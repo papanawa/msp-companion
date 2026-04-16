@@ -126,6 +126,7 @@ async function dattoAuth() {
   const platformUrl = (s.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
   const creds = btoa('public-client:public');
 
+  const authBody = `grant_type=password&username=${encodeURIComponent(s.apiKey)}&password=${encodeURIComponent(s.secretKey)}`;
   const res = await fetch('/api/datto?path=%2Fauth%2Foauth%2Ftoken&method=POST', {
     method: 'POST',
     headers: {
@@ -133,7 +134,7 @@ async function dattoAuth() {
       'Content-Type': 'application/x-www-form-urlencoded',
       'x-platform-url': platformUrl,
     },
-    body: `grant_type=password&username=${encodeURIComponent(s.apiKey)}&password=${encodeURIComponent(s.secretKey)}`,
+    body: authBody,
   });
   if (!res.ok) throw new Error(`Datto auth failed: HTTP ${res.status}`);
   const data = await res.json();
