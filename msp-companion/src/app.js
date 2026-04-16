@@ -1119,6 +1119,7 @@ function setView(view) {
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === `view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === view));
   if (view === 'kb') renderKB();
+  if (view === 'settings') populateKnownClients();
   LS.set('msp_view', view);
 }
 
