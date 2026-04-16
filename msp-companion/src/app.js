@@ -114,7 +114,7 @@ function saveSettings(partial) {
   LS.set('msp_settings', state.settings);
 }
 
-// ─── DATTO RMM API ────────────────────────────────────────────────────────────
+
 let dattoToken = null;
 let dattoTokenExpiry = 0;
 
@@ -125,11 +125,13 @@ async function dattoAuth() {
 
   const platformUrl = (s.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
   const creds = btoa('public-client:public');
-  const res = await fetch(`${platformUrl}/auth/oauth/token`, {
+
+  const res = await fetch('/api/datto?path=%2Fauth%2Foauth%2Ftoken&method=POST', {
     method: 'POST',
     headers: {
       'Authorization': `Basic ${creds}`,
       'Content-Type': 'application/x-www-form-urlencoded',
+      'x-platform-url': platformUrl,
     },
     body: `grant_type=password&username=${encodeURIComponent(s.apiKey)}&password=${encodeURIComponent(s.secretKey)}`,
   });
@@ -143,8 +145,11 @@ async function dattoAuth() {
 async function dattoFetch(path) {
   const token = await dattoAuth();
   const platformUrl = (state.settings.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
-  const res = await fetch(`${platformUrl}/api/v2${path}`, {
-    headers: { 'Authorization': `Bearer ${token}` }
+  const res = await fetch(`/api/datto?path=${encodeURIComponent(path)}&method=GET`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'x-platform-url': platformUrl,
+    }
   });
   if (!res.ok) throw new Error(`Datto API error: HTTP ${res.status}`);
   return res.json();
@@ -220,9 +225,13 @@ async function fetchSites() {
 async function resolveAlert(alertUid) {
   const token = await dattoAuth();
   const platformUrl = (state.settings.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
-  const res = await fetch(`${platformUrl}/api/v2/alert/${alertUid}/resolve`, {
+  const path = `/alert/${alertUid}/resolve`;
+  const res = await fetch(`/api/datto?path=${encodeURIComponent(path)}&method=POST`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}` }
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'x-platform-url': platformUrl,
+    }
   });
   if (!res.ok && res.status !== 204) throw new Error(`Resolve failed: HTTP ${res.status}`);
 }
@@ -244,9 +253,20 @@ function atBase() {
 }
 
 async function atFetch(path, method = 'GET', body = null) {
-  const opts = { method, headers: atHeaders() };
+  const zone = state.settings.atZone || '14';
+  const h = atHeaders();
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'username': h.UserName,
+      'secret': h.Secret,
+      'apiintegrationcode': h.ApiIntegrationCode,
+      'x-at-zone': zone,
+    }
+  };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${atBase()}${path}`, opts);
+  const res = await fetch(`/api/autotask?path=${encodeURIComponent(path)}&method=${method}`, opts);
   if (!res.ok) {
     const txt = await res.text();
     let err = {};
