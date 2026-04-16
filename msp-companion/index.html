@@ -1,0 +1,406 @@
+
+  <!-- App shell -->
+  <div id="app">
+    <!-- Nav rail -->
+    <nav class="nav-rail" id="navRail">
+      <div class="nav-logo">
+        <div class="nav-logo-mark">MC</div>
+        <div class="nav-logo-text">
+          <div class="nav-logo-name">MSP<span>COMPANION</span></div>
+          <div class="nav-logo-tag">SYNOBIS NETWORK SOLUTIONS</div>
+        </div>
+      </div>
+      <div class="nav-items">
+        <button class="nav-item active" data-view="dashboard" title="Dashboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          <span>DASH</span>
+        </button>
+        <button class="nav-item" data-view="alerts" title="Alerts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          <span>ALERTS</span>
+          <div class="nav-badge" id="navAlertBadge" style="display:none"></div>
+        </button>
+        <button class="nav-item" data-view="tickets" title="Tickets">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 00-2 2v3a2 2 0 110 4v3a2 2 0 002 2h14a2 2 0 002-2v-3a2 2 0 110-4V7a2 2 0 00-2-2H5z"/></svg>
+          <span>TICKETS</span>
+          <div class="nav-badge nav-badge-purple" id="navTicketBadge" style="display:none"></div>
+        </button>
+        <button class="nav-item" data-view="queue" title="Unified Queue">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          <span>QUEUE</span>
+        </button>
+      </div>
+      <div class="nav-bottom">
+        <div class="nav-divider"></div>
+        <button class="nav-item" data-view="kb" title="Knowledge Base">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+          <span>KB</span>
+        </button>
+        <button class="nav-item" data-view="reports" title="Reports">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+          <span>REPORTS</span>
+        </button>
+        <div class="nav-divider"></div>
+        <button class="nav-item" data-view="settings" title="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+          <span>SETTINGS</span>
+        </button>
+      </div>
+    </nav>
+
+    <!-- Main content area -->
+    <main class="main-area" id="mainArea">
+
+      <!-- ── DASHBOARD ───────────────────────────────────────────── -->
+      <section class="view active" id="view-dashboard">
+        <div class="view-header">
+          <div>
+            <h1 class="view-title">Dashboard</h1>
+            <p class="view-sub" id="dashGreeting">Good morning — here's your operational status.</p>
+          </div>
+          <div class="header-actions">
+            <button class="hbtn" id="dashRefreshBtn">↺ Refresh All</button>
+            <div class="live-indicator"><div class="live-dot"></div><span>LIVE</span></div>
+          </div>
+        </div>
+
+        <!-- Stat row -->
+        <div class="stat-grid" id="dashStats">
+          <div class="stat-card">
+            <div class="stat-val" id="statOpenAlerts" style="color:#00b4d8">—</div>
+            <div class="stat-lbl">Open Alerts</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statCritical" style="color:#c8102e">—</div>
+            <div class="stat-lbl">Critical</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statHigh" style="color:#e07b00">—</div>
+            <div class="stat-lbl">High</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statOpenTickets" style="color:#8b5cf6">—</div>
+            <div class="stat-lbl">Open Tickets</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statMismatch" style="color:#c8960c">—</div>
+            <div class="stat-lbl">Mismatches</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statNoTicket" style="color:#5a7a96">—</div>
+            <div class="stat-lbl">No Ticket</div>
+          </div>
+        </div>
+
+        <!-- Bulk action bar -->
+        <div class="bulk-bar" id="bulkBar" style="display:none">
+          <div class="bulk-bar-text">
+            <span class="bulk-bar-count" id="bulkBarCount">0</span> alerts have completed Autotask tickets
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="bulk-btn" id="bulkResolveBtn">⚡ RESOLVE ALL</button>
+            <button class="bulk-btn-ghost" id="bulkViewBtn">VIEW</button>
+          </div>
+        </div>
+
+        <!-- Resolution pipeline -->
+        <div class="section-label">Resolution Pipeline — Active Incidents</div>
+        <div class="pipeline" id="dashPipeline">
+          <div class="pipeline-col">
+            <div class="pipeline-header">
+              <div class="pipeline-dot" style="background:#c8102e"></div>
+              <span class="pipeline-title">Needs Attention</span>
+              <span class="pipeline-count" id="pipeNeedsAttention">0</span>
+            </div>
+            <div class="pipeline-items" id="pipeColNeeds"></div>
+          </div>
+          <div class="pipeline-arrow">→</div>
+          <div class="pipeline-col">
+            <div class="pipeline-header">
+              <div class="pipeline-dot" style="background:#e07b00"></div>
+              <span class="pipeline-title">Ticket Open</span>
+              <span class="pipeline-count" id="pipeTicketOpen">0</span>
+            </div>
+            <div class="pipeline-items" id="pipeColTicket"></div>
+          </div>
+          <div class="pipeline-arrow">→</div>
+          <div class="pipeline-col">
+            <div class="pipeline-header">
+              <div class="pipeline-dot" style="background:#c8a000"></div>
+              <span class="pipeline-title">In Progress</span>
+              <span class="pipeline-count" id="pipeInProgress">0</span>
+            </div>
+            <div class="pipeline-items" id="pipeColProgress"></div>
+          </div>
+          <div class="pipeline-arrow">→</div>
+          <div class="pipeline-col">
+            <div class="pipeline-header">
+              <div class="pipeline-dot" style="background:#2a9d5c"></div>
+              <span class="pipeline-title">Ready to Close</span>
+              <span class="pipeline-count" id="pipeReadyClose">0</span>
+            </div>
+            <div class="pipeline-items" id="pipeColReady"></div>
+          </div>
+        </div>
+
+        <!-- Client health grid -->
+        <div class="section-label" style="margin-top:20px">Client Health</div>
+        <div class="client-grid" id="dashClientGrid">
+          <div class="loading-state">Loading client data...</div>
+        </div>
+      </section>
+
+      <!-- ── ALERTS VIEW ────────────────────────────────────────── -->
+      <section class="view" id="view-alerts">
+        <div class="split-layout">
+          <div class="split-list" id="alertListPanel">
+            <div class="list-toolbar">
+              <div class="list-filters" id="alertFilters">
+                <button class="filter-chip active" data-filter="all">All</button>
+                <button class="filter-chip crit" data-filter="Critical">Critical</button>
+                <button class="filter-chip high" data-filter="High">High</button>
+                <button class="filter-chip" data-filter="no-ticket">No Ticket</button>
+                <button class="filter-chip" data-filter="mismatch">⚠ Mismatch</button>
+              </div>
+              <div class="list-counts">
+                <span id="alertListCount">0 alerts</span>
+                <span id="alertCritCount" style="color:#c8102e">0 critical</span>
+              </div>
+            </div>
+            <div class="client-chips" id="alertClientChips"></div>
+            <div class="list-scroll" id="alertList">
+              <div class="loading-state">Loading alerts...</div>
+            </div>
+          </div>
+          <div class="split-detail" id="alertDetail">
+            <div class="empty-detail">
+              <div class="empty-icon">⚡</div>
+              <div class="empty-title">Select an alert</div>
+              <div class="empty-sub" id="alertEmptySub">Loading data...</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── TICKETS VIEW ───────────────────────────────────────── -->
+      <section class="view" id="view-tickets">
+        <div class="split-layout">
+          <div class="split-list">
+            <div class="list-toolbar">
+              <div class="list-filters" id="ticketFilters">
+                <button class="filter-chip active" data-filter="all">All</button>
+                <button class="filter-chip crit" data-filter="New">New</button>
+                <button class="filter-chip high" data-filter="InProgress">In Progress</button>
+                <button class="filter-chip" data-filter="Waiting">Waiting</button>
+              </div>
+              <button class="hbtn" id="ticketRefreshBtn">↺ Refresh</button>
+            </div>
+            <div class="list-scroll" id="ticketList">
+              <div class="loading-state">Loading tickets...</div>
+            </div>
+          </div>
+          <div class="split-detail" id="ticketDetail">
+            <div class="empty-detail">
+              <div class="empty-icon">🎫</div>
+              <div class="empty-title">Select a ticket</div>
+              <div class="empty-sub">Choose a ticket from the list to begin working it</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── UNIFIED QUEUE ──────────────────────────────────────── -->
+      <section class="view" id="view-queue">
+        <div class="split-layout">
+          <div class="split-list">
+            <div class="list-toolbar">
+              <div class="list-filters">
+                <button class="filter-chip active" data-filter="all">All</button>
+                <button class="filter-chip crit" data-filter="critical">Critical</button>
+                <button class="filter-chip" data-filter="alerts">Alerts</button>
+                <button class="filter-chip ticket-chip" data-filter="tickets">Tickets</button>
+                <button class="filter-chip" data-filter="mismatch">⚠ Mismatch</button>
+              </div>
+            </div>
+            <div class="list-scroll" id="queueList">
+              <div class="loading-state">Loading unified queue...</div>
+            </div>
+          </div>
+          <div class="split-detail" id="queueDetail">
+            <div class="empty-detail">
+              <div class="empty-icon">⊞</div>
+              <div class="empty-title">Select an item</div>
+              <div class="empty-sub">Alerts and tickets unified in one queue</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── KNOWLEDGE BASE ─────────────────────────────────────── -->
+      <section class="view" id="view-kb">
+        <div class="view-header">
+          <div>
+            <h1 class="view-title">Knowledge Base</h1>
+            <p class="view-sub">Resolved incidents and solutions for future reference</p>
+          </div>
+          <button class="hbtn" id="kbAddBtn">＋ Add Entry</button>
+        </div>
+        <div class="kb-search-row">
+          <input type="text" id="kbSearch" class="kb-search" placeholder="Search KB..." />
+        </div>
+        <div id="kbList" class="kb-list">
+          <div class="loading-state">Loading knowledge base...</div>
+        </div>
+      </section>
+
+      <!-- ── REPORTS ────────────────────────────────────────────── -->
+      <section class="view" id="view-reports">
+        <div class="view-header">
+          <h1 class="view-title">Reports</h1>
+        </div>
+        <div class="coming-soon">
+          <div class="coming-soon-icon">📊</div>
+          <div class="coming-soon-title">Reports Coming Soon</div>
+          <div class="coming-soon-sub">Alert trends, resolution times, tech workload, and client health reports</div>
+        </div>
+      </section>
+
+      <!-- ── SETTINGS ───────────────────────────────────────────── -->
+      <section class="view" id="view-settings">
+        <div class="view-header">
+          <h1 class="view-title">Settings</h1>
+        </div>
+        <div class="settings-grid">
+
+          <div class="settings-card">
+            <div class="settings-card-title">⚡ Datto RMM</div>
+            <div class="field-group">
+              <label>API Key</label>
+              <input type="password" id="set-apiKey" placeholder="Your Datto RMM API key" autocomplete="off" />
+            </div>
+            <div class="field-group">
+              <label>Secret Key</label>
+              <input type="password" id="set-secretKey" placeholder="Your Datto RMM secret key" autocomplete="off" />
+              <div class="field-hint">⚠ The Secret Key is only shown once when generated. Store it in MyGlue or your password manager.</div>
+            </div>
+            <div class="field-group">
+              <label>Platform URL</label>
+              <input type="text" id="set-platformUrl" placeholder="https://concord-api.centrastage.net" autocomplete="off" />
+              <div class="field-hint">Platforms: concord, pinotage, merlot, zinfandel, syrah</div>
+            </div>
+            <div class="settings-btn-row">
+              <button class="settings-btn-primary" id="saveDattoBtn">💾 Save</button>
+              <button class="settings-btn-secondary" id="testDattoBtn">⚡ Test</button>
+            </div>
+            <div class="settings-status" id="dattoStatus"></div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title">🎫 Autotask PSA</div>
+            <div class="field-group">
+              <label>API Username</label>
+              <input type="text" id="set-atUser" placeholder="apiuser@synobis.com" autocomplete="off" />
+            </div>
+            <div class="field-group">
+              <label>API Secret</label>
+              <input type="password" id="set-atSecret" placeholder="Your Autotask API secret" autocomplete="off" />
+            </div>
+            <div class="field-group">
+              <label>Zone Number</label>
+              <input type="text" id="set-atZone" placeholder="14" value="14" autocomplete="off" style="max-width:80px" />
+              <div class="field-hint">From your Autotask URL — ww<strong>14</strong>.autotask.net</div>
+            </div>
+            <div class="field-group">
+              <label>Integration Code</label>
+              <input type="text" id="set-atIntCode" placeholder="MSPCompanion (optional)" autocomplete="off" />
+            </div>
+            <div class="settings-btn-row">
+              <button class="settings-btn-primary" id="saveAtBtn">💾 Save</button>
+              <button class="settings-btn-secondary" id="testAtBtn">⚡ Test</button>
+            </div>
+            <div class="settings-status" id="atStatus"></div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title">🤖 AI (Anthropic Claude)</div>
+            <div class="field-group">
+              <label>API Key</label>
+              <input type="password" id="set-anthropicKey" placeholder="sk-ant-..." autocomplete="off" />
+              <div class="field-hint">Get your key at console.anthropic.com → API Keys</div>
+            </div>
+            <div class="settings-btn-row">
+              <button class="settings-btn-primary" id="saveAiBtn">💾 Save</button>
+              <button class="settings-btn-secondary" id="testAiBtn">⚡ Test</button>
+            </div>
+            <div class="settings-status" id="aiStatus"></div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title">🚫 Excluded Clients</div>
+            <div class="field-hint" style="margin-bottom:10px">Alerts from these clients are hidden from all views. Use for co-managed clients who handle their own tickets.</div>
+            <div id="excludedChips" class="excluded-chips"></div>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <input type="text" id="excludeInput" placeholder="Type client name..." autocomplete="off" style="flex:1" />
+              <button class="settings-btn-secondary" id="addExcludeBtn">＋ Add</button>
+            </div>
+            <div class="section-label" style="margin-top:14px">Known clients</div>
+            <div id="knownClientsList" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
+            <div class="settings-btn-row" style="margin-top:12px">
+              <button class="settings-btn-primary" id="saveExcludeBtn">💾 Save Exclusions</button>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title">⚙ Preferences</div>
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-label">Auto-resolve Information alerts</div>
+                <div class="field-hint">Silently resolve "Information" priority alerts on each refresh</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="set-autoResolveInfo" checked />
+                <span class="toggle-track"></span>
+              </label>
+            </div>
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-label">Desktop notifications</div>
+                <div class="field-hint">Notify on new Critical or High alerts</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="set-notifications" checked />
+                <span class="toggle-track"></span>
+              </label>
+            </div>
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-label">Auto-refresh</div>
+                <div class="field-hint">Automatically poll Datto RMM</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="set-autoRefresh" checked />
+                <span class="toggle-track"></span>
+              </label>
+            </div>
+            <div class="field-group" style="margin-top:10px">
+              <label>Refresh interval (minutes)</label>
+              <input type="number" id="set-refreshInterval" value="5" min="1" max="60" style="max-width:80px" />
+            </div>
+            <div class="settings-btn-row">
+              <button class="settings-btn-primary" id="savePrefsBtn">💾 Save Preferences</button>
+            </div>
+            <div class="settings-status" id="prefsStatus"></div>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <script src="/src/app.js" type="module"></script>
+</body>
+</html>
