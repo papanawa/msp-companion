@@ -146,16 +146,21 @@ function normalizeAlert(raw) {
   if (!alertMessage || alertMessage === 'Alert triggered') {
 
     // ── Disk Usage ────────────────────────────────────────────────
-    if (cls.includes('diskusage') || cls.includes('disk') || monitorType.includes('disk')) {
-      const free  = ctx.freeSpace ?? ctx.freeSpaceBytes ?? ctx.free;
-      const total = ctx.driveCapacity ?? ctx.totalSpaceBytes ?? ctx.total ?? ctx.capacity;
-      const drive = ctx.driveLetter || ctx.volume || ctx.drive || 'C:';
-      const pct   = ctx.usagePercent ?? ctx.percentUsed ?? ctx.percent;
-      if (free !== undefined && total !== undefined) {
-        const freeStr  = free  > 1e9 ? (free/1e9).toFixed(1)+' GB'  : (free/1e6).toFixed(0)+' MB';
-        const totalStr = total > 1e9 ? (total/1e9).toFixed(1)+' GB' : (total/1e6).toFixed(0)+' MB';
-        const pctVal   = total > 0 ? Math.round((1 - free/total)*100) : (pct || 0);
-        alertMessage = `Disk Usage: ${drive} — ${freeStr} free of ${totalStr} (${pctVal}% used)`;
+    if (cls.includes('disk') || monitorType.includes('disk')) {
+      const drive = ctx.diskName || ctx.driveLetter || ctx.volume || ctx.drive || 'C:';
+      // Datto sends freeSpace and totalVolume in MB (not bytes)
+      const freeMB  = ctx.freeSpace ?? ctx.freeSpaceBytes ?? ctx.free;
+      const totalMB = ctx.totalVolume ?? ctx.driveCapacity ?? ctx.totalSpaceBytes ?? ctx.total;
+      const pct     = ctx.usagePercent ?? ctx.percentUsed ?? ctx.percent;
+      if (freeMB !== undefined && totalMB !== undefined) {
+        // Determine if values are in bytes or MB based on magnitude
+        const isBytes = totalMB > 1e9;
+        const freeGB  = isBytes ? freeMB/1e9  : freeMB/1024;
+        const totalGB = isBytes ? totalMB/1e9 : totalMB/1024;
+        const pctUsed = totalMB > 0 ? Math.round((1 - freeMB/totalMB)*100) : (pct || 0);
+        const freeStr  = freeGB  >= 1 ? freeGB.toFixed(1)+' GB'  : Math.round(freeGB*1024)+' MB';
+        const totalStr = totalGB >= 1 ? totalGB.toFixed(1)+' GB' : Math.round(totalGB*1024)+' MB';
+        alertMessage = `Disk Usage: ${drive} — ${freeStr} free of ${totalStr} (${pctUsed}% used)`;
       } else if (pct !== undefined) {
         alertMessage = `Disk Usage: ${drive} — ${pct}% used`;
       } else if (ctx.threshold) {
