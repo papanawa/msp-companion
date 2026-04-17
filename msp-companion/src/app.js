@@ -128,6 +128,25 @@ async function dattoFetch(path) {
   return res.json();
 }
 
+// ─── Datto Device Cache ──────────────────────────────────────────
+const DEVICE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 minutes
+state.deviceCache = state.deviceCache || {};
+
+async function fetchDattoDevice(deviceUid) {
+  if (!deviceUid) return null;
+  const cached = state.deviceCache[deviceUid];
+  if (cached && (Date.now() - cached.fetchedAt) < DEVICE_CACHE_TTL_MS) return cached.data;
+  try {
+    const [device, openAlerts] = await Promise.all([
+      dattoFetch(`/device/${deviceUid}`),
+      dattoFetch(`/device/${deviceUid}/alerts/open?max=50`).catch(() => ({ alerts: [] })),
+    ]);
+    const data = { device, openAlertCount: (openAlerts?.alerts || openAlerts?.items || []).length };
+    state.deviceCache[deviceUid] = { data, fetchedAt: Date.now() };
+    return data;
+  } catch(e) { console.warn('Device fetch failed:', e.message); return null; }
+}
+
 function normalizeAlert(raw) {
   const src = raw.alertSourceInfo || {};
   const ctx = raw.alertContext || {};
@@ -275,6 +294,7 @@ function normalizeAlert(raw) {
   return {
     alertUid:    raw.alertUid || raw.id,
     hostname:    src.deviceName || raw.deviceName || 'Unknown Device',
+    deviceUid:   src.deviceUid  || raw.deviceUid  || null,
     siteName:    src.siteName   || raw.siteName   || 'Unknown Client',
     siteUid:     src.siteUid   || raw.siteUid,
     priority:    raw.priority   || 'Information',
@@ -405,6 +425,64 @@ async function loadAtPriorityPicklist() {
     LS.set('msp_at_priority_picklist', pl);
     return pl;
   } catch(e) { console.warn('AT priority picklist failed:', e.message); return {}; }
+}
+
+// Consolidated loader for Issue Type, Sub-Issue Type, Source picklists (one API call)
+async function loadAtTicketPicklists() {
+  if (state.atTicketPicklists) return state.atTicketPicklists;
+  const cached = LS.get('msp_at_ticket_picklists');
+  if (cached) { state.atTicketPicklists = cached; return cached; }
+  try {
+    const data = await atFetch('/Tickets/entityInformation/fields');
+    const fields = data?.fields || [];
+    const buildMap = (name) => {
+      const f = fields.find(x => x.name === name);
+      const m = {};
+      (f?.picklistValues || []).forEach(pv => {
+        if (pv.isActive === false) return;
+        m[pv.value] = { label: pv.label, parentValue: pv.parentValue };
+      });
+      return m;
+    };
+    const pl = {
+      issueType: buildMap('issueType'),
+      subIssueType: buildMap('subIssueType'),
+      source: buildMap('source'),
+    };
+    state.atTicketPicklists = pl;
+    LS.set('msp_at_ticket_picklists', pl);
+    return pl;
+  } catch(e) { console.warn('AT ticket picklists failed:', e.message); return { issueType:{}, subIssueType:{}, source:{} }; }
+}
+
+async function fetchAtContractName(contractId) {
+  if (!contractId) return null;
+  state.atContractCache = state.atContractCache || {};
+  if (state.atContractCache[contractId]) return state.atContractCache[contractId];
+  try {
+    const data = await atFetch(`/Contracts/${contractId}`);
+    const name = (data?.item || data)?.contractName || null;
+    if (name) state.atContractCache[contractId] = name;
+    return name;
+  } catch(e) { console.warn('Contract fetch failed:', e.message); return null; }
+}
+
+async function fetchAtTicketActivityNotes(ticketId) {
+  // Expanded version of fetchAtTicketNotes — pulls 10 notes with noteType + resource for activity feed
+  try {
+    const data = await atFetch(`/Tickets/${ticketId}/Notes/query`, 'POST', {
+      MaxRecords: 10,
+      filter: [{ op: 'gte', field: 'id', value: 0 }],
+      IncludeFields: ['id','title','description','noteType','publish','createDateTime','lastActivityDate','creatorResourceID'],
+    });
+    const items = data?.items || [];
+    items.sort((a,b) => {
+      const aT = a.createDateTime || a.lastActivityDate || '';
+      const bT = b.createDateTime || b.lastActivityDate || '';
+      return bT.localeCompare(aT);
+    });
+    return items.slice(0, 10);
+  } catch(e) { console.warn('Activity notes fetch failed:', e.message); return []; }
 }
 
 async function syncTicketStatuses(ticketNumbers) {
@@ -1554,6 +1632,240 @@ function renderTicketList() {
   }).join('');
 }
 
+// ─── TIER B: DEVICE / ACTIVITY / METADATA RENDERERS ─────────────
+function fmtBytes(mb) {
+  if (mb == null || isNaN(mb)) return '';
+  if (mb > 1024*1024) return (mb/1024/1024).toFixed(1) + ' TB';
+  if (mb > 1024)      return (mb/1024).toFixed(1) + ' GB';
+  return Math.round(mb) + ' MB';
+}
+
+function fmtRelativeTime(ts) {
+  if (!ts) return 'unknown';
+  const d = new Date(ts);
+  if (isNaN(d)) return 'unknown';
+  const diff = Date.now() - d.getTime();
+  const mins = Math.floor(diff/60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins/60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs/24);
+  if (days < 30) return `${days}d ago`;
+  return d.toLocaleDateString();
+}
+
+function fmtSlaClock(dueDateStr) {
+  if (!dueDateStr) return { text: '—', color: 'var(--textdim)' };
+  const d = new Date(dueDateStr);
+  if (isNaN(d)) return { text: '—', color: 'var(--textdim)' };
+  const diff = d.getTime() - Date.now();
+  const absH = Math.floor(Math.abs(diff) / 3600000);
+  const absD = Math.floor(absH / 24);
+  if (diff < 0) {
+    const t = absD >= 1 ? `Overdue ${absD}d` : `Overdue ${absH}h`;
+    return { text: t, color: '#c8102e' };
+  }
+  if (absH < 4) return { text: `Due in ${absH}h`, color: '#e07b00' };
+  if (absD < 1) return { text: `Due in ${absH}h`, color: '#c8a000' };
+  return { text: `Due in ${absD}d`, color: 'var(--textmid)' };
+}
+
+function renderDevicePanel(ticket) {
+  // Try to find a linked Datto device via the linked alert
+  const linkedAlert = findLinkedAlertForTicket(ticket);
+  const deviceUid = linkedAlert?.deviceUid;
+  if (!deviceUid) {
+    return ''; // No device linkage — skip this card entirely
+  }
+  // Card shell — will be hydrated async
+  return `<div class="detail-card" id="devicePanelCard" data-device-uid="${esc(deviceUid)}">
+    <div class="card-label" style="display:flex;align-items:center;justify-content:space-between">
+      <span>📟 DATTO DEVICE</span>
+      <button class="inv-step-btn" data-action="device-refresh" data-device-uid="${esc(deviceUid)}" title="Refresh device info" style="width:auto;padding:0 8px;height:22px;font-size:11px">↺</button>
+    </div>
+    <div id="devicePanelBody">
+      <div style="color:var(--textdim);font-size:12px;padding:10px 0">Loading device info...</div>
+    </div>
+  </div>`;
+}
+
+function hydrateDevicePanel(deviceData) {
+  const body = document.getElementById('devicePanelBody');
+  if (!body) return;
+  if (!deviceData) {
+    body.innerHTML = `<div style="color:var(--textdim);font-size:12px;padding:6px 0">Device info unavailable. Check Datto RMM connection.</div>`;
+    return;
+  }
+  const d = deviceData.device || {};
+  const openAlerts = deviceData.openAlertCount || 0;
+  const online = d.online === true || d.online === 'true';
+  const onlineColor = online ? '#2a9d5c' : '#c8102e';
+  const onlineLabel = online ? 'ONLINE' : 'OFFLINE';
+  const lastSeen = d.lastSeen || d.lastSeenDate || null;
+  const os = d.operatingSystem || d.osType || 'Unknown OS';
+  const desc = d.description || d.hostname || '';
+  const user = d.lastLoggedInUser || null;
+  const domain = d.domain || null;
+  // Storage — Datto typically returns an array with volumes
+  let storageRow = '';
+  const vols = d.volumes || d.storage || [];
+  if (Array.isArray(vols) && vols.length) {
+    storageRow = vols.slice(0, 3).map(v => {
+      const name = v.name || v.volume || v.drive || 'Drive';
+      const total = v.totalSize || v.capacity || v.total;
+      const free = v.freeSpace || v.free;
+      if (total && free != null) {
+        const pct = Math.round((1 - free/total) * 100);
+        const warn = pct >= 90 ? '#c8102e' : pct >= 80 ? '#e07b00' : '#2a9d5c';
+        return `<div class="device-storage-row">
+          <div class="device-storage-label"><span>${esc(name)}</span><span style="color:${warn};font-weight:700">${pct}%</span></div>
+          <div class="device-storage-bar"><div class="device-storage-fill" style="width:${pct}%;background:${warn}"></div></div>
+          <div class="device-storage-sub">${fmtBytes(free)} free of ${fmtBytes(total)}</div>
+        </div>`;
+      }
+      return '';
+    }).join('');
+  }
+  // AV/Patch/Software — defensive
+  const av = d.antivirus || d.antivirusStatus;
+  const patch = d.patchStatus || d.patch;
+  const health = [];
+  if (av)    health.push(`<span class="device-health-pill ${av.productName || av.status ? 'ok' : ''}">AV: ${esc(av.productName || av.status || 'Unknown')}</span>`);
+  if (patch) health.push(`<span class="device-health-pill">Patch: ${esc(typeof patch === 'string' ? patch : patch.status || 'Unknown')}</span>`);
+
+  body.innerHTML = `
+    <div class="device-header">
+      <div>
+        <div class="device-name">${esc(d.hostname || desc || 'Unknown device')}</div>
+        ${domain ? `<div class="device-meta">${esc(domain)}</div>` : ''}
+      </div>
+      <span class="device-status-badge" style="color:${onlineColor};background:${onlineColor}22;border:1px solid ${onlineColor}55">${onlineLabel}</span>
+    </div>
+    <div class="device-grid">
+      <div class="device-grid-cell"><div class="device-grid-label">OS</div><div class="device-grid-value">${esc(os)}</div></div>
+      <div class="device-grid-cell"><div class="device-grid-label">LAST SEEN</div><div class="device-grid-value">${esc(fmtRelativeTime(lastSeen))}</div></div>
+      ${user ? `<div class="device-grid-cell"><div class="device-grid-label">LAST USER</div><div class="device-grid-value">${esc(user)}</div></div>` : ''}
+      <div class="device-grid-cell"><div class="device-grid-label">OPEN ALERTS</div><div class="device-grid-value" style="color:${openAlerts>0?'#e07b00':'var(--text)'};font-weight:${openAlerts>0?'700':'400'}">${openAlerts}</div></div>
+    </div>
+    ${storageRow ? `<div class="device-section"><div class="device-section-label">STORAGE</div>${storageRow}</div>` : ''}
+    ${health.length ? `<div class="device-section"><div class="device-health-row">${health.join('')}</div></div>` : ''}
+  `;
+}
+
+function renderActivityFeed(ticket) {
+  return `<div class="detail-card" id="activityFeedCard">
+    <div class="card-label" style="display:flex;align-items:center;justify-content:space-between">
+      <span>⌚ ACTIVITY</span>
+      <button class="inv-step-btn" data-action="activity-refresh" data-ticket-id="${ticket.id}" title="Refresh activity" style="width:auto;padding:0 8px;height:22px;font-size:11px">↺</button>
+    </div>
+    <div id="activityFeedBody">
+      <div style="color:var(--textdim);font-size:12px;padding:10px 0">Loading recent notes...</div>
+    </div>
+  </div>`;
+}
+
+function hydrateActivityFeed(notes) {
+  const body = document.getElementById('activityFeedBody');
+  if (!body) return;
+  if (!notes?.length) {
+    body.innerHTML = `<div style="color:var(--textdim);font-size:12px;padding:6px 0">No notes on this ticket yet.</div>`;
+    return;
+  }
+  const resourceMap = {};
+  state.atResources.forEach(r => { resourceMap[r.id] = r.name; });
+  const rows = notes.map(n => {
+    const creator = resourceMap[n.creatorResourceID] || 'System';
+    const date = n.createDateTime || n.lastActivityDate || '';
+    const dateStr = date ? new Date(date).toLocaleString() : '';
+    const isInternal = n.publish === 2 || n.noteType === 2;
+    const typeBadge = isInternal
+      ? `<span class="activity-type activity-type-internal">INTERNAL</span>`
+      : `<span class="activity-type activity-type-public">PUBLIC</span>`;
+    const desc = (n.description || '').trim();
+    const preview = desc.length > 280 ? desc.substring(0, 280) + '…' : desc;
+    return `<div class="activity-row">
+      <div class="activity-head">
+        <span class="activity-author">${esc(creator)}</span>
+        <span class="activity-date">${esc(dateStr)}</span>
+        ${typeBadge}
+      </div>
+      ${n.title ? `<div class="activity-title">${esc(n.title)}</div>` : ''}
+      ${preview ? `<div class="activity-desc">${esc(preview)}</div>` : ''}
+    </div>`;
+  }).join('');
+  body.innerHTML = rows;
+}
+
+function renderMetadataPanel(ticket) {
+  return `<div class="detail-card" id="metadataPanelCard">
+    <div class="card-label">ℹ️ TICKET METADATA</div>
+    <div id="metadataPanelBody">
+      <div style="color:var(--textdim);font-size:12px;padding:10px 0">Loading metadata...</div>
+    </div>
+  </div>`;
+}
+
+function hydrateMetadataPanel(ticket, fullTicket, picklists, contractName) {
+  const body = document.getElementById('metadataPanelBody');
+  if (!body) return;
+  const f = fullTicket || {};
+  const pl = picklists || { issueType:{}, subIssueType:{}, source:{} };
+  const lookup = (map, val) => (map[val]?.label || (val ? `#${val}` : '—'));
+  const issueLabel     = lookup(pl.issueType,    f.issueType);
+  const subIssueLabel  = lookup(pl.subIssueType, f.subIssueType);
+  const sourceLabel    = lookup(pl.source,       f.source);
+  const due = f.dueDateTime || f.dueDate;
+  const sla = fmtSlaClock(due);
+  const workType = f.billingCodeID
+    ? (state.atBillingCodes.find(b => b.id === f.billingCodeID)?.name || `#${f.billingCodeID}`)
+    : '—';
+
+  body.innerHTML = `
+    <div class="meta-grid">
+      <div class="meta-cell"><div class="meta-label">ISSUE TYPE</div><div class="meta-value">${esc(issueLabel)}</div></div>
+      <div class="meta-cell"><div class="meta-label">SUB-ISSUE</div><div class="meta-value">${esc(subIssueLabel)}</div></div>
+      <div class="meta-cell"><div class="meta-label">SOURCE</div><div class="meta-value">${esc(sourceLabel)}</div></div>
+      <div class="meta-cell"><div class="meta-label">WORK TYPE</div><div class="meta-value">${esc(workType)}</div></div>
+      <div class="meta-cell"><div class="meta-label">DUE DATE</div><div class="meta-value">${due ? esc(new Date(due).toLocaleDateString()) : '—'}</div></div>
+      <div class="meta-cell"><div class="meta-label">SLA</div><div class="meta-value" style="color:${sla.color};font-weight:600">${esc(sla.text)}</div></div>
+      <div class="meta-cell"><div class="meta-label">EST. HOURS</div><div class="meta-value">${f.estimatedHours != null ? esc(String(f.estimatedHours)) : '—'}</div></div>
+      <div class="meta-cell"><div class="meta-label">CONTRACT</div><div class="meta-value">${contractName ? esc(contractName) : '—'}</div></div>
+    </div>
+  `;
+}
+
+async function hydrateTierBPanels(ticket) {
+  // Runs async, populates all three panels as data arrives. Guarded by currentTicket check.
+  const linkedAlert = findLinkedAlertForTicket(ticket);
+  const deviceUid = linkedAlert?.deviceUid;
+
+  // Device panel
+  if (deviceUid) {
+    fetchDattoDevice(deviceUid).then(data => {
+      if (state.currentTicket?.id === ticket.id) hydrateDevicePanel(data);
+    });
+  }
+
+  // Activity feed
+  Promise.all([
+    fetchAtTicketActivityNotes(ticket.id),
+    loadAtResources(),
+  ]).then(([notes]) => {
+    if (state.currentTicket?.id === ticket.id) hydrateActivityFeed(notes);
+  });
+
+  // Metadata panel — full ticket + picklists + contract name + billing codes
+  Promise.all([
+    fetchAtTicketFull(ticket.id),
+    loadAtTicketPicklists(),
+    loadAtBillingCodes(),
+  ]).then(async ([fullTicket, picklists]) => {
+    const contractName = fullTicket?.contractID ? await fetchAtContractName(fullTicket.contractID) : null;
+    if (state.currentTicket?.id === ticket.id) hydrateMetadataPanel(ticket, fullTicket, picklists, contractName);
+  });
+}
+
 function renderInvestigationCard(ticket) {
   const inv = getInvestigation(ticket.id);
   const hasInv = !!(inv && inv.steps?.length);
@@ -1650,6 +1962,8 @@ function renderTicketDetail(ticket) {
       </div>
     </div>
 
+    ${renderDevicePanel(ticket)}
+
     <div class="detail-card">
       <div class="card-label">⚙️ TICKET FIELDS</div>
       <div class="ticket-fields-grid">
@@ -1671,6 +1985,10 @@ function renderTicketDetail(ticket) {
         </div>
       </div>
     </div>
+
+    ${renderMetadataPanel(ticket)}
+
+    ${renderActivityFeed(ticket)}
 
     ${renderInvestigationCard(ticket)}
 
@@ -1718,6 +2036,7 @@ function renderTicketDetail(ticket) {
     }
   };
   renderTicketDetail._rehydrateSelects(ticket);
+  hydrateTierBPanels(ticket);
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
@@ -2306,6 +2625,25 @@ function wireEvents() {
       renderTicketDetail(ticket);
     }
 
+    if (action==='device-refresh') {
+      const deviceUid = el.dataset.deviceUid;
+      if (!deviceUid) return;
+      delete state.deviceCache[deviceUid];
+      const body = document.getElementById('devicePanelBody');
+      if (body) body.innerHTML = '<div style="color:var(--textdim);font-size:12px;padding:10px 0">Refreshing...</div>';
+      const data = await fetchDattoDevice(deviceUid);
+      if (state.currentTicket) hydrateDevicePanel(data);
+    }
+
+    if (action==='activity-refresh') {
+      const ticket = findTicketByBtn(); if (!ticket) return;
+      const body = document.getElementById('activityFeedBody');
+      if (body) body.innerHTML = '<div style="color:var(--textdim);font-size:12px;padding:10px 0">Refreshing...</div>';
+      const notes = await fetchAtTicketActivityNotes(ticket.id);
+      await loadAtResources();
+      if (state.currentTicket?.id === ticket.id) hydrateActivityFeed(notes);
+    }
+
     if (action==='inv-step-delete' || action==='inv-step-up' || action==='inv-step-down') {
       const stepEl = el.closest('.inv-step'); if (!stepEl) return;
       const tid = stepEl.dataset.ticketId;
@@ -2775,6 +3113,180 @@ function injectTierAStyles() {
     @media (max-width: 640px) {
       .inv-step-header { flex-wrap: wrap; }
       .inv-step-text { order: 10; flex-basis: 100%; margin-top: 4px; }
+    }
+    /* Tier B: Device / Activity / Metadata */
+    .device-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 6px 0 12px;
+    }
+    .device-name {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--text);
+    }
+    .device-meta {
+      font-size: 11px;
+      color: var(--textdim);
+      margin-top: 2px;
+    }
+    .device-status-badge {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      padding: 3px 8px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+    .device-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 8px 12px;
+      padding: 10px 12px;
+      background: rgba(0,180,216,0.04);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+    }
+    .device-grid-cell { min-width: 0; }
+    .device-grid-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--textdim);
+      margin-bottom: 2px;
+    }
+    .device-grid-value {
+      font-size: 12px;
+      color: var(--text);
+      word-break: break-word;
+    }
+    .device-section {
+      margin-top: 12px;
+    }
+    .device-section-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--textdim);
+      margin-bottom: 6px;
+    }
+    .device-storage-row { margin-bottom: 8px; }
+    .device-storage-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+    .device-storage-bar {
+      width: 100%;
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .device-storage-fill {
+      height: 100%;
+      transition: width 0.3s;
+    }
+    .device-storage-sub {
+      font-size: 10px;
+      color: var(--textdim);
+      margin-top: 2px;
+    }
+    .device-health-row {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .device-health-pill {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      background: rgba(42,157,92,0.1);
+      border: 1px solid rgba(42,157,92,0.3);
+      color: var(--textmid);
+    }
+    /* Activity feed */
+    .activity-row {
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .activity-row:last-child { border-bottom: 0; }
+    .activity-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 3px;
+    }
+    .activity-author {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      color: var(--accent);
+    }
+    .activity-date {
+      font-size: 10px;
+      color: var(--textdim);
+    }
+    .activity-type {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      padding: 1px 6px;
+      border-radius: 2px;
+    }
+    .activity-type-internal {
+      background: rgba(224,123,0,0.12);
+      color: #e07b00;
+      border: 1px solid rgba(224,123,0,0.4);
+    }
+    .activity-type-public {
+      background: rgba(42,157,92,0.12);
+      color: #2a9d5c;
+      border: 1px solid rgba(42,157,92,0.4);
+    }
+    .activity-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .activity-desc {
+      font-size: 12px;
+      color: var(--textmid);
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    /* Metadata */
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px 14px;
+      padding: 4px 0;
+    }
+    .meta-cell { min-width: 0; }
+    .meta-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--textdim);
+      margin-bottom: 2px;
+    }
+    .meta-value {
+      font-size: 12px;
+      color: var(--text);
+      word-break: break-word;
     }
   `;
   document.head.appendChild(style);
