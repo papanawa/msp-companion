@@ -41,10 +41,7 @@
           <span>TICKETS</span>
           <div class="nav-badge nav-badge-purple" id="navTicketBadge" style="display:none"></div>
         </button>
-        <button class="nav-item" data-view="queue" title="Unified Queue">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
-          <span>QUEUE</span>
-        </button>
+
       </div>
       <div class="nav-bottom">
         <div class="nav-divider"></div>
@@ -225,33 +222,6 @@
               <div class="empty-icon">🎫</div>
               <div class="empty-title">Select a ticket</div>
               <div class="empty-sub">Choose a ticket from the list to begin working it</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── UNIFIED QUEUE ──────────────────────────────────────── -->
-      <section class="view" id="view-queue">
-        <div class="split-layout">
-          <div class="split-list">
-            <div class="list-toolbar">
-              <div class="list-filters">
-                <button class="filter-chip active" data-filter="all">All</button>
-                <button class="filter-chip crit" data-filter="critical">Critical</button>
-                <button class="filter-chip" data-filter="alerts">Alerts</button>
-                <button class="filter-chip ticket-chip" data-filter="tickets">Tickets</button>
-                <button class="filter-chip" data-filter="mismatch">⚠ Mismatch</button>
-              </div>
-            </div>
-            <div class="list-scroll" id="queueList">
-              <div class="loading-state">Loading unified queue...</div>
-            </div>
-          </div>
-          <div class="split-detail" id="queueDetail">
-            <div class="empty-detail">
-              <div class="empty-icon">⊞</div>
-              <div class="empty-title">Select an item</div>
-              <div class="empty-sub">Alerts and tickets unified in one queue</div>
             </div>
           </div>
         </div>
