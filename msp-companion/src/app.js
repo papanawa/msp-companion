@@ -439,20 +439,15 @@ let atCompanyCache = {};
 async function loadAtQueues() {
   if (state.atQueues?.length) return;
   try {
-    const data = await atFetch('/ServiceCallTicketResources/query', 'POST', {
-      filter: [{ op: 'eq', field: 'isActive', value: true }]
-    });
-    state.atQueues = (data?.items || []).map(q => ({ id: q.id, name: q.name }));
-  } catch(e) {
-    // Try alternate endpoint
-    try {
-      const data2 = await atFetch('/Tickets/entityInformation/fields');
-      const queueField = (data2?.fields || []).find(f => f.name === 'queueID');
-      state.atQueues = (queueField?.picklistValues || [])
-        .filter(q => q.isActive !== false)
-        .map(q => ({ id: q.value, name: q.label }));
-    } catch(e2) { console.warn('Queue fetch failed:', e2.message); state.atQueues = []; }
-  }
+    // queueID is a picklist on the Tickets entity — same endpoint we use for status
+    const data = await atFetch('/Tickets/entityInformation/fields');
+    const queueField = (data?.fields || []).find(f => f.name === 'queueID');
+    state.atQueues = (queueField?.picklistValues || [])
+      .filter(q => q.isActive !== false && q.label)
+      .map(q => ({ id: parseInt(q.value), name: q.label }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    console.log('Loaded queues:', state.atQueues.map(q => q.name));
+  } catch(e) { console.warn('Queue fetch failed:', e.message); state.atQueues = []; }
 }
 
 function buildCompanyNameMap() {
