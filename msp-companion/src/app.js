@@ -4,7 +4,7 @@
 const state = {
   alerts: [], sites: [], tickets: {},
   atStatusPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
-  resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(),
+  resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(), atQueues: [],
   notesDrafts: {}, aiResults: {}, chatHistories: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
@@ -64,6 +64,7 @@ function loadSettings() {
   setVal('set-atZone',          s.atZone || '14');
   setVal('set-atIntCode',       s.atIntCode || '');
   setVal('set-anthropicKey',    s.anthropicKey || '');
+  setVal('set-defaultQueue',    s.defaultQueue || '');
   setVal('set-autoResolveInfo', s.autoResolveInfo !== false);
   setVal('set-notifications',   s.notifications !== false);
   setVal('set-autoRefresh',     s.autoRefresh !== false);
@@ -435,6 +436,25 @@ async function loadAtRoles() {
 // Cache of Autotask companyID -> company name
 let atCompanyCache = {};
 
+async function loadAtQueues() {
+  if (state.atQueues?.length) return;
+  try {
+    const data = await atFetch('/ServiceCallTicketResources/query', 'POST', {
+      filter: [{ op: 'eq', field: 'isActive', value: true }]
+    });
+    state.atQueues = (data?.items || []).map(q => ({ id: q.id, name: q.name }));
+  } catch(e) {
+    // Try alternate endpoint
+    try {
+      const data2 = await atFetch('/Tickets/entityInformation/fields');
+      const queueField = (data2?.fields || []).find(f => f.name === 'queueID');
+      state.atQueues = (queueField?.picklistValues || [])
+        .filter(q => q.isActive !== false)
+        .map(q => ({ id: q.value, name: q.label }));
+    } catch(e2) { console.warn('Queue fetch failed:', e2.message); state.atQueues = []; }
+  }
+}
+
 function buildCompanyNameMap() {
   // Start with AT company cache (most reliable)
   const map = { ...atCompanyCache };
@@ -545,6 +565,7 @@ async function createTicketForAlert(alert) {
   const companyId = Object.entries(atCompanyCache).find(([, name]) => name === alert.siteName)?.[0];
   if (!companyId) throw new Error(`Company not found in AT cache for: ${alert.siteName}. Refresh tickets first.`);
 
+  const queueID = parseInt(state.settings.defaultQueue) || null;
   const body = {
     companyID: parseInt(companyId),
     title,
@@ -553,6 +574,7 @@ async function createTicketForAlert(alert) {
     status: 1, // New
     ticketType: 1, // Service Request
   };
+  if (queueID) body.queueID = queueID;
 
   const data = await atFetch('/Tickets', 'POST', body);
   const newTicket = data?.item;
@@ -1289,7 +1311,17 @@ function setView(view) {
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
   if (view==='kb') renderKB();
-  if (view==='settings') populateKnownClients();
+  if (view==='settings') {
+    populateKnownClients();
+    // Load queues and populate dropdown
+    loadAtQueues().then(() => {
+      const sel = document.getElementById('set-defaultQueue');
+      if (!sel || !state.atQueues?.length) return;
+      const current = state.settings.defaultQueue || '';
+      sel.innerHTML = '<option value="">— Select a queue —</option>' +
+        state.atQueues.map(q => `<option value="${q.id}" ${String(q.id)===String(current)?'selected':''}>${q.name}</option>`).join('');
+    }).catch(() => {});
+  }
   LS.set('msp_view', view);
 }
 
@@ -1583,7 +1615,13 @@ function wireEvents() {
 
   // Settings — Preferences
   $('savePrefsBtn')?.addEventListener('click', () => {
-    saveSettings({autoResolveInfo:$('set-autoResolveInfo')?.checked,notifications:$('set-notifications')?.checked,autoRefresh:$('set-autoRefresh')?.checked,refreshInterval:parseInt($('set-refreshInterval')?.value)||5});
+    saveSettings({
+      autoResolveInfo: $('set-autoResolveInfo')?.checked,
+      notifications:   $('set-notifications')?.checked,
+      autoRefresh:     $('set-autoRefresh')?.checked,
+      refreshInterval: parseInt($('set-refreshInterval')?.value)||5,
+      defaultQueue:    $('set-defaultQueue')?.value || '',
+    });
     startAutoRefresh(); showSettingsStatus('prefsStatus','✓ Preferences saved','ok');
   });
 

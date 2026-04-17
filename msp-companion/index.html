@@ -422,6 +422,13 @@
               <label>Refresh interval (minutes)</label>
               <input type="number" id="set-refreshInterval" value="5" min="1" max="60" style="max-width:80px" />
             </div>
+            <div class="field-group" style="margin-top:10px">
+              <label>Default ticket queue (for ticket creation)</label>
+              <select id="set-defaultQueue" style="width:100%">
+                <option value="">— Loading queues... —</option>
+              </select>
+              <div class="field-hint">Queue used when creating tickets from MSP Companion</div>
+            </div>
             <div class="settings-btn-row">
               <button class="settings-btn-primary" id="savePrefsBtn">💾 Save Preferences</button>
             </div>
