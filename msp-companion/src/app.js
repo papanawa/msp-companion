@@ -1699,37 +1699,53 @@ function registerSW() {
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 async function boot() {
-  registerSW();
-  loadSettings();
+  try {
+    registerSW();
+    loadSettings();
 
-  // Restore last view
-  const lastView = LS.get('msp_view', 'dashboard');
-  setView(lastView);
+    // Restore last view
+    const lastView = LS.get('msp_view', 'dashboard');
+    setView(lastView);
 
-  // Load cached data
-  const cached = LS.get('msp_alerts', []);
-  if (cached.length) {
-    state.alerts = cached;
-    state.tickets = LS.get('msp_tickets', {});
-    render();
-  }
+    // Load cached data — sanitize tickets to ensure required fields exist
+    const cached = LS.get('msp_alerts', []);
+    if (cached.length) {
+      state.alerts = cached;
+      const rawTickets = LS.get('msp_tickets', {});
+      // Sanitize old cached tickets that may be missing fields
+      Object.values(rawTickets).forEach(t => {
+        if (!t.statusColor) t.statusColor = '#8bacc8';
+        if (!t.statusLabel) t.statusLabel = 'Unknown';
+        if (t.isDone === undefined) t.isDone = false;
+        if (!t.assignedResourceName) t.assignedResourceName = null;
+      });
+      state.tickets = rawTickets;
+      try { render(); } catch(renderErr) { console.error('Render error:', renderErr); }
+    }
 
-  // Wire all events
-  wireEvents();
+    // Wire all events
+    try { wireEvents(); } catch(wireErr) { console.error('Wire events error:', wireErr); }
 
-  // Populate known clients in settings
-  populateKnownClients();
+    // Populate known clients in settings
+    try { populateKnownClients(); } catch(e) {}
 
-  // Auto-refresh
-  startAutoRefresh();
+    // Auto-refresh
+    startAutoRefresh();
 
-  // If we have credentials, refresh immediately
-  if (state.settings.apiKey && state.settings.secretKey) {
-    await refreshAll();
-  } else {
-    // First run — go to settings
-    setView('settings');
-    showToast('Welcome to MSP Companion — configure your credentials in Settings', 'info');
+    // If we have credentials, refresh immediately
+    if (state.settings.apiKey && state.settings.secretKey) {
+      await refreshAll();
+    } else {
+      setView('settings');
+      showToast('Welcome to MSP Companion — configure your credentials in Settings', 'info');
+    }
+  } catch(bootErr) {
+    console.error('Boot error:', bootErr);
+    document.body.innerHTML = '<div style="padding:40px;font-family:monospace;color:#f87191;background:#071222;height:100vh">' +
+      '<h2 style="color:#00b4d8;margin-bottom:16px">MSP Companion — Startup Error</h2>' +
+      '<p>Open the browser console (F12) and look for red errors.</p>' +
+      '<pre style="margin-top:16px;color:#fcd34d">' + bootErr.message + '</pre>' +
+      '</div>';
   }
 }
 
