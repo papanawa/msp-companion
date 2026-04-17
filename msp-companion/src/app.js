@@ -126,27 +126,136 @@ function normalizeAlert(raw) {
   const src = raw.alertSourceInfo || {};
   const ctx = raw.alertContext || {};
   let alertMessage = raw.alertMessage || '';
-  const cls = ctx['@class'] || '';
-  if (cls.includes('PerfDiskUsageContext') || cls.includes('DiskUsage')) {
-    const free = ctx.freeSpace ?? ctx.freeSpaceBytes;
-    const total = ctx.driveCapacity ?? ctx.totalSpaceBytes;
-    const drive = ctx.driveLetter || ctx.volume || 'C:';
-    if (free !== undefined && total !== undefined) {
-      const freeMB  = free  > 1e9 ? (free/1e9).toFixed(1)+' GB'  : (free/1e6).toFixed(0)+' MB';
-      const totMB   = total > 1e9 ? (total/1e9).toFixed(1)+' GB' : (total/1e6).toFixed(0)+' MB';
-      const pct     = total > 0 ? Math.round((1 - free/total)*100) : 0;
-      alertMessage  = `Disk Usage Alert: ${drive} — ${freeMB} free of ${totMB} (${pct}% Used)`;
+  const cls = (ctx['@class'] || '').toLowerCase();
+  const monitorType = (raw.alertMonitorType || raw.monitorType || '').toLowerCase();
+
+  // Try to build a meaningful message if we don't already have one
+  if (!alertMessage || alertMessage === 'Alert triggered') {
+
+    // ── Disk Usage ────────────────────────────────────────────────
+    if (cls.includes('diskusage') || cls.includes('disk') || monitorType.includes('disk')) {
+      const free  = ctx.freeSpace ?? ctx.freeSpaceBytes ?? ctx.free;
+      const total = ctx.driveCapacity ?? ctx.totalSpaceBytes ?? ctx.total ?? ctx.capacity;
+      const drive = ctx.driveLetter || ctx.volume || ctx.drive || 'C:';
+      const pct   = ctx.usagePercent ?? ctx.percentUsed ?? ctx.percent;
+      if (free !== undefined && total !== undefined) {
+        const freeStr  = free  > 1e9 ? (free/1e9).toFixed(1)+' GB'  : (free/1e6).toFixed(0)+' MB';
+        const totalStr = total > 1e9 ? (total/1e9).toFixed(1)+' GB' : (total/1e6).toFixed(0)+' MB';
+        const pctVal   = total > 0 ? Math.round((1 - free/total)*100) : (pct || 0);
+        alertMessage = `Disk Usage: ${drive} — ${freeStr} free of ${totalStr} (${pctVal}% used)`;
+      } else if (pct !== undefined) {
+        alertMessage = `Disk Usage: ${drive} — ${pct}% used`;
+      } else if (ctx.threshold) {
+        alertMessage = `Disk Usage: ${drive} — exceeded ${ctx.threshold}% threshold`;
+      }
     }
-  } else if (!alertMessage && ctx.message)      alertMessage = ctx.message;
-  else if (!alertMessage && ctx.description)    alertMessage = ctx.description;
+
+    // ── CPU ───────────────────────────────────────────────────────
+    else if (cls.includes('cpu') || monitorType.includes('cpu')) {
+      const usage = ctx.cpuUsage ?? ctx.usage ?? ctx.percent ?? ctx.value;
+      const threshold = ctx.threshold ?? ctx.alertThreshold;
+      if (usage !== undefined) alertMessage = `CPU Usage: ${Math.round(usage)}%${threshold ? ` (threshold: ${threshold}%)` : ''}`;
+      else if (threshold) alertMessage = `CPU Usage exceeded ${threshold}% threshold`;
+    }
+
+    // ── Memory / RAM ──────────────────────────────────────────────
+    else if (cls.includes('memory') || cls.includes('ram') || monitorType.includes('memory')) {
+      const usage = ctx.memoryUsage ?? ctx.usage ?? ctx.percent ?? ctx.value;
+      const free  = ctx.freeMemory ?? ctx.free;
+      const total = ctx.totalMemory ?? ctx.total;
+      if (free !== undefined && total !== undefined) {
+        const freeStr  = free  > 1e9 ? (free/1e9).toFixed(1)+' GB'  : (free/1e6).toFixed(0)+' MB';
+        const totalStr = total > 1e9 ? (total/1e9).toFixed(1)+' GB' : (total/1e6).toFixed(0)+' MB';
+        alertMessage = `Memory: ${freeStr} free of ${totalStr} (${Math.round((1-free/total)*100)}% used)`;
+      } else if (usage !== undefined) {
+        alertMessage = `Memory Usage: ${Math.round(usage)}%`;
+      }
+    }
+
+    // ── Network / Connectivity ────────────────────────────────────
+    else if (cls.includes('network') || cls.includes('connectivity') || monitorType.includes('network') || monitorType.includes('ping')) {
+      const iface = ctx.interface || ctx.networkInterface || ctx.adapter || '';
+      const latency = ctx.latency ?? ctx.responseTime ?? ctx.pingTime;
+      const loss = ctx.packetLoss ?? ctx.loss;
+      if (loss !== undefined) alertMessage = `Network: ${iface ? iface+' — ' : ''}${loss}% packet loss${latency ? `, ${latency}ms latency` : ''}`;
+      else if (latency !== undefined) alertMessage = `Network: ${iface ? iface+' — ' : ''}${latency}ms response time`;
+      else alertMessage = `Network connectivity issue${iface ? ': '+iface : ''}`;
+    }
+
+    // ── Service / Process ─────────────────────────────────────────
+    else if (cls.includes('service') || cls.includes('process') || monitorType.includes('service')) {
+      const service = ctx.serviceName || ctx.processName || ctx.name || ctx.service || '';
+      const status  = ctx.status || ctx.state || '';
+      if (service) alertMessage = `Service ${status ? status+': ' : 'alert: '}${service}`;
+      else alertMessage = `Service/process alert${status ? ': '+status : ''}`;
+    }
+
+    // ── Backup ────────────────────────────────────────────────────
+    else if (cls.includes('backup') || monitorType.includes('backup')) {
+      const job    = ctx.jobName || ctx.backupJob || ctx.name || '';
+      const status = ctx.status || ctx.result || ctx.state || '';
+      const size   = ctx.backupSize ?? ctx.size;
+      const sizeStr = size ? (size > 1e9 ? (size/1e9).toFixed(1)+' GB' : (size/1e6).toFixed(0)+' MB') : '';
+      alertMessage = `Backup ${status || 'alert'}${job ? ': '+job : ''}${sizeStr ? ' ('+sizeStr+')' : ''}`;
+    }
+
+    // ── Temperature ───────────────────────────────────────────────
+    else if (cls.includes('temp') || monitorType.includes('temp')) {
+      const temp  = ctx.temperature ?? ctx.temp ?? ctx.value;
+      const unit  = ctx.unit || 'C';
+      const comp  = ctx.component || ctx.sensor || '';
+      if (temp !== undefined) alertMessage = `Temperature: ${temp}°${unit}${comp ? ' ('+comp+')' : ''}`;
+    }
+
+    // ── Event Log ─────────────────────────────────────────────────
+    else if (cls.includes('event') || monitorType.includes('event')) {
+      const source = ctx.source || ctx.eventSource || '';
+      const id     = ctx.eventId || ctx.id || '';
+      const msg    = ctx.eventMessage || ctx.logMessage || '';
+      if (msg) alertMessage = `Event Log: ${msg.substring(0, 100)}`;
+      else alertMessage = `Event Log alert${source ? ': '+source : ''}${id ? ' (ID: '+id+')' : ''}`;
+    }
+
+    // ── SNMP ──────────────────────────────────────────────────────
+    else if (cls.includes('snmp') || monitorType.includes('snmp')) {
+      const oid = ctx.oid || ctx.objectId || '';
+      const val = ctx.value ?? ctx.currentValue;
+      alertMessage = `SNMP alert${oid ? ': '+oid : ''}${val !== undefined ? ' — value: '+val : ''}`;
+    }
+
+    // ── Generic fallback — scrape anything useful from context ────
+    else {
+      const candidates = [
+        ctx.message, ctx.description, ctx.details, ctx.summary,
+        ctx.alertMessage, ctx.text, ctx.info,
+        ctx.errorMessage, ctx.error,
+      ].filter(Boolean);
+      if (candidates.length) {
+        alertMessage = String(candidates[0]).substring(0, 200);
+      } else {
+        // Last resort — show monitor type and any numeric values
+        const vals = Object.entries(ctx)
+          .filter(([k,v]) => typeof v === 'number' && !k.startsWith('@'))
+          .map(([k,v]) => `${k}: ${v}`)
+          .slice(0, 3)
+          .join(', ');
+        const rawType = raw.alertMonitorType || cls.split('.').pop() || '';
+        alertMessage = rawType
+          ? `${rawType.replace(/_/g,' ').replace(/ctx$/i,'').trim()} alert${vals ? ' — '+vals : ''}`
+          : (vals || 'Alert triggered — check Datto RMM for details');
+      }
+    }
+  }
+
   return {
     alertUid:    raw.alertUid || raw.id,
     hostname:    src.deviceName || raw.deviceName || 'Unknown Device',
     siteName:    src.siteName   || raw.siteName   || 'Unknown Client',
     siteUid:     src.siteUid   || raw.siteUid,
     priority:    raw.priority   || 'Information',
-    monitorType: (cls.split('.').pop() || raw.alertMonitorType || 'Unknown').replace('Context','').replace(/([A-Z])/g,' $1').trim(),
-    alertMessage: alertMessage || 'Alert triggered',
+    monitorType: (raw.alertMonitorType || cls.split('.').pop() || 'Unknown')
+      .replace(/Context$/i,'').replace(/_/g,' ').replace(/([A-Z])/g,' $1').trim(),
+    alertMessage: alertMessage || 'Alert triggered — check Datto RMM for details',
     ticketNumber: raw.ticketNumber || null,
     timestampMs:  raw.createdAt ? new Date(raw.createdAt).getTime() : Date.now(),
     alertContext: ctx,
