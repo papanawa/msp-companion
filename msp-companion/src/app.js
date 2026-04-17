@@ -362,7 +362,15 @@ async function fetchAtTicketQueue() {
   const resourceMap = {};
   state.atResources.forEach(r => { resourceMap[r.id] = r.name; });
 
-  // Enrich tickets with status info and resource names
+  // Build companyID -> name map from existing alerts and sites
+  const companyNameMap = {};
+  state.alerts.forEach(a => { if (a.siteName) companyNameMap[a.siteUid] = a.siteName; });
+  state.sites.forEach(s => {
+    if (s.id && s.name) companyNameMap[s.id] = s.name;
+    if (s.uid && s.name) companyNameMap[s.uid] = s.name;
+  });
+
+  // Enrich tickets with status info, resource names, and company names
   const pl2 = state.atStatusPicklist || {};
   items.forEach(t => {
     const si = pl2[t.status] || { label: `Status ${t.status}`, color: '#8bacc8', done: false };
@@ -370,6 +378,7 @@ async function fetchAtTicketQueue() {
     t.statusColor = si.color;
     t.isDone = si.done;
     t.assignedResourceName = t.assignedResourceID ? (resourceMap[t.assignedResourceID] || `Resource ${t.assignedResourceID}`) : null;
+    t.companyName = companyNameMap[t.companyID] || null;
   });
 
   return items;
@@ -599,7 +608,7 @@ function renderDashboard() {
   const high    = visible.filter(a => a.priority === 'High');
   const noTicket = visible.filter(a => !a.ticketNumber);
   const mismatch = visible.filter(a => a.ticketNumber && state.tickets[a.ticketNumber]?.isDone);
-  const openTickets = Object.values(state.tickets).filter(t => !t.isDone);
+  const openTickets = Object.values(state.tickets).filter(t => !t.isDone && (!t.companyName || !state.excludedClients.has(t.companyName)));
 
   // Update stat cards
   setText('statOpenAlerts', visible.length);
@@ -958,8 +967,13 @@ function renderTicketList() {
   const el = $('ticketList');
   if (!el) return;
 
-  // Include all tickets that are NOT complete or closed
-  const tickets = Object.values(state.tickets).filter(t => !t.isDone);
+  // Include all tickets that are NOT complete or closed and not from excluded clients
+  const tickets = Object.values(state.tickets).filter(t => {
+    if (t.isDone) return false;
+    // Filter by excluded clients — match on companyName if available
+    if (t.companyName && state.excludedClients.has(t.companyName)) return false;
+    return true;
+  });
   if (!tickets.length) {
     el.innerHTML = '<div class="loading-state">No open tickets — click Refresh to load</div>';
     return;
@@ -1019,7 +1033,7 @@ function renderQueueList() {
   const el = $('queueList');
   if (!el) return;
   const alerts  = getVisibleAlerts();
-  const tickets = Object.values(state.tickets).filter(t => !t.isDone);
+  const tickets = Object.values(state.tickets).filter(t => !t.isDone && (!t.companyName || !state.excludedClients.has(t.companyName)));
 
   // Merge and sort — critical alerts first, then open tickets
   const items = [
@@ -1226,11 +1240,24 @@ function wireEvents() {
     if (btn) { btn.textContent = '↺ Loading...'; btn.disabled = true; }
     try {
       const items = await fetchAtTicketQueue();
+      // Build companyID -> name map from alerts (alerts have siteName)
+      const companyNameMap = {};
+      state.alerts.forEach(a => {
+        if (a.siteUid && a.siteName) companyNameMap[a.siteUid] = a.siteName;
+      });
+      // Also use sites data if available
+      state.sites.forEach(s => {
+        if (s.id && s.name) companyNameMap[s.id] = s.name;
+        if (s.uid && s.name) companyNameMap[s.uid] = s.name;
+      });
+
       items.forEach(t => {
+        // Try to resolve company name from companyID
+        const companyName = companyNameMap[t.companyID] || t.companyName || null;
         state.tickets[t.ticketNumber] = {
           id: t.id, ticketNumber: t.ticketNumber,
           status: t.status, statusLabel: t.statusLabel, statusColor: t.statusColor, isDone: t.isDone,
-          title: t.title, companyID: t.companyID, lastActivity: t.lastActivityDate,
+          title: t.title, companyID: t.companyID, companyName, lastActivity: t.lastActivityDate,
           assignedResourceID: t.assignedResourceID, assignedResourceName: t.assignedResourceName,
         };
       });
