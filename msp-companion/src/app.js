@@ -949,17 +949,41 @@ function showKBModal(prefill={}) {
 function renderExcludedChips() {
   const el=$('excludedChips'); if(!el) return;
   const clients=[...state.excludedClients];
-  if (!clients.length) { el.innerHTML='<span style="font-family:var(--cond);font-size:11px;color:var(--textdim)">No clients excluded</span>'; return; }
-  el.innerHTML=clients.map(c=>`<span class="excluded-chip">🚫 ${esc(c)}<span class="excluded-chip-remove" data-remove="${esc(c)}">×</span></span>`).join('');
+  el.innerHTML = '';
+  if (!clients.length) {
+    const s = document.createElement('span');
+    s.style.cssText = 'font-family:var(--cond);font-size:11px;color:var(--textdim)';
+    s.textContent = 'No clients excluded';
+    el.appendChild(s);
+    return;
+  }
+  clients.forEach(c => {
+    const chip = document.createElement('span');
+    chip.className = 'excluded-chip';
+    chip.textContent = '🚫 ' + c + ' ';
+    const rem = document.createElement('span');
+    rem.className = 'excluded-chip-remove';
+    rem.textContent = '×';
+    rem.dataset.remove = c; // Raw string — no encoding
+    chip.appendChild(rem);
+    el.appendChild(chip);
+  });
 }
 
 function populateKnownClients() {
   const el=$('knownClientsList'); if(!el) return;
-  // Combine Datto site names AND Autotask company names
   const fromAlerts = state.alerts.map(a=>a.siteName).filter(Boolean);
   const fromAt = Object.values(atCompanyCache).filter(Boolean);
   const known = [...new Set([...fromAlerts, ...fromAt])].sort();
-  el.innerHTML=known.map(c=>`<span class="known-chip ${state.excludedClients.has(c)?'excluded':''}" data-known="${esc(c)}">${state.excludedClients.has(c)?'🚫 ':''}${esc(c)}</span>`).join('');
+  // Use a div trick to set data attribute safely without HTML encoding issues
+  el.innerHTML = '';
+  known.forEach(c => {
+    const span = document.createElement('span');
+    span.className = 'known-chip' + (state.excludedClients.has(c) ? ' excluded' : '');
+    span.textContent = (state.excludedClients.has(c) ? '🚫 ' : '') + c;
+    span.dataset.known = c; // Raw string — no HTML encoding
+    el.appendChild(span);
+  });
 }
 
 function showSettingsStatus(id, msg, type) {
@@ -1324,7 +1348,11 @@ function wireEvents() {
   // Settings — Excluded clients
   $('addExcludeBtn')?.addEventListener('click', () => {
     const val=$('excludeInput')?.value.trim();
-    if(val&&!state.excludedClients.has(val)){state.excludedClients.add(val);if($('excludeInput'))$('excludeInput').value='';renderExcludedChips();}
+    if(val&&!state.excludedClients.has(val)){
+      state.excludedClients.add(val);
+      if($('excludeInput'))$('excludeInput').value='';
+      renderExcludedChips();
+    }
   });
   $('excludeInput')?.addEventListener('keydown', e=>{if(e.key==='Enter')$('addExcludeBtn')?.click();});
   $('saveExcludeBtn')?.addEventListener('click', () => {
