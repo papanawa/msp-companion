@@ -7,6 +7,7 @@ const state = {
   resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(), atQueues: [],
   notesDrafts: {}, aiResults: {}, chatHistories: {},
   kbContextCache: {}, historyContextCache: {},
+  investigations: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
   autoRefreshTimer: null,
@@ -58,6 +59,7 @@ function loadSettings() {
   state.chatHistories = LS.get('msp_chats', {});
   state.kbContextCache      = LS.get('msp_kb_context_cache', {});
   state.historyContextCache = LS.get('msp_history_context_cache', {});
+  state.investigations      = LS.get('msp_investigations', {});
   const s = state.settings;
   setVal('set-apiKey',          s.apiKey || '');
   setVal('set-secretKey',       s.secretKey || '');
@@ -915,6 +917,198 @@ async function getHistoryContextForAlert(alert) {
   } catch(e) { console.warn('History context build failed:', e.message); return ''; }
 }
 
+// ─── TICKET INVESTIGATION (ANALYZE → CHECKLIST → DRAFT RESOLUTION) ─
+const INV_STEP_NOTES_MAX = 2000;
+
+function saveInvestigations() { LS.set('msp_investigations', state.investigations); }
+
+function getInvestigation(ticketId) {
+  const key = String(ticketId);
+  return state.investigations[key] || null;
+}
+
+function setInvestigation(ticketId, inv) {
+  const key = String(ticketId);
+  state.investigations[key] = inv;
+  saveInvestigations();
+}
+
+function newStepId() { return 's-' + Math.random().toString(36).slice(2, 10); }
+
+async function fetchAtTicketFull(ticketId) {
+  try {
+    const data = await atFetch(`/Tickets/${ticketId}`);
+    return data?.item || data || null;
+  } catch(e) { console.warn('Ticket fetch failed:', e.message); return null; }
+}
+
+async function fetchAtTicketNotes(ticketId) {
+  // Uses the standard AT REST child-collection query pattern
+  try {
+    const data = await atFetch(`/Tickets/${ticketId}/Notes/query`, 'POST', {
+      MaxRecords: 10,
+      filter: [{ op: 'gte', field: 'id', value: 0 }],
+      IncludeFields: ['id','title','description','noteType','createDateTime','lastActivityDate'],
+    });
+    const items = data?.items || [];
+    // Newest-first by createDateTime / lastActivityDate
+    items.sort((a,b) => {
+      const aT = a.createDateTime || a.lastActivityDate || '';
+      const bT = b.createDateTime || b.lastActivityDate || '';
+      return bT.localeCompare(aT);
+    });
+    return items.slice(0, 5).map(n => ({
+      title: (n.title || '').substring(0, 120),
+      description: (n.description || '').substring(0, 500),
+      date: (n.createDateTime || n.lastActivityDate || '').substring(0, 10),
+    }));
+  } catch(e) { console.warn('AT notes fetch failed (non-fatal):', e.message); return []; }
+}
+
+function findLinkedAlertForTicket(ticket) {
+  if (!ticket?.ticketNumber) return null;
+  return state.alerts.find(a => a.ticketNumber === ticket.ticketNumber) || null;
+}
+
+async function buildTicketContextBlob(ticket) {
+  // Pull ticket data, recent AT notes, KB + history context, and linked-alert context in parallel
+  const linkedAlert = findLinkedAlertForTicket(ticket);
+  const [fullTicket, atNotes, kbCtx, histCtx] = await Promise.all([
+    fetchAtTicketFull(ticket.id),
+    fetchAtTicketNotes(ticket.id),
+    // Reuse Tier C engine — use the linked alert if present, otherwise synthesize a minimal "alert" from ticket data
+    linkedAlert ? getKbContextForAlert(linkedAlert) : Promise.resolve(''),
+    linkedAlert ? getHistoryContextForAlert(linkedAlert) : getHistoryContextForAlert({
+      alertUid: 'ticket-' + ticket.id,
+      siteName: ticket.companyName,
+      monitorType: 'Ticket',
+      alertMessage: ticket.title || '',
+    }),
+  ]);
+
+  const pieces = [];
+  pieces.push(`TICKET ${ticket.ticketNumber || ticket.id}`);
+  pieces.push(`Title: ${ticket.title || '(no title)'}`);
+  if (ticket.companyName)    pieces.push(`Client: ${ticket.companyName}`);
+  if (ticket.statusLabel)    pieces.push(`Status: ${ticket.statusLabel}`);
+  if (fullTicket?.description) pieces.push(`\nDescription:\n${fullTicket.description.substring(0, 1500)}`);
+
+  if (linkedAlert) {
+    pieces.push(`\nLINKED DATTO ALERT:`);
+    pieces.push(`Device: ${linkedAlert.hostname}`);
+    pieces.push(`Monitor: ${linkedAlert.monitorType}`);
+    pieces.push(`Priority: ${linkedAlert.priority}`);
+    pieces.push(`Alert: ${linkedAlert.alertMessage}`);
+    const alertAi = state.aiResults[linkedAlert.alertUid];
+    if (alertAi) pieces.push(`\nPRIOR ALERT TRIAGE:\n${alertAi.substring(0, 800)}`);
+  }
+
+  if (atNotes.length) {
+    pieces.push('\n── RECENT AUTOTASK NOTES ──');
+    atNotes.forEach((n, i) => {
+      pieces.push(`\nNOTE-${i+1} (${n.date || 'no date'}): ${n.title || '(no title)'}`);
+      if (n.description) pieces.push(n.description);
+    });
+  }
+
+  return pieces.join('\n') + (kbCtx || '') + (histCtx || '');
+}
+
+function buildTicketInvestigationSystemPrompt() {
+  return `You are an expert MSP tier-2/3 engineer at Synobis Network Solutions. You investigate tickets and produce a concrete, ordered action plan a technician can execute.
+
+Use all provided context (ticket detail, AT notes, linked Datto alert, KB articles, client history) to understand the issue and produce a plan.
+
+Respond ONLY with valid JSON in this EXACT shape, no markdown fences, no preamble:
+
+{
+  "understanding": "2-3 sentences describing the issue and most likely root cause.",
+  "confidence": 0-100,
+  "relevantContext": ["brief bullet citing which KB article or prior ticket informed the plan, if any"],
+  "plan": [
+    { "num": 1, "text": "Concrete actionable step with specific commands, paths, or check criteria." },
+    { "num": 2, "text": "..." }
+  ]
+}
+
+Rules:
+- plan MUST have 4-7 steps, ordered from verify-first → remediate → verify-after → document.
+- Each step must be concrete and verifiable. Prefer exact commands, file paths, UI navigation ("Services.msc → find X → Restart"), or specific thresholds.
+- Avoid steps like "investigate further" or "check logs" without saying which logs.
+- relevantContext may be an empty array if nothing provided was materially relevant. Do not invent citations.
+- Do not restate the ticket description. Do not include markdown.`;
+}
+
+function buildResolutionDraftSystemPrompt() {
+  return `You are an MSP technician writing a resolution note for Autotask. You receive the ticket's plan and the technician's per-step notes documenting what they actually did.
+
+Write a professional, concise resolution note suitable for posting to the client-visible ticket record.
+
+STRICT RULES:
+- Use ONLY information present in the step notes. Do NOT invent actions, findings, diagnostics, or outcomes not mentioned in the notes.
+- If step notes are thin, empty, or only partially filled in, write a brief honest note acknowledging the work done and suggest reviewing the ticket timeline. Do not fabricate.
+- Past tense, flowing professional prose. No bullet points, no headers, no step-by-step rehash.
+- 3-5 sentences. Tight.
+- MSP tone: factual, calm, confident. Not salesy.
+- Return only the resolution text. No preamble, no sign-off, no quotes.`;
+}
+
+function formatStepNotesForResolution(steps) {
+  const lines = [];
+  steps.forEach((s, i) => {
+    const num = i + 1;
+    const done = s.done ? '[DONE]' : '[NOT DONE]';
+    const mins = s.minutes ? ` (${s.minutes}m)` : '';
+    lines.push(`Step ${num} ${done}${mins}: ${s.text || '(no step text)'}`);
+    if (s.notes?.trim()) lines.push(`Notes: ${s.notes.trim()}`);
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
+async function runTicketInvestigation(ticket, progressFn) {
+  progressFn?.('Gathering ticket context...');
+  const contextBlob = await buildTicketContextBlob(ticket);
+  progressFn?.('Analyzing with AI...');
+  const system = buildTicketInvestigationSystemPrompt();
+  const userMessage = `INVESTIGATE THIS TICKET AND PRODUCE A PLAN.\n\n${contextBlob}`;
+  const raw = await callAI(system, [{ role: 'user', content: userMessage }]);
+  // Strip potential code fences
+  const cleaned = (raw || '').replace(/```json|```/g, '').trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch(e) {
+    throw new Error('AI returned non-JSON. Raw: ' + cleaned.substring(0, 200));
+  }
+  if (!Array.isArray(parsed.plan) || !parsed.plan.length) throw new Error('AI response missing a plan array');
+  // Build investigation state
+  const steps = parsed.plan.map(p => ({
+    id: newStepId(),
+    text: String(p.text || '').trim(),
+    done: false,
+    notes: '',
+    minutes: 0,
+  }));
+  return {
+    analysis: {
+      understanding: String(parsed.understanding || '').trim(),
+      confidence: parseInt(parsed.confidence) || 0,
+      relevantContext: Array.isArray(parsed.relevantContext) ? parsed.relevantContext.slice(0, 6) : [],
+    },
+    steps,
+    lastAnalyzedAt: Date.now(),
+  };
+}
+
+async function draftResolutionFromSteps(ticket, investigation) {
+  if (!investigation?.steps?.length) throw new Error('No investigation plan to draft from');
+  const system = buildResolutionDraftSystemPrompt();
+  const userMessage = `TICKET: ${ticket.ticketNumber || ticket.id} — ${ticket.title || ''}\n\nSTEP NOTES:\n${formatStepNotesForResolution(investigation.steps)}`;
+  const text = await callAI(system, [{ role: 'user', content: userMessage }]);
+  return (text || '').trim();
+}
+
 // ─── ALERT AI SYSTEM PROMPT ───────────────────────────────────────
 async function buildAlertSystemPrompt(alert) {
   const ticket = alert.ticketNumber ? state.tickets[alert.ticketNumber] : null;
@@ -1360,6 +1554,68 @@ function renderTicketList() {
   }).join('');
 }
 
+function renderInvestigationCard(ticket) {
+  const inv = getInvestigation(ticket.id);
+  const hasInv = !!(inv && inv.steps?.length);
+  const headerHtml = `<div class="card-label" style="display:flex;align-items:center;justify-content:space-between">
+    <span>★ AI INVESTIGATION</span>
+    ${hasInv ? `<span style="font-size:11px;color:var(--textdim);font-weight:400;letter-spacing:0.03em;text-transform:none">Last analyzed ${new Date(inv.lastAnalyzedAt).toLocaleString()}</span>` : ''}
+  </div>`;
+
+  if (!hasInv) {
+    return `<div class="detail-card" id="investigationCard">
+      ${headerHtml}
+      <div style="color:var(--textdim);font-size:12px;margin:8px 0 12px">Pulls ticket detail, Autotask notes, KB articles, client history, and any linked Datto alert. Produces an editable action plan.</div>
+      <button class="abtn abtn-ai" data-action="ticket-analyze" data-ticket-id="${ticket.id}">▶ ANALYZE TICKET</button>
+      <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
+    </div>`;
+  }
+
+  const { analysis, steps } = inv;
+  const conf = analysis.confidence || 0;
+  const confColor = conf >= 75 ? '#2a9d5c' : conf >= 50 ? '#c8a000' : '#e07b00';
+  const ctxBadges = (analysis.relevantContext || []).map(c =>
+    `<div class="inv-ctx-badge">${esc(c)}</div>`
+  ).join('');
+
+  const stepsHtml = steps.map((s, idx) => `
+    <div class="inv-step ${s.done?'inv-step-done':''}" data-step-id="${esc(s.id)}" data-ticket-id="${ticket.id}">
+      <div class="inv-step-header">
+        <input type="checkbox" class="inv-step-done-cb" data-action="inv-step-toggle" ${s.done?'checked':''} />
+        <span class="inv-step-num">${idx+1}</span>
+        <input type="text" class="inv-step-text" data-action="inv-step-text" value="${esc(s.text)}" placeholder="Step description..." />
+        <button class="inv-step-btn" data-action="inv-step-up"  title="Move up"   ${idx===0?'disabled':''}>↑</button>
+        <button class="inv-step-btn" data-action="inv-step-down" title="Move down" ${idx===steps.length-1?'disabled':''}>↓</button>
+        <input type="number" class="inv-step-mins" data-action="inv-step-mins" value="${s.minutes||''}" placeholder="min" min="0" />
+        <button class="inv-step-btn inv-step-delete" data-action="inv-step-delete" title="Delete step">×</button>
+      </div>
+      <textarea class="inv-step-notes" data-action="inv-step-notes" placeholder="What did you do / find?" maxlength="${INV_STEP_NOTES_MAX}">${esc(s.notes||'')}</textarea>
+    </div>
+  `).join('');
+
+  return `<div class="detail-card" id="investigationCard">
+    ${headerHtml}
+    <div class="inv-analysis">
+      <div class="inv-analysis-row">
+        <span class="inv-conf-badge" style="color:${confColor};background:${confColor}22;border:1px solid ${confColor}55">CONFIDENCE ${conf}%</span>
+      </div>
+      <div class="inv-understanding">${esc(analysis.understanding || '(no summary)')}</div>
+      ${ctxBadges ? `<div class="inv-ctx-wrap">${ctxBadges}</div>` : ''}
+    </div>
+    <div class="inv-steps-wrap">
+      ${stepsHtml}
+    </div>
+    <div class="inv-step-add-row">
+      <button class="abtn abtn-kb" data-action="inv-step-add" data-ticket-id="${ticket.id}" style="font-size:11px;padding:6px 10px">+ ADD STEP</button>
+    </div>
+    <div class="inv-actions-row">
+      <button class="abtn abtn-ghost" data-action="ticket-reanalyze" data-ticket-id="${ticket.id}">↺ Re-analyze</button>
+      <button class="abtn abtn-ai" data-action="ticket-draft-resolution" data-ticket-id="${ticket.id}">✓ DRAFT RESOLUTION</button>
+    </div>
+    <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
+  </div>`;
+}
+
 function renderTicketDetail(ticket) {
   const dp=$('ticketDetail'); if(!dp) return;
   const zone=state.settings.atZone||'14';
@@ -1415,6 +1671,8 @@ function renderTicketDetail(ticket) {
         </div>
       </div>
     </div>
+
+    ${renderInvestigationCard(ticket)}
 
     <div class="detail-card">
       <div class="card-label">✅ RESOLUTION</div>
@@ -2008,10 +2266,112 @@ function wireEvents() {
         renderTicketDetail(ticket);
       }
     }
+
+    // ─── TICKET INVESTIGATION HANDLERS ────────────────────────────
+    const findTicketByBtn = () => {
+      const tid = el.dataset.ticketId;
+      return Object.values(state.tickets).find(t => String(t.id) === tid);
+    };
+
+    const setInvStatus = (msg) => {
+      const s = document.getElementById('investigationStatus');
+      if (s) s.textContent = msg || '';
+    };
+
+    if (action==='ticket-analyze' || action==='ticket-reanalyze') {
+      const ticket = findTicketByBtn(); if (!ticket) return;
+      const origLabel = el.textContent;
+      el.disabled = true;
+      el.textContent = action==='ticket-reanalyze' ? 'Re-analyzing...' : 'Analyzing...';
+      try {
+        if (action==='ticket-reanalyze' && !confirm('Re-analyze will replace the current plan and clear step notes. Proceed?')) {
+          el.disabled = false; el.textContent = origLabel; return;
+        }
+        const inv = await runTicketInvestigation(ticket, setInvStatus);
+        setInvestigation(ticket.id, inv);
+        renderTicketDetail(ticket);
+        showToast('✓ Investigation complete', 'ok');
+      } catch(err) {
+        showToast(`Analyze failed: ${err.message}`, 'err');
+        setInvStatus(`Error: ${err.message}`);
+        el.disabled = false; el.textContent = origLabel;
+      }
+    }
+
+    if (action==='inv-step-add') {
+      const ticket = findTicketByBtn(); if (!ticket) return;
+      const inv = getInvestigation(ticket.id); if (!inv) return;
+      inv.steps.push({ id: newStepId(), text: '', done: false, notes: '', minutes: 0 });
+      setInvestigation(ticket.id, inv);
+      renderTicketDetail(ticket);
+    }
+
+    if (action==='inv-step-delete' || action==='inv-step-up' || action==='inv-step-down') {
+      const stepEl = el.closest('.inv-step'); if (!stepEl) return;
+      const tid = stepEl.dataset.ticketId;
+      const sid = stepEl.dataset.stepId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === tid); if (!ticket) return;
+      const inv = getInvestigation(ticket.id); if (!inv) return;
+      const idx = inv.steps.findIndex(s => s.id === sid);
+      if (idx < 0) return;
+      if (action==='inv-step-delete') {
+        if (!confirm('Delete this step?')) return;
+        inv.steps.splice(idx, 1);
+      } else if (action==='inv-step-up' && idx > 0) {
+        [inv.steps[idx-1], inv.steps[idx]] = [inv.steps[idx], inv.steps[idx-1]];
+      } else if (action==='inv-step-down' && idx < inv.steps.length - 1) {
+        [inv.steps[idx], inv.steps[idx+1]] = [inv.steps[idx+1], inv.steps[idx]];
+      }
+      setInvestigation(ticket.id, inv);
+      renderTicketDetail(ticket);
+    }
+
+    if (action==='ticket-draft-resolution') {
+      const ticket = findTicketByBtn(); if (!ticket) return;
+      const inv = getInvestigation(ticket.id); if (!inv) return;
+      const hasAnyNotes = inv.steps.some(s => s.notes?.trim());
+      if (!hasAnyNotes) {
+        if (!confirm('No step notes captured yet. Draft will be minimal / honest about lack of documentation. Continue?')) return;
+      }
+      const origLabel = el.textContent;
+      el.disabled = true; el.textContent = 'Drafting...';
+      try {
+        setInvStatus('Drafting resolution from step notes...');
+        const draft = await draftResolutionFromSteps(ticket, inv);
+        const resInput = document.getElementById('ticketNotesInput');
+        if (resInput) {
+          resInput.value = draft;
+          state.notesDrafts['ticket-'+ticket.id] = draft;
+          LS.set('msp_notes', state.notesDrafts);
+          resInput.focus();
+          resInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        setInvStatus('✓ Draft ready — review and edit above, then POST RESOLUTION');
+        showToast('✓ Resolution drafted — review before posting', 'ok');
+      } catch(err) {
+        showToast(`Draft failed: ${err.message}`, 'err');
+        setInvStatus(`Error: ${err.message}`);
+      } finally {
+        el.disabled = false; el.textContent = origLabel;
+      }
+    }
   });
 
   // Ticket field inline edits (status, priority, queue, resource)
   document.addEventListener('change', async e => {
+    // Investigation: toggle step done
+    if (e.target.classList?.contains('inv-step-done-cb')) {
+      const stepEl = e.target.closest('.inv-step'); if (!stepEl) return;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
+      if (!ticket) return;
+      const inv = getInvestigation(ticket.id); if (!inv) return;
+      const step = inv.steps.find(s => s.id === stepEl.dataset.stepId);
+      if (!step) return;
+      step.done = !!e.target.checked;
+      setInvestigation(ticket.id, inv);
+      stepEl.classList.toggle('inv-step-done', step.done);
+      return;
+    }
     if (!e.target.classList?.contains('ticket-field-select')) return;
     const sel = e.target;
     const ticketId = sel.dataset.ticketId;
@@ -2054,6 +2414,21 @@ function wireEvents() {
     if(e.target.id==='ticketNotesInput'){
       const ticketId=state.currentTicket?.id;
       if(ticketId) state.notesDrafts['ticket-'+ticketId]=e.target.value;
+    }
+    // Investigation per-step autosave (text / notes / minutes)
+    const invField = e.target.dataset?.action;
+    if (invField === 'inv-step-text' || invField === 'inv-step-notes' || invField === 'inv-step-mins') {
+      const stepEl = e.target.closest('.inv-step'); if (!stepEl) return;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
+      if (!ticket) return;
+      const inv = getInvestigation(ticket.id); if (!inv) return;
+      const step = inv.steps.find(s => s.id === stepEl.dataset.stepId); if (!step) return;
+      if (invField === 'inv-step-text')  step.text    = e.target.value;
+      if (invField === 'inv-step-notes') step.notes   = e.target.value.slice(0, INV_STEP_NOTES_MAX);
+      if (invField === 'inv-step-mins')  step.minutes = parseInt(e.target.value) || 0;
+      // Debounce LS writes — schedule via a shared timer
+      clearTimeout(window._invSaveTimer);
+      window._invSaveTimer = setTimeout(() => saveInvestigations(), 400);
     }
   });
 
@@ -2244,6 +2619,162 @@ function injectTierAStyles() {
     .abtn-complete:hover:not(:disabled) {
       background: rgba(42,157,92,0.22);
       border-color: rgba(42,157,92,0.7);
+    }
+    /* AI Investigation card */
+    .abtn-ai {
+      background: linear-gradient(135deg, rgba(147,51,234,0.18), rgba(0,180,216,0.18));
+      border: 1px solid rgba(147,51,234,0.45);
+      color: var(--text);
+      font-weight: 700;
+    }
+    .abtn-ai:hover:not(:disabled) {
+      background: linear-gradient(135deg, rgba(147,51,234,0.28), rgba(0,180,216,0.28));
+      border-color: rgba(147,51,234,0.7);
+    }
+    .abtn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textmid);
+    }
+    .abtn-ghost:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+    .inv-analysis {
+      background: rgba(147,51,234,0.05);
+      border: 1px solid rgba(147,51,234,0.2);
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin: 10px 0 14px;
+    }
+    .inv-analysis-row { margin-bottom: 6px; }
+    .inv-conf-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+    }
+    .inv-understanding {
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--text);
+    }
+    .inv-ctx-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .inv-ctx-badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      background: rgba(0,180,216,0.1);
+      border: 1px solid rgba(0,180,216,0.3);
+      color: var(--textmid);
+    }
+    .inv-steps-wrap { display: flex; flex-direction: column; gap: 8px; }
+    .inv-step {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: var(--bg);
+      transition: opacity 0.15s;
+    }
+    .inv-step.inv-step-done { opacity: 0.55; }
+    .inv-step.inv-step-done .inv-step-text { text-decoration: line-through; color: var(--textdim); }
+    .inv-step-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .inv-step-done-cb {
+      width: 16px; height: 16px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .inv-step-num {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--textdim);
+      min-width: 18px;
+      text-align: center;
+    }
+    .inv-step-text {
+      flex: 1;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text);
+      padding: 4px 6px;
+      border-radius: 3px;
+      font-size: 13px;
+      font-family: inherit;
+      min-width: 0;
+    }
+    .inv-step-text:hover:not(:focus) { border-color: var(--border); }
+    .inv-step-text:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--bg);
+    }
+    .inv-step-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textmid);
+      width: 24px;
+      height: 24px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 13px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .inv-step-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+    .inv-step-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    .inv-step-delete:hover:not(:disabled) { border-color: #c8102e; color: #c8102e; }
+    .inv-step-mins {
+      width: 50px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 3px 5px;
+      border-radius: 3px;
+      font-size: 12px;
+      text-align: center;
+      -moz-appearance: textfield;
+    }
+    .inv-step-mins::-webkit-outer-spin-button,
+    .inv-step-mins::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .inv-step-notes {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 8px;
+      border-radius: 3px;
+      font-size: 12px;
+      font-family: inherit;
+      line-height: 1.45;
+      margin-top: 6px;
+      min-height: 38px;
+      resize: vertical;
+    }
+    .inv-step-notes:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .inv-step-add-row { margin-top: 10px; }
+    .inv-actions-row {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+    @media (max-width: 640px) {
+      .inv-step-header { flex-wrap: wrap; }
+      .inv-step-text { order: 10; flex-basis: 100%; margin-top: 4px; }
     }
   `;
   document.head.appendChild(style);
