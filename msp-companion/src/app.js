@@ -1097,6 +1097,8 @@ function buildTicketInvestigationSystemPrompt() {
 
 Use all provided context (ticket detail, AT notes, linked Datto alert, KB articles, client history) to understand the issue and produce a plan.
 
+If the user message contains a "TECHNICIAN CONTEXT" block, treat it as high-priority input. The technician may specify their usual first steps, environment quirks, specific tools they prefer, prior knowledge about this client, or things they've already tried. Incorporate that guidance into the plan's ordering and step wording. Do not ignore it. Do not contradict it unless the ticket context clearly makes it wrong (and if so, say so in understanding).
+
 Respond ONLY with valid JSON in this EXACT shape, no markdown fences, no preamble:
 
 {
@@ -1144,12 +1146,15 @@ function formatStepNotesForResolution(steps) {
   return lines.join('\n');
 }
 
-async function runTicketInvestigation(ticket, progressFn) {
+async function runTicketInvestigation(ticket, progressFn, techContext) {
   progressFn?.('Gathering ticket context...');
   const contextBlob = await buildTicketContextBlob(ticket);
   progressFn?.('Analyzing with AI...');
   const system = buildTicketInvestigationSystemPrompt();
-  const userMessage = `INVESTIGATE THIS TICKET AND PRODUCE A PLAN.\n\n${contextBlob}`;
+  const techBlock = (techContext || '').trim()
+    ? `\n\n── TECHNICIAN CONTEXT (the tech working this ticket provided the following — treat this as high-priority input that should shape your plan) ──\n${techContext.trim()}`
+    : '';
+  const userMessage = `INVESTIGATE THIS TICKET AND PRODUCE A PLAN.\n\n${contextBlob}${techBlock}`;
   const raw = await callAI(system, [{ role: 'user', content: userMessage }]);
   // Strip potential code fences
   const cleaned = (raw || '').replace(/```json|```/g, '').trim();
@@ -1175,6 +1180,7 @@ async function runTicketInvestigation(ticket, progressFn) {
       relevantContext: Array.isArray(parsed.relevantContext) ? parsed.relevantContext.slice(0, 6) : [],
     },
     steps,
+    techContext: (techContext || '').trim(),
     lastAnalyzedAt: Date.now(),
   };
 }
@@ -1875,9 +1881,14 @@ function renderInvestigationCard(ticket) {
   </div>`;
 
   if (!hasInv) {
+    const draft = state.notesDrafts['tech-ctx-' + ticket.id] || '';
     return `<div class="detail-card" id="investigationCard">
       ${headerHtml}
       <div style="color:var(--textdim);font-size:12px;margin:8px 0 12px">Pulls ticket detail, Autotask notes, KB articles, client history, and any linked Datto alert. Produces an editable action plan.</div>
+      <div class="field-group" style="margin-bottom:10px">
+        <label style="display:block;font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:4px">TECH CONTEXT <span style="font-weight:400;text-transform:none;letter-spacing:0.02em">(optional — your usual first steps, environment quirks, prior knowledge)</span></label>
+        <textarea id="techContextInput" data-ticket-id="${ticket.id}" rows="3" placeholder="e.g. My first step is normally to check if the computer is on. Client runs SQL cluster with AG — don't restart primary without failover. Try cached credentials before AD lookup.">${esc(draft)}</textarea>
+      </div>
       <button class="abtn abtn-ai" data-action="ticket-analyze" data-ticket-id="${ticket.id}">▶ ANALYZE TICKET</button>
       <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
     </div>`;
@@ -1889,6 +1900,10 @@ function renderInvestigationCard(ticket) {
   const ctxBadges = (analysis.relevantContext || []).map(c =>
     `<div class="inv-ctx-badge">${esc(c)}</div>`
   ).join('');
+  const techCtxBlock = inv.techContext ? `<div class="inv-tech-ctx">
+    <div class="inv-tech-ctx-label">TECH CONTEXT USED</div>
+    <div class="inv-tech-ctx-body">${esc(inv.techContext)}</div>
+  </div>` : '';
 
   const stepsHtml = steps.map((s, idx) => `
     <div class="inv-step ${s.done?'inv-step-done':''}" data-step-id="${esc(s.id)}" data-ticket-id="${ticket.id}">
@@ -1913,6 +1928,7 @@ function renderInvestigationCard(ticket) {
       </div>
       <div class="inv-understanding">${esc(analysis.understanding || '(no summary)')}</div>
       ${ctxBadges ? `<div class="inv-ctx-wrap">${ctxBadges}</div>` : ''}
+      ${techCtxBlock}
     </div>
     <div class="inv-steps-wrap">
       ${stepsHtml}
@@ -2597,21 +2613,68 @@ function wireEvents() {
       if (s) s.textContent = msg || '';
     };
 
-    if (action==='ticket-analyze' || action==='ticket-reanalyze') {
+    if (action==='ticket-analyze') {
       const ticket = findTicketByBtn(); if (!ticket) return;
       const origLabel = el.textContent;
       el.disabled = true;
-      el.textContent = action==='ticket-reanalyze' ? 'Re-analyzing...' : 'Analyzing...';
+      el.textContent = 'Analyzing...';
       try {
-        if (action==='ticket-reanalyze' && !confirm('Re-analyze will replace the current plan and clear step notes. Proceed?')) {
-          el.disabled = false; el.textContent = origLabel; return;
-        }
-        const inv = await runTicketInvestigation(ticket, setInvStatus);
+        const techCtxEl = document.getElementById('techContextInput');
+        const techContext = (techCtxEl?.value || '').trim();
+        const inv = await runTicketInvestigation(ticket, setInvStatus, techContext);
         setInvestigation(ticket.id, inv);
+        // Clear the draft context now that it's been folded in
+        delete state.notesDrafts['tech-ctx-' + ticket.id];
+        LS.set('msp_notes', state.notesDrafts);
         renderTicketDetail(ticket);
         showToast('✓ Investigation complete', 'ok');
       } catch(err) {
         showToast(`Analyze failed: ${err.message}`, 'err');
+        setInvStatus(`Error: ${err.message}`);
+        el.disabled = false; el.textContent = origLabel;
+      }
+    }
+
+    if (action==='ticket-reanalyze') {
+      const ticket = findTicketByBtn(); if (!ticket) return;
+      const currentInv = getInvestigation(ticket.id);
+      const priorContext = currentInv?.techContext || '';
+      // Small modal to edit context before re-running
+      const newCtx = await new Promise(resolve => {
+        const modal = document.createElement('div');
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+        modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:20px;width:100%;max-width:520px">
+          <div style="font-family:var(--cond);font-size:14px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">↺ RE-ANALYZE TICKET</div>
+          <div style="font-size:12px;color:var(--textdim);margin-bottom:12px">This will replace the current plan and clear all step notes. Revise your tech context below if needed, then re-run.</div>
+          <label style="display:block;font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:4px">TECH CONTEXT (optional)</label>
+          <textarea id="reAnalyzeCtx" rows="4" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:4px;font-size:13px;font-family:inherit;resize:vertical" placeholder="e.g. Tried restart already. Client is on cellular backup.">${esc(priorContext)}</textarea>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button id="reAnalyzeGo" style="flex:2;cursor:pointer;background:linear-gradient(135deg, rgba(147,51,234,0.25), rgba(0,180,216,0.25));border:1px solid rgba(147,51,234,0.5);color:var(--text);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">▶ RE-ANALYZE</button>
+            <button id="reAnalyzeCancel" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Cancel</button>
+          </div>
+        </div>`;
+        document.body.appendChild(modal);
+        const ctxInput = document.getElementById('reAnalyzeCtx');
+        ctxInput?.focus();
+        document.getElementById('reAnalyzeCancel').addEventListener('click', () => {
+          document.body.removeChild(modal); resolve(null);
+        });
+        document.getElementById('reAnalyzeGo').addEventListener('click', () => {
+          const v = ctxInput?.value || '';
+          document.body.removeChild(modal); resolve(v);
+        });
+      });
+      if (newCtx === null) return; // cancelled
+
+      const origLabel = el.textContent;
+      el.disabled = true; el.textContent = 'Re-analyzing...';
+      try {
+        const inv = await runTicketInvestigation(ticket, setInvStatus, newCtx.trim());
+        setInvestigation(ticket.id, inv);
+        renderTicketDetail(ticket);
+        showToast('✓ Re-analysis complete', 'ok');
+      } catch(err) {
+        showToast(`Re-analyze failed: ${err.message}`, 'err');
         setInvStatus(`Error: ${err.message}`);
         el.disabled = false; el.textContent = origLabel;
       }
@@ -2752,6 +2815,14 @@ function wireEvents() {
     if(e.target.id==='ticketNotesInput'){
       const ticketId=state.currentTicket?.id;
       if(ticketId) state.notesDrafts['ticket-'+ticketId]=e.target.value;
+    }
+    if(e.target.id==='techContextInput'){
+      const ticketId = e.target.dataset.ticketId;
+      if (ticketId) {
+        state.notesDrafts['tech-ctx-' + ticketId] = e.target.value;
+        clearTimeout(window._techCtxSaveTimer);
+        window._techCtxSaveTimer = setTimeout(() => LS.set('msp_notes', state.notesDrafts), 400);
+      }
     }
     // Investigation per-step autosave (text / notes / minutes)
     const invField = e.target.dataset?.action;
@@ -3005,6 +3076,27 @@ function injectTierAStyles() {
       background: rgba(0,180,216,0.1);
       border: 1px solid rgba(0,180,216,0.3);
       color: var(--textmid);
+    }
+    .inv-tech-ctx {
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: rgba(0,180,216,0.06);
+      border-left: 3px solid var(--accent);
+      border-radius: 3px;
+    }
+    .inv-tech-ctx-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .inv-tech-ctx-body {
+      font-size: 12px;
+      color: var(--text);
+      line-height: 1.45;
+      white-space: pre-wrap;
     }
     .inv-steps-wrap { display: flex; flex-direction: column; gap: 8px; }
     .inv-step {
