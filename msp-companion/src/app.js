@@ -1444,8 +1444,9 @@ function wireEvents() {
           lastActivity: new Date().toISOString(),
         };
         LS.set('msp_tickets', state.tickets);
-        // Link alert to ticket
+        // Link alert to ticket and persist
         alert.ticketNumber = newTicket.ticketNumber;
+        LS.set('msp_alerts', state.alerts);
         // Open ticket in Autotask
         const zone = state.settings.atZone || '14';
         const tUrl = `https://ww${zone}.autotask.net/Autotask/AutotaskExtend/ExecuteCommand.aspx?Code=OpenTicketDetail&TicketNumber=${encodeURIComponent(newTicket.ticketNumber)}`;
