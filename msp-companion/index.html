@@ -357,17 +357,32 @@
           </div>
 
           <div class="settings-card">
-            <div class="settings-card-title">🚫 Excluded Clients</div>
-            <div class="field-hint" style="margin-bottom:10px">Alerts from these clients are hidden from all views. Use for co-managed clients who handle their own tickets.</div>
-            <div id="excludedChips" class="excluded-chips"></div>
+            <div class="settings-card-title">⚡ RMM Excluded Clients</div>
+            <div class="field-hint" style="margin-bottom:10px">Alerts from these Datto RMM clients are hidden from all views. Click a known client to toggle exclusion.</div>
+            <div id="rmmExcludedChips" class="excluded-chips"></div>
             <div style="display:flex;gap:8px;margin-top:8px">
-              <input type="text" id="excludeInput" placeholder="Type client name..." autocomplete="off" style="flex:1" />
-              <button class="settings-btn-secondary" id="addExcludeBtn">＋ Add</button>
+              <input type="text" id="rmmExcludeInput" placeholder="Type Datto site name..." autocomplete="off" style="flex:1" />
+              <button class="settings-btn-secondary" id="rmmAddExcludeBtn">＋ Add</button>
             </div>
-            <div class="section-label" style="margin-top:14px">Known clients</div>
-            <div id="knownClientsList" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
+            <div class="section-label" style="margin-top:14px">Known RMM clients</div>
+            <div id="rmmKnownClientsList" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
             <div class="settings-btn-row" style="margin-top:12px">
-              <button class="settings-btn-primary" id="saveExcludeBtn">💾 Save Exclusions</button>
+              <button class="settings-btn-primary" id="rmmSaveExcludeBtn">💾 Save RMM Exclusions</button>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title">🎫 PSA Excluded Clients</div>
+            <div class="field-hint" style="margin-bottom:10px">Tickets from these Autotask clients are hidden from the ticket queue. Click a known client to toggle exclusion.</div>
+            <div id="psaExcludedChips" class="excluded-chips"></div>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <input type="text" id="psaExcludeInput" placeholder="Type Autotask company name..." autocomplete="off" style="flex:1" />
+              <button class="settings-btn-secondary" id="psaAddExcludeBtn">＋ Add</button>
+            </div>
+            <div class="section-label" style="margin-top:14px">Known PSA clients</div>
+            <div id="psaKnownClientsList" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
+            <div class="settings-btn-row" style="margin-top:12px">
+              <button class="settings-btn-primary" id="psaSaveExcludeBtn">💾 Save PSA Exclusions</button>
             </div>
           </div>
 

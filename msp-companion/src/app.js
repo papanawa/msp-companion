@@ -4,7 +4,7 @@
 const state = {
   alerts: [], sites: [], tickets: {},
   atStatusPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
-  resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(),
+  resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(),
   notesDrafts: {}, aiResults: {}, chatHistories: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
@@ -50,7 +50,8 @@ function loadSettings() {
   state.settings      = LS.get('msp_settings', {});
   state.resolvedIds   = new Set(LS.get('msp_resolved', []));
   state.snoozedIds    = new Set(LS.get('msp_snoozed', []));
-  state.excludedClients = new Set(LS.get('msp_excluded', []));
+  state.excludedClients    = new Set(LS.get('msp_excluded', []));
+  state.psaExcludedClients = new Set(LS.get('msp_psa_excluded', []));
   state.notesDrafts   = LS.get('msp_notes', {});
   state.aiResults     = LS.get('msp_ai', {});
   state.chatHistories = LS.get('msp_chats', {});
@@ -486,17 +487,15 @@ function getFilteredAlerts() {
 }
 
 function getOpenTickets() {
-  // Build set of excluded company IDs from the cache for tickets where name lookup failed
+  // Build set of excluded company IDs using PSA exclusion list
   const excludedIds = new Set();
   Object.entries(atCompanyCache).forEach(([id, name]) => {
-    if (state.excludedClients.has(name)) excludedIds.add(parseInt(id));
+    if (state.psaExcludedClients.has(name)) excludedIds.add(parseInt(id));
   });
 
   return Object.values(state.tickets).filter(t => {
     if (t.isDone) return false;
-    // Filter by company name if we have it
-    if (t.companyName && state.excludedClients.has(t.companyName)) return false;
-    // Filter by company ID if name lookup failed but we have the ID in cache
+    if (t.companyName && state.psaExcludedClients.has(t.companyName)) return false;
     if (!t.companyName && t.companyID && excludedIds.has(t.companyID)) return false;
     return true;
   });
@@ -946,44 +945,62 @@ function showKBModal(prefill={}) {
 }
 
 // ─── SETTINGS UI ──────────────────────────────────────────────────
-function renderExcludedChips() {
-  const el=$('excludedChips'); if(!el) return;
-  const clients=[...state.excludedClients];
-  el.innerHTML = '';
+function renderChipList(elId, clientSet) {
+  const el=$(elId); if(!el) return;
+  const clients=[...clientSet];
+  el.innerHTML='';
   if (!clients.length) {
-    const s = document.createElement('span');
-    s.style.cssText = 'font-family:var(--cond);font-size:11px;color:var(--textdim)';
-    s.textContent = 'No clients excluded';
-    el.appendChild(s);
-    return;
+    const s=document.createElement('span');
+    s.style.cssText='font-family:var(--cond);font-size:11px;color:var(--textdim)';
+    s.textContent='No clients excluded';
+    el.appendChild(s); return;
   }
   clients.forEach(c => {
-    const chip = document.createElement('span');
-    chip.className = 'excluded-chip';
-    chip.textContent = '🚫 ' + c + ' ';
-    const rem = document.createElement('span');
-    rem.className = 'excluded-chip-remove';
-    rem.textContent = '×';
-    rem.dataset.remove = c; // Raw string — no encoding
+    const chip=document.createElement('span');
+    chip.className='excluded-chip';
+    chip.textContent='🚫 '+c+' ';
+    const rem=document.createElement('span');
+    rem.className='excluded-chip-remove';
+    rem.textContent='×';
+    rem.dataset.remove=c;
+    rem.dataset.list=elId;
     chip.appendChild(rem);
     el.appendChild(chip);
   });
 }
 
+function renderExcludedChips() {
+  renderChipList('rmmExcludedChips', state.excludedClients);
+  renderChipList('psaExcludedChips', state.psaExcludedClients);
+}
+
 function populateKnownClients() {
-  const el=$('knownClientsList'); if(!el) return;
-  const fromAlerts = state.alerts.map(a=>a.siteName).filter(Boolean);
-  const fromAt = Object.values(atCompanyCache).filter(Boolean);
-  const known = [...new Set([...fromAlerts, ...fromAt])].sort();
-  // Use a div trick to set data attribute safely without HTML encoding issues
-  el.innerHTML = '';
-  known.forEach(c => {
-    const span = document.createElement('span');
-    span.className = 'known-chip' + (state.excludedClients.has(c) ? ' excluded' : '');
-    span.textContent = (state.excludedClients.has(c) ? '🚫 ' : '') + c;
-    span.dataset.known = c; // Raw string — no HTML encoding
-    el.appendChild(span);
-  });
+  // RMM known clients — from Datto alerts
+  const rmmEl=$('rmmKnownClientsList');
+  if (rmmEl) {
+    rmmEl.innerHTML='';
+    const rmmKnown=[...new Set(state.alerts.map(a=>a.siteName).filter(Boolean))].sort();
+    rmmKnown.forEach(c => {
+      const span=document.createElement('span');
+      span.className='known-chip'+(state.excludedClients.has(c)?' excluded':'');
+      span.textContent=(state.excludedClients.has(c)?'🚫 ':'')+c;
+      span.dataset.known=c; span.dataset.list='rmm';
+      rmmEl.appendChild(span);
+    });
+  }
+  // PSA known clients — from Autotask company cache
+  const psaEl=$('psaKnownClientsList');
+  if (psaEl) {
+    psaEl.innerHTML='';
+    const psaKnown=[...new Set(Object.values(atCompanyCache).filter(Boolean))].sort();
+    psaKnown.forEach(c => {
+      const span=document.createElement('span');
+      span.className='known-chip'+(state.psaExcludedClients.has(c)?' excluded':'');
+      span.textContent=(state.psaExcludedClients.has(c)?'🚫 ':'')+c;
+      span.dataset.known=c; span.dataset.list='psa';
+      psaEl.appendChild(span);
+    });
+  }
 }
 
 function showSettingsStatus(id, msg, type) {
@@ -1345,33 +1362,65 @@ function wireEvents() {
     startAutoRefresh(); showSettingsStatus('prefsStatus','✓ Preferences saved','ok');
   });
 
-  // Settings — Excluded clients
-  $('addExcludeBtn')?.addEventListener('click', () => {
-    const val=$('excludeInput')?.value.trim();
+  // Settings — RMM Excluded clients
+  $('rmmAddExcludeBtn')?.addEventListener('click', () => {
+    const val=$('rmmExcludeInput')?.value.trim();
     if(val&&!state.excludedClients.has(val)){
       state.excludedClients.add(val);
-      if($('excludeInput'))$('excludeInput').value='';
+      if($('rmmExcludeInput'))$('rmmExcludeInput').value='';
       renderExcludedChips();
     }
   });
-  $('excludeInput')?.addEventListener('keydown', e=>{if(e.key==='Enter')$('addExcludeBtn')?.click();});
-  $('saveExcludeBtn')?.addEventListener('click', () => {
+  $('rmmExcludeInput')?.addEventListener('keydown', e=>{if(e.key==='Enter')$('rmmAddExcludeBtn')?.click();});
+  $('rmmSaveExcludeBtn')?.addEventListener('click', () => {
     LS.set('msp_excluded',[...state.excludedClients]);
-    render(); showToast(`✓ Saved — ${state.excludedClients.size} client(s) excluded`,'ok');
+    render(); showToast(`✓ RMM exclusions saved — ${state.excludedClients.size} client(s) excluded`,'ok');
   });
-  $('excludedChips')?.addEventListener('click', e=>{
-    const rem=e.target.closest('[data-remove]');
-    if(rem){state.excludedClients.delete(rem.dataset.remove);renderExcludedChips();}
+
+  // Settings — PSA Excluded clients
+  $('psaAddExcludeBtn')?.addEventListener('click', () => {
+    const val=$('psaExcludeInput')?.value.trim();
+    if(val&&!state.psaExcludedClients.has(val)){
+      state.psaExcludedClients.add(val);
+      if($('psaExcludeInput'))$('psaExcludeInput').value='';
+      renderExcludedChips();
+    }
   });
-  $('knownClientsList')?.addEventListener('click', e=>{
-    const chip=e.target.closest('[data-known]'); if(!chip) return;
-    const name=chip.dataset.known;
-    if(state.excludedClients.has(name)) state.excludedClients.delete(name);
-    else state.excludedClients.add(name);
-    chip.classList.toggle('excluded',state.excludedClients.has(name));
-    chip.textContent=(state.excludedClients.has(name)?'🚫 ':'')+name;
+  $('psaExcludeInput')?.addEventListener('keydown', e=>{if(e.key==='Enter')$('psaAddExcludeBtn')?.click();});
+  $('psaSaveExcludeBtn')?.addEventListener('click', () => {
+    LS.set('msp_psa_excluded',[...state.psaExcludedClients]);
+    render(); showToast(`✓ PSA exclusions saved — ${state.psaExcludedClients.size} client(s) excluded`,'ok');
+  });
+
+  // Chip remove — works for both lists
+  document.addEventListener('click', e => {
+    const rem=e.target.closest('.excluded-chip-remove[data-remove]');
+    if (!rem) return;
+    const list=rem.dataset.list, name=rem.dataset.remove;
+    if(list==='psaExcludedChips') state.psaExcludedClients.delete(name);
+    else state.excludedClients.delete(name);
     renderExcludedChips();
-  });
+  }, true);
+
+  // Known client chip toggle — works for both lists
+  document.addEventListener('click', e => {
+    const chip=e.target.closest('.known-chip[data-known]'); if(!chip) return;
+    const name=chip.dataset.known, list=chip.dataset.list;
+    if(list==='psa'){
+      if(state.psaExcludedClients.has(name)) state.psaExcludedClients.delete(name);
+      else state.psaExcludedClients.add(name);
+      chip.classList.toggle('excluded',state.psaExcludedClients.has(name));
+      chip.textContent=(state.psaExcludedClients.has(name)?'🚫 ':'')+name;
+      chip.dataset.known=name;
+    } else {
+      if(state.excludedClients.has(name)) state.excludedClients.delete(name);
+      else state.excludedClients.add(name);
+      chip.classList.toggle('excluded',state.excludedClients.has(name));
+      chip.textContent=(state.excludedClients.has(name)?'🚫 ':'')+name;
+      chip.dataset.known=name;
+    }
+    renderExcludedChips();
+  }, true);
 }
 
 // ─── SERVICE WORKER ───────────────────────────────────────────────
