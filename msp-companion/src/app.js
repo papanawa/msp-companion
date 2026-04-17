@@ -202,10 +202,11 @@ function normalizeAlert(raw) {
     }
 
     // ── Service / Process ─────────────────────────────────────────
-    else if (cls.includes('service') || cls.includes('process') || monitorType.includes('service')) {
+    else if (cls.includes('srvc') || cls.includes('service') || cls.includes('process') || monitorType.includes('service')) {
       const service = ctx.serviceName || ctx.processName || ctx.name || ctx.service || '';
-      const status  = ctx.status || ctx.state || '';
-      if (service) alertMessage = `Service ${status ? status+': ' : 'alert: '}${service}`;
+      const status  = (ctx.status || ctx.state || '').toUpperCase();
+      if (service && status) alertMessage = `Service '${service}' is ${status.toLowerCase()}`;
+      else if (service) alertMessage = `Service alert: ${service}`;
       else alertMessage = `Service/process alert${status ? ': '+status : ''}`;
     }
 
@@ -1094,37 +1095,6 @@ function renderTicketDetail(ticket) {
     </div>`;
 }
 
-// ─── QUEUE LIST ───────────────────────────────────────────────────
-function renderQueueList() {
-  const el=$('queueList'); if(!el) return;
-  const alerts  = getVisibleAlerts();
-  const tickets = getOpenTickets();
-  const items = [
-    ...alerts.map(a=>({type:'alert',data:a,priority:{Critical:0,High:1,Moderate:2,Low:3,Information:4}[a.priority]??5})),
-    ...tickets.map(t=>({type:'ticket',data:t,priority:3})),
-  ].sort((a,b)=>a.priority-b.priority);
-  if (!items.length) { el.innerHTML='<div class="loading-state">Queue is clear</div>'; return; }
-  el.innerHTML = items.map(item => {
-    if (item.type==='alert') {
-      const a=item.data, sv=SEV[a.priority]||SEV.Information;
-      const ticket=a.ticketNumber?state.tickets[a.ticketNumber]:null;
-      return `<div class="list-row" data-uid="${esc(a.alertUid)}">
-        <div class="row-top"><span class="row-device">${esc(a.hostname)}</span>${badgeHtml(a.priority,sv.color,sv.bg)}</div>
-        <div class="row-client">${esc(a.siteName)}</div>
-        <div class="row-msg">${esc(a.alertMessage)}</div>
-        <div class="row-foot"><span class="row-type">⚡ Alert</span>${ticket?`<span class="badge" style="color:${ticket.statusColor};background:${ticket.statusColor}22;border:1px solid ${ticket.statusColor}44">${esc(ticket.statusLabel)}</span>`:'<span class="row-type" style="color:#c8960c">No Ticket</span>'}</div>
-      </div>`;
-    } else {
-      const t=item.data;
-      return `<div class="list-row ticket-row" data-ticket-id="${t.id}">
-        <div class="row-top"><span class="row-device" style="font-size:13px">${esc(t.ticketNumber)}</span><span class="badge" style="color:${t.statusColor||'#8bacc8'};background:${t.statusColor||'#8bacc8'}22;border:1px solid ${t.statusColor||'#8bacc8'}44">${esc(t.statusLabel||'Unknown')}</span></div>
-        <div class="row-client purple">${esc(t.title?.substring(0,60)||'')}</div>
-        <div class="row-foot"><span class="row-type">🎫 ${esc(t.companyName||'Ticket')}</span></div>
-      </div>`;
-    }
-  }).join('');
-}
-
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
 function renderKB(filter='') {
   const kb=LS.get('msp_kb',[]); const el=$('kbList'); if(!el) return;
@@ -1323,7 +1293,6 @@ function render() {
   renderClientChips();
   renderAlertList();
   renderTicketList();
-  renderQueueList();
   if (state.currentAlert) renderAlertDetail(state.currentAlert);
 }
 
@@ -1444,17 +1413,7 @@ function wireEvents() {
     finally{if(btn){btn.textContent='↺ Refresh';btn.disabled=false;}}
   });
 
-  // Queue list
-  $('queueList')?.addEventListener('click', e => {
-    const row=e.target.closest('.list-row'); if(!row) return;
-    if(row.dataset.uid){
-      const alert=state.alerts.find(a=>a.alertUid===row.dataset.uid);
-      if(alert){setView('alerts');renderAlertDetail(alert);}
-    } else if(row.dataset.ticketId){
-      const ticket=Object.values(state.tickets).find(t=>String(t.id)===row.dataset.ticketId);
-      if(ticket){setView('tickets');state.currentTicket=ticket;renderTicketDetail(ticket);}
-    }
-  });
+
 
   // Detail panel delegated actions
   document.addEventListener('click', async e => {
