@@ -572,9 +572,12 @@ async function createTicketForAlert(alert) {
   if (queueID) body.queueID = queueID;
 
   const data = await atFetch('/Tickets', 'POST', body);
-  const newTicket = data?.item;
-  if (!newTicket?.id) throw new Error('Ticket created but no ID returned');
-
+  // AT REST API returns created item in different fields depending on version
+  const newTicket = data?.item || data?.items?.[0] || data;
+  if (!newTicket?.id) {
+    console.log('AT create ticket response:', JSON.stringify(data));
+    throw new Error('Ticket created but no ID returned');
+  }
   return newTicket;
 }
 
@@ -753,7 +756,7 @@ function renderDashboard() {
   setText('statNoTicket',   noTicket.length);
 
   const updateBadge = (id, count) => { const el=$(id); if(!el) return; if(count){el.style.display='block';el.textContent=count>99?'99+':count;}else el.style.display='none'; };
-  updateBadge('navAlertBadge',  crit.length||null);
+  updateBadge('navAlertBadge',  visible.length||null);
   updateBadge('navTicketBadge', openTickets.length||null);
 
   const greetEl = $('dashGreeting');
