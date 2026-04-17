@@ -6,6 +6,7 @@ const state = {
   atStatusPicklist: null, atPriorityPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
   resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(), atQueues: [],
   notesDrafts: {}, aiResults: {}, chatHistories: {},
+  kbContextCache: {}, historyContextCache: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
   autoRefreshTimer: null,
@@ -55,6 +56,8 @@ function loadSettings() {
   state.notesDrafts   = LS.get('msp_notes', {});
   state.aiResults     = LS.get('msp_ai', {});
   state.chatHistories = LS.get('msp_chats', {});
+  state.kbContextCache      = LS.get('msp_kb_context_cache', {});
+  state.historyContextCache = LS.get('msp_history_context_cache', {});
   const s = state.settings;
   setVal('set-apiKey',          s.apiKey || '');
   setVal('set-secretKey',       s.secretKey || '');
@@ -731,7 +734,189 @@ async function callAI(systemPrompt, messages) {
   return data.content?.find(b=>b.type==='text')?.text || 'No response received.';
 }
 
-function buildAlertSystemPrompt(alert) {
+// ─── AI CONTEXT ENRICHMENT ────────────────────────────────────────
+// Caches (TTLs vary: KB articles change slowly, ticket history moves faster)
+const KB_TTL_MS = 6 * 60 * 60 * 1000;        // 6 hours
+const HISTORY_TTL_MS = 2 * 60 * 60 * 1000;   // 2 hours
+const CONTEXT_CACHE_MAX = 50;                 // cap per cache
+
+const AI_STOP_WORDS = new Set([
+  'with','that','this','from','have','been','they','their','when','will','your','which',
+  'were','about','there','would','could','should','using','after','before','alert','threshold',
+  'trigger','triggered','policy','windows','message','issue','problem','device','server'
+]);
+
+function extractAlertKeywords(alert) {
+  const keywords = [];
+  // Monitor type is usually the best single keyword ("Disk Usage", "CPU", etc.)
+  if (alert.monitorType) keywords.push(alert.monitorType);
+  // Extract additional keywords from alertMessage by frequency
+  const text = (alert.alertMessage || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+  const words = text.split(/\s+/).filter(w => w.length >= 5 && !AI_STOP_WORDS.has(w) && !/^\d/.test(w));
+  const freq = {};
+  words.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
+  const topWords = Object.entries(freq).sort((a,b) => b[1] - a[1]).slice(0, 3).map(e => e[0]);
+  keywords.push(...topWords);
+  // Dedupe, cap at 4 (AT KB search supports up to 4 parallel term queries)
+  return [...new Set(keywords.map(k => k.trim()).filter(Boolean))].slice(0, 4);
+}
+
+function pruneContextCache(cache, maxSize) {
+  const entries = Object.entries(cache);
+  if (entries.length <= maxSize) return;
+  entries.sort((a,b) => (a[1].fetchedAt || 0) - (b[1].fetchedAt || 0));
+  while (entries.length > maxSize) {
+    const [key] = entries.shift();
+    delete cache[key];
+  }
+}
+
+async function fetchAtKbArticles(keywords) {
+  if (!keywords?.length) return [];
+  // Parallel query per keyword, 5 results each
+  const searches = keywords.slice(0, 4).map(term =>
+    atFetch('/KnowledgeBaseArticles/query', 'POST', {
+      MaxRecords: 5,
+      filter: [{ op: 'contains', field: 'title', value: term }],
+    }).catch(() => ({ items: [] }))
+  );
+  const results = await Promise.all(searches);
+  // Dedupe by id
+  const seen = new Set();
+  const articles = [];
+  for (const r of results) {
+    for (const item of (r?.items || [])) {
+      if (!seen.has(item.id)) { seen.add(item.id); articles.push(item); }
+    }
+  }
+  // Fetch plain text content for top 3
+  const top3 = articles.slice(0, 3);
+  const withContent = await Promise.all(top3.map(async a => {
+    try {
+      const c = await atFetch(`/KnowledgeBaseArticles/${a.id}/ArticlePlainTextContent`);
+      const content = (c?.items || []).map(i => i.content || '').join(' ').trim();
+      return { id: a.id, title: a.title, content: content.substring(0, 800) };
+    } catch {
+      return { id: a.id, title: a.title, content: '' };
+    }
+  }));
+  return withContent;
+}
+
+async function resolveCompanyIdForAlert(alert) {
+  if (!alert?.siteName) return null;
+  // Check local cache first
+  const cached = Object.entries(atCompanyCache).find(([, name]) => name === alert.siteName);
+  if (cached) return parseInt(cached[0]);
+  // Query AT by exact name
+  try {
+    const data = await atFetch('/Companies/query', 'POST', {
+      MaxRecords: 5,
+      filter: [{ op: 'contains', field: 'companyName', value: alert.siteName }],
+      IncludeFields: ['id', 'companyName'],
+    });
+    const match = (data?.items || []).find(c =>
+      c.companyName?.toLowerCase() === alert.siteName?.toLowerCase()
+    ) || data?.items?.[0];
+    if (match) {
+      atCompanyCache[match.id] = match.companyName;
+      LS.set('msp_at_companies', atCompanyCache);
+      return match.id;
+    }
+  } catch(e) { console.warn('Company lookup failed for history:', e.message); }
+  return null;
+}
+
+async function fetchClientTicketHistory(alert) {
+  const companyId = await resolveCompanyIdForAlert(alert);
+  if (!companyId) return [];
+  // Done statuses from the picklist
+  await loadAtStatusPicklist();
+  const pl = state.atStatusPicklist || {};
+  const doneStatusIds = Object.entries(pl).filter(([,i]) => i.done).map(([v]) => parseInt(v)).filter(Boolean);
+  if (!doneStatusIds.length) return [];
+  // 90-day cutoff so we pull recent resolved work, not ancient
+  const cutoff = new Date(Date.now() - 90*24*60*60*1000).toISOString();
+  try {
+    const data = await atFetch('/Tickets/query', 'POST', {
+      MaxRecords: 20,
+      filter: [
+        { op: 'eq', field: 'companyID', value: companyId },
+        { op: 'in', field: 'status', value: doneStatusIds },
+        { op: 'gte', field: 'createDate', value: cutoff },
+      ],
+      IncludeFields: ['id','ticketNumber','title','resolution','createDate','resolvedDateTime','lastActivityDate'],
+    });
+    const items = data?.items || [];
+    // Sort newest-first by resolvedDateTime (fall back to lastActivityDate or createDate)
+    items.sort((a,b) => {
+      const aT = a.resolvedDateTime || a.lastActivityDate || a.createDate || '';
+      const bT = b.resolvedDateTime || b.lastActivityDate || b.createDate || '';
+      return bT.localeCompare(aT);
+    });
+    return items.slice(0, 5).map(t => ({
+      ticketNumber: t.ticketNumber,
+      title: t.title,
+      resolution: (t.resolution || '').substring(0, 400),
+      resolvedDate: (t.resolvedDateTime || t.lastActivityDate || t.createDate || '').substring(0, 10),
+    }));
+  } catch(e) { console.warn('Ticket history fetch failed:', e.message); return []; }
+}
+
+function buildKbContextString(articles) {
+  if (!articles?.length) return '';
+  let out = '\n\n── AUTOTASK KB ARTICLES ──';
+  articles.forEach((a, i) => {
+    out += `\n\nAT-KB-${i+1}: ${a.title || 'Untitled'}`;
+    if (a.content) out += `\nContent: ${a.content}`;
+  });
+  return out;
+}
+
+function buildHistoryContextString(tickets, clientName) {
+  if (!tickets?.length) return '';
+  let out = `\n\n── RECENT RESOLVED TICKETS FOR ${clientName || 'THIS CLIENT'} ──`;
+  tickets.forEach((t, i) => {
+    out += `\n\nHIST-${i+1}: ${t.ticketNumber || '?'} — ${t.title || '(no title)'}`;
+    if (t.resolvedDate) out += `\nResolved: ${t.resolvedDate}`;
+    if (t.resolution) out += `\nResolution: ${t.resolution}`;
+  });
+  return out;
+}
+
+async function getKbContextForAlert(alert) {
+  if (state.settings.includeKbContext === false) return '';
+  if (!alert?.alertUid) return '';
+  const cached = state.kbContextCache[alert.alertUid];
+  if (cached && (Date.now() - cached.fetchedAt) < KB_TTL_MS) return cached.text || '';
+  try {
+    const keywords = extractAlertKeywords(alert);
+    const articles = await fetchAtKbArticles(keywords);
+    const text = buildKbContextString(articles);
+    state.kbContextCache[alert.alertUid] = { text, fetchedAt: Date.now() };
+    pruneContextCache(state.kbContextCache, CONTEXT_CACHE_MAX);
+    LS.set('msp_kb_context_cache', state.kbContextCache);
+    return text;
+  } catch(e) { console.warn('KB context build failed:', e.message); return ''; }
+}
+
+async function getHistoryContextForAlert(alert) {
+  if (state.settings.includeTicketHistory === false) return '';
+  if (!alert?.alertUid) return '';
+  const cached = state.historyContextCache[alert.alertUid];
+  if (cached && (Date.now() - cached.fetchedAt) < HISTORY_TTL_MS) return cached.text || '';
+  try {
+    const tickets = await fetchClientTicketHistory(alert);
+    const text = buildHistoryContextString(tickets, alert.siteName);
+    state.historyContextCache[alert.alertUid] = { text, fetchedAt: Date.now() };
+    pruneContextCache(state.historyContextCache, CONTEXT_CACHE_MAX);
+    LS.set('msp_history_context_cache', state.historyContextCache);
+    return text;
+  } catch(e) { console.warn('History context build failed:', e.message); return ''; }
+}
+
+// ─── ALERT AI SYSTEM PROMPT ───────────────────────────────────────
+async function buildAlertSystemPrompt(alert) {
   const ticket = alert.ticketNumber ? state.tickets[alert.ticketNumber] : null;
   let resolutionState = 'NO_TICKET';
   if (ticket) {
@@ -739,6 +924,17 @@ function buildAlertSystemPrompt(alert) {
     else if (['in progress','assigned','dispatched'].some(s=>ticket.statusLabel?.toLowerCase().includes(s))) resolutionState = 'IN_PROGRESS';
     else resolutionState = 'TICKET_OPEN';
   }
+
+  // Pull KB + history context in parallel (both return '' if toggles off, empty, or failed)
+  const [kbContext, historyContext] = await Promise.all([
+    getKbContextForAlert(alert),
+    getHistoryContextForAlert(alert),
+  ]);
+  const extraContext = (kbContext + historyContext).trim();
+  const contextGuidance = extraContext
+    ? '\n\nUse the context below to ground your analysis. Cite relevant KB article titles or past ticket numbers when they materially inform the recommendation. Do not invent context — if nothing below is relevant, say so briefly.'
+    : '';
+
   return `You are an expert MSP engineer AI assistant for Synobis Network Solutions — a veteran-owned MSP in San Antonio, TX. You are embedded in MSP Companion, a unified Datto RMM + Autotask platform.
 
 INCIDENT CONTEXT:
@@ -769,7 +965,7 @@ ROOT CAUSE: [Most likely cause in one sentence]
 ESCALATE IF: [Specific conditions that warrant escalation]
 RECONCILIATION PATH: [How to complete the full resolution cycle from current state to KB logged]
 
-Be concise, practical, and specific. Include exact commands or paths when relevant.`;
+Be concise, practical, and specific. Include exact commands or paths when relevant.${contextGuidance}${extraContext ? '\n' + extraContext : ''}`;
 }
 
 // ─── RESOLUTION STATE ─────────────────────────────────────────────
@@ -1103,7 +1299,7 @@ async function sendChat(uid, message) {
   histEl.insertAdjacentHTML('beforeend',`<div id="${tid}" style="display:flex;gap:8px;align-items:center;padding:8px 0"><div style="display:flex;gap:3px"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1s ease-in-out infinite;display:inline-block"></span><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1s ease-in-out 0.2s infinite;display:inline-block"></span><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1s ease-in-out 0.4s infinite;display:inline-block"></span></div><span style="font-family:var(--cond);font-size:11px;color:var(--textdim)">AI IS THINKING...</span></div>`);
   histEl.scrollTop=histEl.scrollHeight;
   try {
-    const system = buildAlertSystemPrompt(alert);
+    const system = await buildAlertSystemPrompt(alert);
     const msgs   = state.chatHistories[uid].map(m=>({role:m.role,content:m.content}));
     const reply  = await callAI(system, msgs);
     state.chatHistories[uid].push({role:'assistant',content:reply});
@@ -1644,10 +1840,25 @@ function wireEvents() {
     if (action==='run-ai') {
       const alert=state.alerts.find(a=>a.alertUid===uid); if(!alert) return;
       const aiOut=$('aiOutput');
-      if(aiOut) aiOut.innerHTML='<div class="ai-loading"><div class="pulse-dot"></div>Analyzing alert with full context...</div>';
+      const setLoadingText = (txt) => {
+        if (aiOut) aiOut.innerHTML = `<div class="ai-loading"><div class="pulse-dot"></div>${esc(txt)}</div>`;
+      };
+      const kbOn = state.settings.includeKbContext !== false;
+      const histOn = state.settings.includeTicketHistory !== false;
+      // Only show context-fetch line if something is being fetched AND not already cached
+      const kbCached = state.kbContextCache[uid] && (Date.now() - state.kbContextCache[uid].fetchedAt) < KB_TTL_MS;
+      const histCached = state.historyContextCache[uid] && (Date.now() - state.historyContextCache[uid].fetchedAt) < HISTORY_TTL_MS;
+      const willFetchKb = kbOn && !kbCached;
+      const willFetchHist = histOn && !histCached;
+      if (willFetchKb && willFetchHist)      setLoadingText('Gathering KB + ticket history...');
+      else if (willFetchKb)                  setLoadingText('Gathering KB context...');
+      else if (willFetchHist)                setLoadingText('Pulling ticket history...');
+      else                                   setLoadingText('Analyzing alert with full context...');
       el.textContent='Analyzing...'; el.disabled=true;
       try {
-        const result=await callAI(buildAlertSystemPrompt(alert),[{role:'user',content:`Analyze this alert for ${alert.hostname} — ${alert.alertMessage}`}]);
+        const system = await buildAlertSystemPrompt(alert);
+        setLoadingText('Analyzing alert with full context...');
+        const result = await callAI(system,[{role:'user',content:`Analyze this alert for ${alert.hostname} — ${alert.alertMessage}`}]);
         state.aiResults[uid]=result; LS.set('msp_ai',state.aiResults);
         await renderAlertDetail(alert);
       } catch(err) {
@@ -2038,11 +2249,70 @@ function injectTierAStyles() {
   document.head.appendChild(style);
 }
 
+// ─── AI CONTEXT TOGGLES (injected into Preferences card at boot) ─
+function injectAiContextToggles() {
+  if (document.getElementById('aiCtxToggleBlock')) return;
+  // Anchor on the Save Preferences button — it's a reliable marker for the prefs card
+  const saveBtn = document.getElementById('savePrefsBtn');
+  if (!saveBtn) return; // Settings view HTML not present yet — caller will retry later
+  const container = saveBtn.parentElement;
+  if (!container) return;
+
+  const kbDefault = state.settings.includeKbContext !== false;
+  const histDefault = state.settings.includeTicketHistory !== false;
+
+  const block = document.createElement('div');
+  block.id = 'aiCtxToggleBlock';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(0,180,216,0.04)';
+  block.innerHTML = `
+    <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">★ AI CONTEXT ENRICHMENT</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
+      <input type="checkbox" id="set-includeKbContext" ${kbDefault?'checked':''} style="cursor:pointer" />
+      <span>Include Autotask Knowledge Base in AI analysis</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
+      <input type="checkbox" id="set-includeTicketHistory" ${histDefault?'checked':''} style="cursor:pointer" />
+      <span>Include client's recent resolved tickets in AI analysis</span>
+    </label>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button id="clearAiContextCacheBtn" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:6px 10px;border-radius:4px;font-family:var(--cond);font-size:11px;font-weight:600;letter-spacing:0.07em">↺ CLEAR CONTEXT CACHE</button>
+    </div>
+    <div id="aiCtxToggleStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:6px;color:var(--textdim)"></div>
+  `;
+  container.insertBefore(block, saveBtn);
+
+  const statusEl = document.getElementById('aiCtxToggleStatus');
+  const flash = (msg) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
+  };
+
+  document.getElementById('set-includeKbContext')?.addEventListener('change', e => {
+    saveSettings({ includeKbContext: !!e.target.checked });
+    flash(e.target.checked ? '✓ KB context ON' : '✓ KB context OFF');
+  });
+  document.getElementById('set-includeTicketHistory')?.addEventListener('change', e => {
+    saveSettings({ includeTicketHistory: !!e.target.checked });
+    flash(e.target.checked ? '✓ Ticket history ON' : '✓ Ticket history OFF');
+  });
+  document.getElementById('clearAiContextCacheBtn')?.addEventListener('click', () => {
+    state.kbContextCache = {};
+    state.historyContextCache = {};
+    LS.set('msp_kb_context_cache', {});
+    LS.set('msp_history_context_cache', {});
+    showToast('✓ AI context cache cleared', 'ok');
+    flash('Cache cleared — next AI run will refetch');
+  });
+}
+
 // ─── BOOT ─────────────────────────────────────────────────────────
 async function boot() {
   injectTierAStyles();
   registerSW();
   loadSettings();
+  injectAiContextToggles();
   applyMode(LS.get('msp_lightmode', false));
   const lastView = LS.get('msp_view','dashboard');
   setView(lastView);
