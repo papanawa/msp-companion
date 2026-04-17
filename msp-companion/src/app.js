@@ -337,12 +337,42 @@ async function syncTicketStatuses(ticketNumbers) {
 
 async function fetchAtTicketQueue() {
   await loadAtStatusPicklist();
+  const pl = state.atStatusPicklist || {};
+
+  // Find all status values that are NOT done
+  const doneValues = Object.entries(pl)
+    .filter(([, info]) => info.done)
+    .map(([val]) => parseInt(val))
+    .filter(Boolean);
+
+  // Query for all non-done tickets
+  const filter = doneValues.length > 0
+    ? doneValues.map(v => ({ op: 'noteq', field: 'status', value: v }))
+    : [{ op: 'noteq', field: 'status', value: 5 }];
+
   const data = await atFetch('/Tickets/query', 'POST', {
     MaxRecords: 200,
-    filter: [{ op: 'noteq', field: 'status', value: 5 }],
+    filter,
     IncludeFields: ['id','ticketNumber','status','title','priority','assignedResourceID','companyID','lastActivityDate'],
   });
-  return data?.items || [];
+  const items = data?.items || [];
+
+  // Load resources so we can show names
+  await loadAtResources();
+  const resourceMap = {};
+  state.atResources.forEach(r => { resourceMap[r.id] = r.name; });
+
+  // Enrich tickets with status info and resource names
+  const pl2 = state.atStatusPicklist || {};
+  items.forEach(t => {
+    const si = pl2[t.status] || { label: `Status ${t.status}`, color: '#8bacc8', done: false };
+    t.statusLabel = si.label;
+    t.statusColor = si.color;
+    t.isDone = si.done;
+    t.assignedResourceName = t.assignedResourceID ? (resourceMap[t.assignedResourceID] || `Resource ${t.assignedResourceID}`) : null;
+  });
+
+  return items;
 }
 
 async function loadAtResources() {
@@ -927,23 +957,61 @@ function renderChatHistory(uid) {
 function renderTicketList() {
   const el = $('ticketList');
   if (!el) return;
+
+  // Include all tickets that are NOT complete or closed
   const tickets = Object.values(state.tickets).filter(t => !t.isDone);
   if (!tickets.length) {
-    el.innerHTML = '<div class="loading-state">No open tickets — sync tickets to load</div>';
+    el.innerHTML = '<div class="loading-state">No open tickets — click Refresh to load</div>';
     return;
   }
-  el.innerHTML = tickets.map(t => `
-    <div class="list-row ticket-row ${state.currentTicket?.id === t.id ? 'active' : ''}" data-ticket-id="${t.id}">
-      <div class="row-top">
-        <span class="row-device" style="font-size:12px">${esc(t.ticketNumber)}</span>
-        <span class="badge" style="color:${t.statusColor};background:${t.statusColor}22;border:1px solid ${t.statusColor}44">${esc(t.statusLabel)}</span>
-      </div>
-      <div class="row-client purple">${esc(t.title?.substring(0,60) || 'No title')}</div>
-      <div class="row-foot">
-        <span class="row-type">AT Ticket</span>
-        <span class="row-time" style="font-size:10px;color:var(--textdim)">${t.lastActivity ? new Date(t.lastActivity).toLocaleDateString() : ''}</span>
-      </div>
-    </div>`).join('');
+
+  // Group by primary resource — unassigned first
+  const groups = {};
+  const UNASSIGNED = '__unassigned__';
+
+  tickets.forEach(t => {
+    const key = t.assignedResourceName || t.assignedResourceID || UNASSIGNED;
+    if (!groups[key]) groups[key] = { name: key === UNASSIGNED ? 'Unassigned' : key, tickets: [], isUnassigned: key === UNASSIGNED };
+    groups[key].tickets.push(t);
+  });
+
+  // Sort: unassigned first, then alphabetical by name
+  const sorted = Object.values(groups).sort((a, b) => {
+    if (a.isUnassigned) return -1;
+    if (b.isUnassigned) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  // Sort tickets within each group by status priority
+  sorted.forEach(g => {
+    g.tickets.sort((a, b) => a.statusLabel.localeCompare(b.statusLabel));
+  });
+
+  el.innerHTML = sorted.map(group => {
+    const initials = group.isUnassigned ? '?' : group.name.split(' ').map(w => w[0]).join('').substring(0,2).toUpperCase();
+    const rows = group.tickets.map(t => `
+      <div class="list-row ticket-row ${state.currentTicket?.id === t.id ? 'active' : ''}" data-ticket-id="${t.id}">
+        <div class="row-top">
+          <span class="row-device" style="font-size:13px">${esc(t.ticketNumber)}</span>
+          <span class="badge" style="color:${t.statusColor};background:${t.statusColor}22;border:1px solid ${t.statusColor}44">${esc(t.statusLabel)}</span>
+        </div>
+        <div class="row-client purple">${esc(t.title?.substring(0,55) || 'No title')}</div>
+        <div class="row-foot">
+          <span class="row-type">${esc(t.companyName || 'AT Ticket')}</span>
+          <span style="font-size:11px;color:var(--textdim)">${t.lastActivity ? new Date(t.lastActivity).toLocaleDateString() : ''}</span>
+        </div>
+      </div>`).join('');
+
+    return `
+      <div class="resource-group">
+        <div class="resource-group-header">
+          <div class="resource-group-avatar ${group.isUnassigned ? 'unassigned' : ''}">${initials}</div>
+          <span class="resource-group-name ${group.isUnassigned ? 'unassigned' : ''}">${esc(group.name)}</span>
+          <span class="resource-group-count">${group.tickets.length}</span>
+        </div>
+        ${rows}
+      </div>`;
+  }).join('');
 }
 
 // ─── QUEUE LIST ───────────────────────────────────────────────────────────────
@@ -1126,6 +1194,29 @@ function setView(view) {
 // ─── EVENT WIRING ─────────────────────────────────────────────────────────────
 function wireEvents() {
 
+  // Dark/Light mode toggle
+  const modeBtn = document.getElementById('modeToggleBtn');
+  const modeLabel = document.getElementById('modeLabel');
+  const modeIcon = document.getElementById('modeIcon');
+
+  function applyMode(isLight) {
+    document.body.classList.toggle('light', isLight);
+    if (modeLabel) modeLabel.textContent = isLight ? 'DARK MODE' : 'LIGHT MODE';
+    if (modeIcon) {
+      modeIcon.innerHTML = isLight
+        ? '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>'
+        : '<path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>';
+    }
+    LS.set('msp_lightmode', isLight);
+  }
+
+  // Restore saved mode
+  applyMode(LS.get('msp_lightmode', false));
+
+  modeBtn?.addEventListener('click', () => {
+    applyMode(!document.body.classList.contains('light'));
+  });
+
   // Nav items
   document.querySelectorAll('.nav-item[data-view]').forEach(btn => {
     btn.addEventListener('click', () => setView(btn.dataset.view));
@@ -1136,17 +1227,23 @@ function wireEvents() {
 
   // Ticket refresh
   $('ticketRefreshBtn')?.addEventListener('click', async () => {
+    const btn = $('ticketRefreshBtn');
+    if (btn) { btn.textContent = '↺ Loading...'; btn.disabled = true; }
     try {
       const items = await fetchAtTicketQueue();
-      const pl = await loadAtStatusPicklist();
       items.forEach(t => {
-        const si = pl[t.status] || { label:`Status ${t.status}`, color:'#8bacc8', done:false };
-        state.tickets[t.ticketNumber] = { id:t.id, ticketNumber:t.ticketNumber, status:t.status, statusLabel:si.label, statusColor:si.color, isDone:si.done, title:t.title, companyID:t.companyID, lastActivity:t.lastActivityDate };
+        state.tickets[t.ticketNumber] = {
+          id: t.id, ticketNumber: t.ticketNumber,
+          status: t.status, statusLabel: t.statusLabel, statusColor: t.statusColor, isDone: t.isDone,
+          title: t.title, companyID: t.companyID, lastActivity: t.lastActivityDate,
+          assignedResourceID: t.assignedResourceID, assignedResourceName: t.assignedResourceName,
+        };
       });
       LS.set('msp_tickets', state.tickets);
       render();
       showToast(`✓ Loaded ${items.length} open tickets`, 'ok');
     } catch (e) { showToast(`Ticket sync error: ${e.message}`, 'err'); }
+    finally { if (btn) { btn.textContent = '↺ Refresh'; btn.disabled = false; } }
   });
 
   // Alert filters
