@@ -552,9 +552,27 @@ async function createTicketForAlert(alert) {
   descParts.push('', '── MSP Companion · Synobis Network Solutions ──');
   const description = descParts.join('\n');
 
-  // Find the Autotask company ID from our cache
-  const companyId = Object.entries(atCompanyCache).find(([, name]) => name === alert.siteName)?.[0];
-  if (!companyId) throw new Error(`Company not found in AT cache for: ${alert.siteName}. Refresh tickets first.`);
+  // Find the Autotask company ID — check cache first, then query AT directly
+  let companyId = Object.entries(atCompanyCache).find(([, name]) => name === alert.siteName)?.[0];
+  if (!companyId) {
+    // Not in cache — query AT Companies directly by name
+    try {
+      const compData = await atFetch('/Companies/query', 'POST', {
+        MaxRecords: 5,
+        filter: [{ op: 'contains', field: 'companyName', value: alert.siteName }],
+        IncludeFields: ['id', 'companyName'],
+      });
+      const match = (compData?.items || []).find(c =>
+        c.companyName?.toLowerCase() === alert.siteName?.toLowerCase()
+      ) || compData?.items?.[0];
+      if (match) {
+        companyId = match.id;
+        atCompanyCache[match.id] = match.companyName;
+        LS.set('msp_at_companies', atCompanyCache);
+      }
+    } catch(e) { console.warn('Company lookup failed:', e.message); }
+  }
+  if (!companyId) throw new Error(`Company "${alert.siteName}" not found in Autotask. Check company name matches exactly.`);
 
   const queueID = parseInt(state.settings.defaultQueue) || null;
   const body = {
