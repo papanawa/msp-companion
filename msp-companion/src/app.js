@@ -572,12 +572,16 @@ async function createTicketForAlert(alert) {
   if (queueID) body.queueID = queueID;
 
   const data = await atFetch('/Tickets', 'POST', body);
-  // AT REST API returns created item in different fields depending on version
-  const newTicket = data?.item || data?.items?.[0] || data;
-  if (!newTicket?.id) {
+  // AT REST API returns {"itemId": 12345} on create
+  const ticketId = data?.itemId || data?.item?.id || data?.id;
+  if (!ticketId) {
     console.log('AT create ticket response:', JSON.stringify(data));
     throw new Error('Ticket created but no ID returned');
   }
+  // Fetch the full ticket so we have ticketNumber etc.
+  const ticketData = await atFetch(`/Tickets/${ticketId}`);
+  const newTicket = ticketData?.item || ticketData;
+  newTicket.id = newTicket.id || ticketId;
   return newTicket;
 }
 
