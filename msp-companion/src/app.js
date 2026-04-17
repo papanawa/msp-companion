@@ -3,7 +3,7 @@
 // ─── STATE ────────────────────────────────────────────────────────
 const state = {
   alerts: [], sites: [], tickets: {},
-  atStatusPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
+  atStatusPicklist: null, atPriorityPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
   resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(), atQueues: [],
   notesDrafts: {}, aiResults: {}, chatHistories: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
@@ -378,6 +378,30 @@ async function loadAtStatusPicklist() {
   } catch(e) { console.warn('AT picklist failed:', e.message); return {}; }
 }
 
+async function loadAtPriorityPicklist() {
+  if (state.atPriorityPicklist) return state.atPriorityPicklist;
+  const cached = LS.get('msp_at_priority_picklist');
+  if (cached) { state.atPriorityPicklist = cached; return cached; }
+  try {
+    const data = await atFetch('/Tickets/entityInformation/fields');
+    const field = (data?.fields || []).find(f => f.name === 'priority');
+    const pl = {};
+    (field?.picklistValues || []).forEach(pv => {
+      if (pv.isActive === false) return;
+      const l = (pv.label||'').toLowerCase();
+      let color = '#8bacc8';
+      if (l.includes('critical'))           color = '#c8102e';
+      else if (l.includes('high'))          color = '#e07b00';
+      else if (l.includes('medium')||l.includes('normal')) color = '#c8a000';
+      else if (l.includes('low'))           color = '#2a9d5c';
+      pl[pv.value] = { label: pv.label, color };
+    });
+    state.atPriorityPicklist = pl;
+    LS.set('msp_at_priority_picklist', pl);
+    return pl;
+  } catch(e) { console.warn('AT priority picklist failed:', e.message); return {}; }
+}
+
 async function syncTicketStatuses(ticketNumbers) {
   if (!ticketNumbers?.length) return;
   const pl = await loadAtStatusPicklist();
@@ -387,7 +411,7 @@ async function syncTicketStatuses(ticketNumbers) {
     try {
       const data = await atFetch('/Tickets/query', 'POST', {
         filter: [{ op:'in', field:'ticketNumber', value:chunk }],
-        IncludeFields: ['id','ticketNumber','status','title','assignedResourceID','lastActivityDate','companyID'],
+        IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','lastActivityDate','companyID'],
       });
       // Build company name map from alerts
       const companyIds2 = (data?.items||[]).map(t=>t.companyID).filter(Boolean);
@@ -398,6 +422,7 @@ async function syncTicketStatuses(ticketNumbers) {
         state.tickets[t.ticketNumber] = {
           id: t.id, ticketNumber: t.ticketNumber,
           status: t.status, statusLabel: si.label, statusColor: si.color, isDone: si.done,
+          priority: t.priority, queueID: t.queueID,
           title: t.title, companyID: t.companyID, companyName: companyNameMap[t.companyID] || null,
           assignedResourceID: t.assignedResourceID, assignedResourceName: null,
           lastActivity: t.lastActivityDate,
@@ -509,7 +534,7 @@ async function fetchAtTicketQueue() {
     : [{ op:'noteq', field:'status', value:5 }];
   const data = await atFetch('/Tickets/query','POST',{
     MaxRecords: 200, filter,
-    IncludeFields: ['id','ticketNumber','status','title','priority','assignedResourceID','companyID','lastActivityDate'],
+    IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','companyID','lastActivityDate'],
   });
   const items = data?.items || [];
   await loadAtResources();
@@ -615,6 +640,80 @@ async function postTimeEntry(ticketId, resourceId, roleId, billingCodeId, hours,
     billingCodeID:parseInt(billingCodeId), dateWorked:start.substring(0,10),
     startDateTime:start, endDateTime:end, hoursWorked:parseFloat(hours),
     summaryNotes:summary||'', isInternalNoteVisible:true, offsetHours:0,
+  });
+}
+
+// ─── TICKET FIELD PATCHES ─────────────────────────────────────────
+async function patchTicketField(ticket, field, rawValue) {
+  // Normalize value: picklist fields need numbers, null clears assignment
+  let value = rawValue;
+  if (rawValue === '' || rawValue === 'null') value = null;
+  else if (['status','priority','queueID','assignedResourceID'].includes(field) && value !== null) value = parseInt(value);
+
+  const body = { id: parseInt(ticket.id) };
+  body[field] = value;
+  await atFetch('/Tickets', 'PATCH', body);
+
+  // Mirror to local state
+  ticket[field] = value;
+  if (field === 'status') {
+    const pl = state.atStatusPicklist || {};
+    const si = pl[value] || { label:`Status ${value}`, color:'#8bacc8', done:false };
+    ticket.statusLabel = si.label;
+    ticket.statusColor = si.color;
+    ticket.isDone = si.done;
+  }
+  if (field === 'assignedResourceID') {
+    const r = state.atResources.find(r => r.id === value);
+    ticket.assignedResourceName = r ? r.name : null;
+  }
+  state.tickets[ticket.ticketNumber] = ticket;
+  LS.set('msp_tickets', state.tickets);
+}
+
+function findCompleteStatusID() {
+  const pl = state.atStatusPicklist || {};
+  // Prefer exact "Complete" or "Completed", fall back to any done status
+  const entries = Object.entries(pl);
+  const preferred = entries.find(([,i]) => ['complete','completed'].includes((i.label||'').toLowerCase()));
+  if (preferred) return parseInt(preferred[0]);
+  const anyDone = entries.find(([,i]) => i.done);
+  return anyDone ? parseInt(anyDone[0]) : null;
+}
+
+async function ensureMyResource() {
+  if (state.settings.myResourceID) {
+    // Verify it still exists in resources list
+    await loadAtResources();
+    const exists = state.atResources.find(r => r.id === parseInt(state.settings.myResourceID));
+    if (exists) return parseInt(state.settings.myResourceID);
+  }
+  // Prompt
+  await loadAtResources();
+  return new Promise(resolve => {
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+    modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:420px">
+      <div style="font-family:var(--cond);font-size:15px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">👤 WHO ARE YOU?</div>
+      <div style="font-size:12px;color:var(--textdim);margin-bottom:16px">Pick your Autotask resource. Saved for future Accept / Log Time actions.</div>
+      <select id="myResSelect" style="width:100%;padding:10px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:13px">
+        <option value="">— Select your resource —</option>
+        ${state.atResources.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}
+      </select>
+      <div style="display:flex;gap:8px;margin-top:16px">
+        <button id="myResSave" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">✓ SAVE</button>
+        <button id="myResCancel" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Cancel</button>
+      </div>
+    </div>`;
+    document.body.appendChild(modal);
+    $('myResCancel').addEventListener('click', () => { document.body.removeChild(modal); resolve(null); });
+    $('myResSave').addEventListener('click', () => {
+      const v = $('myResSelect').value;
+      if (!v) return;
+      saveSettings({ myResourceID: parseInt(v) });
+      document.body.removeChild(modal);
+      resolve(parseInt(v));
+    });
   });
 }
 
@@ -1070,6 +1169,17 @@ function renderTicketDetail(ticket) {
   const zone=state.settings.atZone||'14';
   const atBase=`https://ww${zone}.autotask.net/Autotask/AutotaskExtend/ExecuteCommand.aspx`;
   const tUrl=`${atBase}?Code=OpenTicketDetail&TicketNumber=${encodeURIComponent(ticket.ticketNumber)}`;
+
+  // Kick off picklist loads in parallel — rebuild when each resolves
+  loadAtStatusPicklist().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
+  loadAtPriorityPicklist().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
+  loadAtQueues().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
+  loadAtResources().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
+
+  const myRid = parseInt(state.settings.myResourceID) || null;
+  const isMine = myRid && ticket.assignedResourceID === myRid;
+  const isComplete = ticket.isDone;
+
   dp.innerHTML=`
     <div class="detail-card" style="border-top:3px solid ${ticket.statusColor||'#8bacc8'}">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;flex-wrap:wrap">
@@ -1078,21 +1188,82 @@ function renderTicketDetail(ticket) {
       </div>
       <div class="alert-msg" style="margin:10px 0">${esc(ticket.title||'No title')}</div>
       ${ticket.companyName ? `<div style="font-size:13px;color:var(--accent);margin-bottom:10px">${esc(ticket.companyName)}</div>` : ''}
-      ${ticket.assignedResourceName ? `<div style="font-size:12px;color:var(--textdim);margin-bottom:10px">Assigned: ${esc(ticket.assignedResourceName)}</div>` : ''}
+      ${ticket.assignedResourceName ? `<div style="font-size:12px;color:var(--textdim);margin-bottom:10px">Assigned: ${esc(ticket.assignedResourceName)}${isMine?' (you)':''}</div>` : `<div style="font-size:12px;color:var(--textdim);margin-bottom:10px">Unassigned</div>`}
       <div class="action-row">
         <a href="${tUrl}" target="_blank" class="abtn abtn-ticket">🎫 Open in Autotask</a>
+        ${!isMine && !isComplete ? `<button class="abtn abtn-accept" data-action="ticket-accept" data-ticket-id="${ticket.id}">✋ Accept</button>` : ''}
+        ${!isComplete ? `<button class="abtn abtn-complete" data-action="ticket-complete" data-ticket-id="${ticket.id}">✓ Complete</button>` : ''}
         <button class="abtn abtn-time" data-action="log-time-ticket" data-ticket-id="${ticket.id}">⏱ Log Time</button>
         <button class="abtn abtn-kb" data-action="save-kb-ticket" data-ticket-id="${ticket.id}">📚 Save to KB</button>
       </div>
     </div>
+
     <div class="detail-card">
-      <div class="card-label">📝 TECHNICIAN NOTES</div>
-      <textarea id="ticketNotesInput" rows="4" placeholder="Log actions taken for this ticket...">${esc(state.notesDrafts['ticket-'+ticket.id]||'')}</textarea>
+      <div class="card-label">⚙️ TICKET FIELDS</div>
+      <div class="ticket-fields-grid">
+        <div class="field-group">
+          <label>STATUS</label>
+          <select class="ticket-field-select" data-field="status" data-ticket-id="${ticket.id}" id="tf-status"></select>
+        </div>
+        <div class="field-group">
+          <label>PRIORITY</label>
+          <select class="ticket-field-select" data-field="priority" data-ticket-id="${ticket.id}" id="tf-priority"></select>
+        </div>
+        <div class="field-group">
+          <label>QUEUE</label>
+          <select class="ticket-field-select" data-field="queueID" data-ticket-id="${ticket.id}" id="tf-queue"></select>
+        </div>
+        <div class="field-group">
+          <label>PRIMARY RESOURCE</label>
+          <select class="ticket-field-select" data-field="assignedResourceID" data-ticket-id="${ticket.id}" id="tf-resource"></select>
+        </div>
+      </div>
+    </div>
+
+    <div class="detail-card">
+      <div class="card-label">✅ RESOLUTION</div>
+      <textarea id="ticketNotesInput" rows="4" placeholder="Final resolution — what fixed the issue? (Posts to the ticket's Resolution field and adds a note.)">${esc(state.notesDrafts['ticket-'+ticket.id]||'')}</textarea>
       <div class="notes-footer">
         <span></span>
-        <button class="abtn abtn-post" data-action="post-ticket-resolution" data-ticket-id="${ticket.id}" style="font-size:11px;padding:6px 12px">↑ POST TO AUTOTASK</button>
+        <button class="abtn abtn-post" data-action="post-ticket-resolution" data-ticket-id="${ticket.id}" style="font-size:11px;padding:6px 12px">↑ POST RESOLUTION</button>
       </div>
     </div>`;
+
+  // Populate selects — called now and re-called as picklists resolve
+  renderTicketDetail._rehydrateSelects = (t) => {
+    if (state.currentTicket?.id !== t.id) return; // user moved on
+    const statusSel = document.getElementById('tf-status');
+    const prioSel   = document.getElementById('tf-priority');
+    const queueSel  = document.getElementById('tf-queue');
+    const resSel    = document.getElementById('tf-resource');
+
+    if (statusSel && state.atStatusPicklist) {
+      const entries = Object.entries(state.atStatusPicklist).sort((a,b)=>a[1].label.localeCompare(b[1].label));
+      statusSel.innerHTML = entries.map(([v,i]) =>
+        `<option value="${v}" ${String(t.status)===v?'selected':''}>${esc(i.label)}</option>`
+      ).join('');
+    }
+    if (prioSel && state.atPriorityPicklist) {
+      const entries = Object.entries(state.atPriorityPicklist);
+      prioSel.innerHTML = entries.map(([v,i]) =>
+        `<option value="${v}" ${String(t.priority)===v?'selected':''}>${esc(i.label)}</option>`
+      ).join('');
+    }
+    if (queueSel && state.atQueues?.length) {
+      queueSel.innerHTML = `<option value="">— None —</option>` +
+        state.atQueues.map(q =>
+          `<option value="${q.id}" ${String(t.queueID)===String(q.id)?'selected':''}>${esc(q.name)}</option>`
+        ).join('');
+    }
+    if (resSel && state.atResources?.length) {
+      const sorted = [...state.atResources].sort((a,b)=>a.name.localeCompare(b.name));
+      resSel.innerHTML = `<option value="">— Unassigned —</option>` +
+        sorted.map(r =>
+          `<option value="${r.id}" ${String(t.assignedResourceID)===String(r.id)?'selected':''}>${esc(r.name)}</option>`
+        ).join('');
+    }
+  };
+  renderTicketDetail._rehydrateSelects(ticket);
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
@@ -1402,6 +1573,7 @@ function wireEvents() {
       items.forEach(t=>{
         state.tickets[t.ticketNumber]={
           id:t.id,ticketNumber:t.ticketNumber,status:t.status,statusLabel:t.statusLabel,statusColor:t.statusColor,isDone:t.isDone,
+          priority:t.priority,queueID:t.queueID,
           title:t.title,companyID:t.companyID,companyName:t.companyName,lastActivity:t.lastActivityDate,
           assignedResourceID:t.assignedResourceID,assignedResourceName:t.assignedResourceName,
         };
@@ -1536,6 +1708,120 @@ function wireEvents() {
 
     if (action==='save-kb-ticket') {
       showKBModal();
+    }
+
+    if (action==='ticket-accept') {
+      const ticketId=el.dataset.ticketId;
+      const ticket=Object.values(state.tickets).find(t=>String(t.id)===ticketId); if(!ticket) return;
+      try {
+        const rid = await ensureMyResource();
+        if (!rid) return;
+        el.disabled = true; el.textContent = 'Accepting...';
+        await patchTicketField(ticket, 'assignedResourceID', rid);
+        // Also bump status to "In Progress" if currently "New"
+        const pl = state.atStatusPicklist || {};
+        const inProgress = Object.entries(pl).find(([,i]) => (i.label||'').toLowerCase().includes('progress'));
+        if (inProgress && (ticket.statusLabel||'').toLowerCase() === 'new') {
+          await patchTicketField(ticket, 'status', parseInt(inProgress[0]));
+        }
+        state.currentTicket = ticket;
+        renderTicketDetail(ticket); renderTicketList();
+        showToast('✓ Ticket accepted', 'ok');
+      } catch(e) {
+        showToast(`Accept failed: ${e.message}`, 'err');
+        renderTicketDetail(ticket);
+      }
+    }
+
+    if (action==='ticket-complete') {
+      const ticketId=el.dataset.ticketId;
+      const ticket=Object.values(state.tickets).find(t=>String(t.id)===ticketId); if(!ticket) return;
+      await loadAtStatusPicklist();
+      const doneId = findCompleteStatusID();
+      if (!doneId) { showToast('No Complete status found in picklist', 'err'); return; }
+
+      const origLabel = el.textContent;
+      const resetBtn = () => { el.disabled = false; el.textContent = origLabel; };
+
+      const input = $('ticketNotesInput');
+      const unpostedText = (input?.value || '').trim();
+
+      // Fetch the ticket's current resolution from AT to know what we're working with
+      el.disabled = true; el.textContent = 'Checking...';
+      let currentResolution = '';
+      try {
+        const data = await atFetch(`/Tickets/${ticket.id}`);
+        currentResolution = ((data?.item?.resolution ?? data?.resolution) || '').trim();
+      } catch(e) {
+        console.warn('Could not verify resolution:', e.message);
+      }
+
+      // Guard: no resolution anywhere — block and focus the field
+      if (!currentResolution && !unpostedText) {
+        resetBtn();
+        showToast('Add a resolution before completing', 'err');
+        input?.focus();
+        return;
+      }
+
+      // Unposted text that differs from what's on the ticket — offer to post first
+      if (unpostedText && unpostedText !== currentResolution) {
+        const msg = currentResolution
+          ? `The ticket already has a different resolution posted.\n\nReplace it with the text in your Resolution field and complete?`
+          : `Post this resolution and mark ticket ${ticket.ticketNumber} complete?`;
+        if (!confirm(msg)) { resetBtn(); return; }
+        try {
+          el.textContent = 'Posting resolution...';
+          await postResolutionToAt(ticket.id, unpostedText, ticket.assignedResourceID);
+          state.notesDrafts['ticket-'+ticket.id] = '';
+        } catch(e) {
+          showToast(`Failed to post resolution: ${e.message}`, 'err');
+          resetBtn();
+          return;
+        }
+      } else {
+        // Resolution already present (or textarea matches it) — simple confirm
+        if (!confirm(`Mark ticket ${ticket.ticketNumber} as Complete?`)) { resetBtn(); return; }
+      }
+
+      // Do the status PATCH to Complete
+      try {
+        el.textContent = 'Completing...';
+        await patchTicketField(ticket, 'status', doneId);
+        state.currentTicket = ticket;
+        renderTicketDetail(ticket); renderTicketList();
+        showToast('✓ Ticket completed', 'ok');
+      } catch(e) {
+        showToast(`Complete failed: ${e.message}`, 'err');
+        resetBtn();
+        renderTicketDetail(ticket);
+      }
+    }
+  });
+
+  // Ticket field inline edits (status, priority, queue, resource)
+  document.addEventListener('change', async e => {
+    if (!e.target.classList?.contains('ticket-field-select')) return;
+    const sel = e.target;
+    const ticketId = sel.dataset.ticketId;
+    const field = sel.dataset.field;
+    const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+    if (!ticket) return;
+    const prevValue = ticket[field];
+    const newValue = sel.value;
+    sel.disabled = true;
+    try {
+      await patchTicketField(ticket, field, newValue);
+      state.currentTicket = ticket;
+      // Refresh header color/badge without blowing away select focus
+      renderTicketDetail(ticket); renderTicketList();
+      const label = sel.options[sel.selectedIndex]?.text || '';
+      showToast(`✓ ${field.replace('ID','')} → ${label}`, 'ok');
+    } catch(err) {
+      sel.value = prevValue ?? '';
+      showToast(`Update failed: ${err.message}`, 'err');
+    } finally {
+      sel.disabled = false;
     }
   });
 
@@ -1682,8 +1968,79 @@ function registerSW() {
   }
 }
 
+// ─── TIER A STYLES (inline-injected — self-contained) ────────────
+function injectTierAStyles() {
+  if (document.getElementById('tierA-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'tierA-styles';
+  style.textContent = `
+    .ticket-fields-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px 14px;
+    }
+    @media (max-width: 640px) {
+      .ticket-fields-grid { grid-template-columns: 1fr; }
+    }
+    .ticket-fields-grid .field-group { margin-bottom: 0; }
+    .ticket-fields-grid label {
+      display: block;
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--textdim);
+      margin-bottom: 4px;
+    }
+    select.ticket-field-select {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    select.ticket-field-select:hover:not(:disabled) {
+      border-color: var(--accent);
+    }
+    select.ticket-field-select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(0,180,216,0.15);
+    }
+    select.ticket-field-select:disabled {
+      opacity: 0.5;
+      cursor: wait;
+    }
+    .abtn-accept {
+      background: rgba(0,180,216,0.12);
+      border: 1px solid rgba(0,180,216,0.4);
+      color: #00b4d8;
+    }
+    .abtn-accept:hover:not(:disabled) {
+      background: rgba(0,180,216,0.22);
+      border-color: rgba(0,180,216,0.7);
+    }
+    .abtn-complete {
+      background: rgba(42,157,92,0.12);
+      border: 1px solid rgba(42,157,92,0.4);
+      color: #2a9d5c;
+    }
+    .abtn-complete:hover:not(:disabled) {
+      background: rgba(42,157,92,0.22);
+      border-color: rgba(42,157,92,0.7);
+    }
+  `;
+  document.head.appendChild(style);
+}
+
 // ─── BOOT ─────────────────────────────────────────────────────────
 async function boot() {
+  injectTierAStyles();
   registerSW();
   loadSettings();
   applyMode(LS.get('msp_lightmode', false));
