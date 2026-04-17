@@ -305,20 +305,41 @@ function buildCompanyNameMap() {
 }
 
 async function loadAtCompanyNames(companyIds) {
-  // Only fetch IDs we don't have yet
   const missing = [...new Set(companyIds)].filter(id => id && !atCompanyCache[id]);
   if (!missing.length) return;
   try {
+    // Autotask REST API uses 'Companies' endpoint
     const data = await atFetch('/Companies/query', 'POST', {
       MaxRecords: 500,
       filter: [{ op: 'in', field: 'id', value: missing }],
-      IncludeFields: ['id', 'companyName'],
+      IncludeFields: ['id', 'companyName', 'accountName'],
     });
     (data?.items || []).forEach(c => {
-      if (c.id && c.companyName) atCompanyCache[c.id] = c.companyName;
+      // Try both field names — different AT API versions use different names
+      const name = c.companyName || c.accountName || c.name || null;
+      if (c.id && name) atCompanyCache[c.id] = name;
     });
+    // If API returned nothing useful, log for debugging
+    if (!data?.items?.length) {
+      console.warn('AT Companies query returned no items. IDs:', missing.slice(0,5));
+    }
     LS.set('msp_at_companies', atCompanyCache);
-  } catch(e) { console.warn('Company name fetch failed:', e.message); }
+  } catch(e) {
+    console.warn('Company name fetch failed:', e.message);
+    // Try alternate endpoint name
+    try {
+      const data2 = await atFetch('/Accounts/query', 'POST', {
+        MaxRecords: 500,
+        filter: [{ op: 'in', field: 'id', value: missing }],
+        IncludeFields: ['id', 'accountName'],
+      });
+      (data2?.items || []).forEach(c => {
+        const name = c.accountName || c.companyName || c.name || null;
+        if (c.id && name) atCompanyCache[c.id] = name;
+      });
+      LS.set('msp_at_companies', atCompanyCache);
+    } catch(e2) { console.warn('Alternate company fetch also failed:', e2.message); }
+  }
 }
 
 async function fetchAtTicketQueue() {
@@ -465,9 +486,20 @@ function getFilteredAlerts() {
 }
 
 function getOpenTickets() {
-  return Object.values(state.tickets).filter(t =>
-    !t.isDone && (!t.companyName || !state.excludedClients.has(t.companyName))
-  );
+  // Build set of excluded company IDs from the cache for tickets where name lookup failed
+  const excludedIds = new Set();
+  Object.entries(atCompanyCache).forEach(([id, name]) => {
+    if (state.excludedClients.has(name)) excludedIds.add(parseInt(id));
+  });
+
+  return Object.values(state.tickets).filter(t => {
+    if (t.isDone) return false;
+    // Filter by company name if we have it
+    if (t.companyName && state.excludedClients.has(t.companyName)) return false;
+    // Filter by company ID if name lookup failed but we have the ID in cache
+    if (!t.companyName && t.companyID && excludedIds.has(t.companyID)) return false;
+    return true;
+  });
 }
 
 // ─── RENDER HELPERS ───────────────────────────────────────────────
@@ -923,7 +955,10 @@ function renderExcludedChips() {
 
 function populateKnownClients() {
   const el=$('knownClientsList'); if(!el) return;
-  const known=[...new Set(state.alerts.map(a=>a.siteName).filter(Boolean))].sort();
+  // Combine Datto site names AND Autotask company names
+  const fromAlerts = state.alerts.map(a=>a.siteName).filter(Boolean);
+  const fromAt = Object.values(atCompanyCache).filter(Boolean);
+  const known = [...new Set([...fromAlerts, ...fromAt])].sort();
   el.innerHTML=known.map(c=>`<span class="known-chip ${state.excludedClients.has(c)?'excluded':''}" data-known="${esc(c)}">${state.excludedClients.has(c)?'🚫 ':''}${esc(c)}</span>`).join('');
 }
 
