@@ -1277,6 +1277,19 @@ async function refreshAll() {
     state.sites = sites;
     const ticketNumbers = [...new Set(alerts.map(a=>a.ticketNumber).filter(Boolean))];
     if (ticketNumbers.length && state.settings.atUser) await syncTicketStatuses(ticketNumbers);
+
+    // Match alerts to tickets created by Companion (where Datto doesn't know the ticket number yet)
+    // Look for tickets whose title contains the alert's hostname
+    alerts.forEach(a => {
+      if (a.ticketNumber) return; // Already linked
+      const matched = Object.values(state.tickets).find(t =>
+        !t.isDone && t.title && t.title.includes(a.hostname) &&
+        t.companyName === a.siteName
+      );
+      if (matched) a.ticketNumber = matched.ticketNumber;
+    });
+    LS.set('msp_alerts', alerts);
+
     render();
     showToast(`✓ Refreshed — ${alerts.length} alerts`,'ok');
   } catch(e) {
