@@ -125,11 +125,24 @@ async function dattoFetch(path) {
 function normalizeAlert(raw) {
   const src = raw.alertSourceInfo || {};
   const ctx = raw.alertContext || {};
-  let alertMessage = raw.alertMessage || '';
+  const src2 = raw.alertSourceInfo || {};
+
+  // Priority order for alert message:
+  // 1. alertMessage on the raw object (Datto usually puts the full message here)
+  // 2. alertSourceInfo message fields
+  // 3. Parse from alertContext
+  let alertMessage = raw.alertMessage
+    || src2.alertMessage
+    || src2.message
+    || ctx.alertMessage
+    || ctx.message
+    || ctx.description
+    || '';
+
   const cls = (ctx['@class'] || '').toLowerCase();
   const monitorType = (raw.alertMonitorType || raw.monitorType || '').toLowerCase();
 
-  // Try to build a meaningful message if we don't already have one
+  // Only try to parse context if we still don't have a meaningful message
   if (!alertMessage || alertMessage === 'Alert triggered') {
 
     // ── Disk Usage ────────────────────────────────────────────────
@@ -262,6 +275,20 @@ function normalizeAlert(raw) {
     _raw: raw,
   };
 }
+
+// Debug helper — paste in console: debugAlert()
+window.debugAlert = () => {
+  const a = window._lastAlert;
+  if (!a) { console.log('No alert selected yet'); return; }
+  console.log('=== RAW ALERT DATA ===');
+  console.log('alertMessage:', a._raw?.alertMessage);
+  console.log('alertMonitorType:', a._raw?.alertMonitorType);
+  console.log('alertSourceInfo:', JSON.stringify(a._raw?.alertSourceInfo, null, 2));
+  console.log('alertContext:', JSON.stringify(a._raw?.alertContext, null, 2));
+  console.log('=== NORMALIZED ===');
+  console.log('message:', a.alertMessage);
+  console.log('monitorType:', a.monitorType);
+};
 
 async function fetchAlerts() {
   const pages = []; let page = 0;
@@ -767,6 +794,7 @@ function renderClientChips() {
 async function renderAlertDetail(alert) {
   const dp = $('alertDetail'); if(!dp) return;
   state.currentAlert = alert;
+  window._lastAlert = alert; // For console debugging — type debugAlert()
   const sv     = SEV[alert.priority]||SEV.Information;
   const ticket = alert.ticketNumber ? state.tickets[alert.ticketNumber] : null;
   const ai     = state.aiResults[alert.alertUid];
