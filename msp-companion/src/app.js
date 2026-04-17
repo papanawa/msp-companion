@@ -246,6 +246,8 @@ async function syncTicketStatuses(ticketNumbers) {
         IncludeFields: ['id','ticketNumber','status','title','assignedResourceID','lastActivityDate','companyID'],
       });
       // Build company name map from alerts
+      const companyIds2 = (data?.items||[]).map(t=>t.companyID).filter(Boolean);
+      await loadAtCompanyNames(companyIds2);
       const companyNameMap = buildCompanyNameMap();
       (data?.items || []).forEach(t => {
         const si = pl[t.status] || { label:`Status ${t.status}`, color:'#8bacc8', done:false };
@@ -288,14 +290,35 @@ async function loadAtRoles() {
   } catch(e) { console.warn('Roles failed:', e.message); }
 }
 
+// Cache of Autotask companyID -> company name
+let atCompanyCache = {};
+
 function buildCompanyNameMap() {
-  const map = {};
-  state.alerts.forEach(a => { if (a.siteUid && a.siteName) map[a.siteUid] = a.siteName; });
+  // Start with AT company cache (most reliable)
+  const map = { ...atCompanyCache };
+  // Also try Datto sites as fallback
   state.sites.forEach(s => {
     if (s.id && s.name) map[s.id] = s.name;
     if (s.uid && s.name) map[s.uid] = s.name;
   });
   return map;
+}
+
+async function loadAtCompanyNames(companyIds) {
+  // Only fetch IDs we don't have yet
+  const missing = [...new Set(companyIds)].filter(id => id && !atCompanyCache[id]);
+  if (!missing.length) return;
+  try {
+    const data = await atFetch('/Companies/query', 'POST', {
+      MaxRecords: 500,
+      filter: [{ op: 'in', field: 'id', value: missing }],
+      IncludeFields: ['id', 'companyName'],
+    });
+    (data?.items || []).forEach(c => {
+      if (c.id && c.companyName) atCompanyCache[c.id] = c.companyName;
+    });
+    LS.set('msp_at_companies', atCompanyCache);
+  } catch(e) { console.warn('Company name fetch failed:', e.message); }
 }
 
 async function fetchAtTicketQueue() {
@@ -313,6 +336,9 @@ async function fetchAtTicketQueue() {
   await loadAtResources();
   const resourceMap = {};
   state.atResources.forEach(r => { resourceMap[r.id] = r.name; });
+  // Fetch company names from Autotask for all unique company IDs
+  const companyIds = [...new Set(items.map(t => t.companyID).filter(Boolean))];
+  await loadAtCompanyNames(companyIds);
   const companyNameMap = buildCompanyNameMap();
   items.forEach(t => {
     const si = pl[t.status] || { label:`Status ${t.status}`, color:'#8bacc8', done:false };
@@ -1299,6 +1325,9 @@ async function boot() {
   applyMode(LS.get('msp_lightmode', false));
   const lastView = LS.get('msp_view','dashboard');
   setView(lastView);
+
+  // Restore AT company name cache
+  atCompanyCache = LS.get('msp_at_companies', {});
 
   // Load and sanitize cached data
   const cachedAlerts = LS.get('msp_alerts',[]);
