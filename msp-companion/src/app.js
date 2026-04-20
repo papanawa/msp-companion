@@ -10,6 +10,7 @@ const state = {
   investigations: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
+  ticketStatusFilter: 'active', ticketShowStale: false,
   autoRefreshTimer: null,
 };
 
@@ -650,39 +651,32 @@ function buildCompanyNameMap() {
 async function loadAtCompanyNames(companyIds) {
   const missing = [...new Set(companyIds)].filter(id => id && !atCompanyCache[id]);
   if (!missing.length) return;
-  try {
-    // Autotask REST API uses 'Companies' endpoint
-    const data = await atFetch('/Companies/query', 'POST', {
-      MaxRecords: 500,
-      filter: [{ op: 'in', field: 'id', value: missing }],
-      IncludeFields: ['id', 'companyName', 'accountName'],
-    });
-    (data?.items || []).forEach(c => {
-      // Try both field names — different AT API versions use different names
-      const name = c.companyName || c.accountName || c.name || null;
-      if (c.id && name) atCompanyCache[c.id] = name;
-    });
-    // If API returned nothing useful, log for debugging
-    if (!data?.items?.length) {
-      console.warn('AT Companies query returned no items. IDs:', missing.slice(0,5));
-    }
-    LS.set('msp_at_companies', atCompanyCache);
-  } catch(e) {
-    console.warn('Company name fetch failed:', e.message);
-    // Try alternate endpoint name
+  // Chunk requests — querying 100+ IDs in one filter sometimes upsets AT's zone proxy
+  const CHUNK = 100;
+  const chunks = [];
+  for (let i = 0; i < missing.length; i += CHUNK) chunks.push(missing.slice(i, i + CHUNK));
+  for (const chunk of chunks) {
     try {
-      const data2 = await atFetch('/Accounts/query', 'POST', {
+      // Autotask REST uses 'Companies' endpoint; companyName is the canonical field.
+      // IncludeFields with accountName causes "Unable to find accountName in Company Entity" 500s on some zones.
+      const data = await atFetch('/Companies/query', 'POST', {
         MaxRecords: 500,
-        filter: [{ op: 'in', field: 'id', value: missing }],
-        IncludeFields: ['id', 'accountName'],
+        filter: [{ op: 'in', field: 'id', value: chunk }],
+        IncludeFields: ['id', 'companyName'],
       });
-      (data2?.items || []).forEach(c => {
-        const name = c.accountName || c.companyName || c.name || null;
+      (data?.items || []).forEach(c => {
+        const name = c.companyName || c.name || null;
         if (c.id && name) atCompanyCache[c.id] = name;
       });
-      LS.set('msp_at_companies', atCompanyCache);
-    } catch(e2) { console.warn('Alternate company fetch also failed:', e2.message); }
+      if (!data?.items?.length) {
+        console.warn('AT Companies query returned no items. IDs:', chunk.slice(0, 5));
+      }
+    } catch(e) {
+      console.warn('Company name chunk failed (non-fatal):', e.message, 'IDs:', chunk.slice(0, 5));
+      // No fallback to /Accounts — that endpoint doesn't exist in modern AT REST.
+    }
   }
+  LS.set('msp_at_companies', atCompanyCache);
 }
 
 async function fetchAtTicketQueue() {
@@ -1366,19 +1360,34 @@ function getFilteredAlerts() {
     });
 }
 
-function getOpenTickets() {
+// Status ID classifications — mirrors AT dashboard "Open Tickets" widget behavior.
+// Active = actively-worked tickets. Stale = waiting/on-hold/admin tickets hidden by default.
+const ACTIVE_STATUS_IDS = new Set([1, 8, 10, 11, 21, 23]);
+// 1=New, 8=In Progress, 10=Dispatched, 11=Escalate, 21=Assigned, 23=Ready to Schedule
+
+function getOpenTickets(opts = {}) {
   // Build set of excluded company IDs using PSA exclusion list
   const excludedIds = new Set();
   Object.entries(atCompanyCache).forEach(([id, name]) => {
     if (state.psaExcludedClients.has(name)) excludedIds.add(parseInt(id));
   });
 
+  const includeStale = opts.includeStale ?? state.ticketShowStale;
+
   return Object.values(state.tickets).filter(t => {
     if (t.isDone) return false;
     if (t.companyName && state.psaExcludedClients.has(t.companyName)) return false;
     if (!t.companyName && t.companyID && excludedIds.has(t.companyID)) return false;
+    // Unless showing stale, hide tickets whose status isn't in the active set
+    if (!includeStale && t.status && !ACTIVE_STATUS_IDS.has(t.status)) return false;
     return true;
   });
+}
+
+// Separate helper for alert-linkage checks — never filters by status, always returns truth.
+// Used by the dashboard/pipeline so "Waiting Customer" tickets still light up as linked to alerts.
+function getTicketByNumber(ticketNumber) {
+  return ticketNumber ? state.tickets[ticketNumber] : null;
 }
 
 // ─── RENDER HELPERS ───────────────────────────────────────────────
@@ -1684,8 +1693,25 @@ function renderChatHistory(uid) {
 // ─── TICKET LIST ──────────────────────────────────────────────────
 function renderTicketList() {
   const el=$('ticketList'); if(!el) return;
+  // All tickets, active + stale, for toolbar counts
+  const allOpen = getOpenTickets({ includeStale: true });
+  const activeCount = allOpen.filter(t => t.status && ACTIVE_STATUS_IDS.has(t.status)).length;
+  const staleCount  = allOpen.length - activeCount;
+
+  const toolbarHtml = `<div class="ticket-status-toolbar">
+    <label class="ticket-stale-toggle">
+      <input type="checkbox" id="ticketShowStale" ${state.ticketShowStale?'checked':''} />
+      <span>Show waiting/hold tickets</span>
+      <span class="ticket-stale-count">${staleCount}</span>
+    </label>
+    <div class="ticket-active-summary">${activeCount} active</div>
+  </div>`;
+
   const tickets = getOpenTickets();
-  if (!tickets.length) { el.innerHTML='<div class="loading-state">No open tickets — click Refresh to load</div>'; return; }
+  if (!tickets.length) {
+    el.innerHTML = toolbarHtml + '<div class="loading-state">No active tickets — click Refresh, or enable "Show waiting/hold" above.</div>';
+    return;
+  }
   const UNASSIGNED='__unassigned__';
   const groups={};
   tickets.forEach(t => {
@@ -1695,7 +1721,7 @@ function renderTicketList() {
   });
   const sorted = Object.values(groups).sort((a,b)=>{ if(a.isUnassigned) return -1; if(b.isUnassigned) return 1; return a.name.localeCompare(b.name); });
   sorted.forEach(g => g.tickets.sort((a,b)=>(a.statusLabel||'').localeCompare(b.statusLabel||'')));
-  el.innerHTML = sorted.map(group => {
+  el.innerHTML = toolbarHtml + sorted.map(group => {
     const initials = group.isUnassigned ? '?' : group.name.split(' ').map(w=>w[0]).join('').substring(0,2).toUpperCase();
     const rows = group.tickets.map(t=>`
       <div class="list-row ticket-row ${state.currentTicket?.id===t.id?'active':''}" data-ticket-id="${t.id}">
@@ -2865,6 +2891,12 @@ function wireEvents() {
 
   // Ticket field inline edits (status, priority, queue, resource)
   document.addEventListener('change', async e => {
+    // Show-stale toggle on ticket list
+    if (e.target.id === 'ticketShowStale') {
+      state.ticketShowStale = !!e.target.checked;
+      renderTicketList();
+      return;
+    }
     // Investigation: toggle step done
     if (e.target.classList?.contains('inv-step-done-cb')) {
       const stepEl = e.target.closest('.inv-step'); if (!stepEl) return;
@@ -3484,6 +3516,45 @@ function injectTierAStyles() {
       font-size: 12px;
       color: var(--text);
       word-break: break-word;
+    }
+    /* Ticket list status filter toolbar */
+    .ticket-status-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      margin-bottom: 8px;
+      background: rgba(0,180,216,0.04);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+    }
+    .ticket-stale-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--textmid);
+    }
+    .ticket-stale-toggle input[type="checkbox"] { cursor: pointer; }
+    .ticket-stale-count {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(200,160,0,0.12);
+      color: #c8a000;
+      border: 1px solid rgba(200,160,0,0.35);
+    }
+    .ticket-active-summary {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--accent);
     }
   `;
   document.head.appendChild(style);
