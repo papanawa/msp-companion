@@ -365,6 +365,40 @@ window.resetTickets = async () => {
   document.getElementById('ticketRefreshBtn')?.click();
 };
 
+// Direct AT query to see what's really coming back. Console: await debugTicketQuery()
+window.debugTicketQuery = async () => {
+  console.log('=== STATUS PICKLIST ===');
+  const pl = await loadAtStatusPicklist();
+  Object.entries(pl).forEach(([v, i]) => console.log(`  ${v}: ${i.label}${i.done ? ' [DONE]' : ''}`));
+
+  console.log('\n=== TRY 1: Only exclude status=5 (standard "Complete") ===');
+  try {
+    const r1 = await atFetch('/Tickets/query', 'POST', {
+      MaxRecords: 500,
+      filter: [{ op: 'noteq', field: 'status', value: 5 }],
+      IncludeFields: ['id', 'ticketNumber', 'status', 'assignedResourceID'],
+    });
+    console.log(`  Got ${r1?.items?.length || 0} tickets`);
+    console.log('  Status distribution:', (r1?.items || []).reduce((a, t) => { a[t.status] = (a[t.status]||0)+1; return a; }, {}));
+    console.log('  Assigned breakdown:', (r1?.items || []).reduce((a, t) => {
+      const k = t.assignedResourceID || 'unassigned';
+      a[k] = (a[k]||0)+1;
+      return a;
+    }, {}));
+  } catch(e) { console.error('  Failed:', e.message); }
+
+  console.log('\n=== TRY 2: What Companion actually uses ===');
+  try {
+    const items = await fetchAtTicketQueue();
+    console.log(`  Got ${items.length} tickets`);
+  } catch(e) { console.error('  Failed:', e.message); }
+
+  console.log('\n=== RESOURCES ===');
+  await loadAtResources();
+  console.log(`  ${state.atResources.length} resources loaded`);
+  state.atResources.forEach(r => console.log(`    ${r.id}: ${r.name}`));
+};
+
 async function fetchAlerts() {
   const pages = []; let page = 0;
   while (true) {
@@ -658,11 +692,14 @@ async function fetchAtTicketQueue() {
   const filter = doneValues.length > 0
     ? doneValues.map(v => ({ op:'noteq', field:'status', value:v }))
     : [{ op:'noteq', field:'status', value:5 }];
+  console.log('[fetchAtTicketQueue] Excluding done statuses:', doneValues, 'Filter:', filter);
   const data = await atFetch('/Tickets/query','POST',{
-    MaxRecords: 200, filter,
+    MaxRecords: 500,
+    filter,
     IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','companyID','lastActivityDate'],
   });
   const items = data?.items || [];
+  console.log('[fetchAtTicketQueue] AT returned', items.length, 'tickets. Page details:', data?.pageDetails);
   await loadAtResources();
   const resourceMap = {};
   state.atResources.forEach(r => { resourceMap[r.id] = r.name; });
@@ -2403,6 +2440,15 @@ function wireEvents() {
     if(btn){btn.textContent='↺ Loading...';btn.disabled=true;}
     try {
       const items=await fetchAtTicketQueue();
+      const priorCount = Object.values(state.tickets).filter(t => !t.isDone).length;
+      // Safety net: if we had >20 tickets before and the fetch returned <10, something went wrong.
+      // Keep the old cache and warn instead of nuking to an empty state.
+      if (priorCount > 20 && items.length < 10) {
+        console.warn('[refresh] Aborting cache replace — fetch returned only', items.length, 'but cache had', priorCount, 'open tickets. Likely partial API failure. Run debugTicketQuery() in console for details.');
+        showToast(`⚠️ Fetch returned ${items.length}, keeping cached ${priorCount}. Check console.`, 'err');
+        if(btn){btn.textContent='↺ Refresh';btn.disabled=false;}
+        return;
+      }
       // Preserve any tickets that are linked to open Datto alerts (even if outside the current query window)
       // so alert→ticket links don't break. Everything else is replaced.
       const linkedTicketNumbers = new Set(state.alerts.map(a => a.ticketNumber).filter(Boolean));
@@ -2429,7 +2475,7 @@ function wireEvents() {
       LS.set('msp_tickets',state.tickets);
       render();
       showToast(`✓ Loaded ${items.length} open tickets`,'ok');
-    } catch(e){showToast(`Ticket sync error: ${e.message}`,'err');}
+    } catch(e){showToast(`Ticket sync error: ${e.message}`,'err'); console.error('[refresh] fetch threw:', e);}
     finally{if(btn){btn.textContent='↺ Refresh';btn.disabled=false;}}
   });
 
