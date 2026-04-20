@@ -322,6 +322,49 @@ window.debugAlert = () => {
   console.log('monitorType:', a.monitorType);
 };
 
+// Debug: compare cached ticket data vs live Autotask for one ticket.
+// Usage: await debugTicket('T20260416.0044')
+window.debugTicket = async (ticketNumber) => {
+  const cached = state.tickets[ticketNumber];
+  console.log('=== CACHED IN COMPANION ===');
+  console.log(cached || '(not in cache)');
+  if (!cached?.id) { console.log('No id to query AT with'); return; }
+  try {
+    const fresh = await atFetch(`/Tickets/${cached.id}`);
+    const t = fresh?.item || fresh;
+    console.log('=== LIVE FROM AUTOTASK ===');
+    console.log({
+      id: t.id,
+      ticketNumber: t.ticketNumber,
+      status: t.status,
+      assignedResourceID: t.assignedResourceID,
+      queueID: t.queueID,
+      priority: t.priority,
+      title: t.title,
+      companyID: t.companyID,
+    });
+    const resourceName = t.assignedResourceID
+      ? (state.atResources.find(r => r.id === t.assignedResourceID)?.name || `(ID ${t.assignedResourceID} not in loaded resources)`)
+      : '(unassigned)';
+    console.log('Live resource name:', resourceName);
+    console.log('Cached resource name:', cached.assignedResourceName);
+    if (cached.assignedResourceID !== t.assignedResourceID) {
+      console.log('⚠️ MISMATCH — cached has assignedResourceID=' + cached.assignedResourceID + ' but AT has =' + t.assignedResourceID);
+    }
+  } catch(e) {
+    console.log('AT fetch failed:', e.message);
+  }
+};
+
+// Nuke cached tickets and force a clean resync. Console: await resetTickets()
+window.resetTickets = async () => {
+  console.log('Clearing msp_tickets cache...');
+  state.tickets = {};
+  LS.set('msp_tickets', {});
+  console.log('Cache cleared. Clicking Refresh now...');
+  document.getElementById('ticketRefreshBtn')?.click();
+};
+
 async function fetchAlerts() {
   const pages = []; let page = 0;
   while (true) {
@@ -2353,12 +2396,22 @@ function wireEvents() {
     if(ticket){state.currentTicket=ticket;renderTicketDetail(ticket);renderTicketList();}
   });
 
-  // Ticket refresh
+  // Ticket refresh — REPLACES the entire open-ticket cache rather than merging,
+  // so tickets that are now closed/assigned-to-someone-else/out-of-window get properly dropped.
   $('ticketRefreshBtn')?.addEventListener('click', async () => {
     const btn=$('ticketRefreshBtn');
     if(btn){btn.textContent='↺ Loading...';btn.disabled=true;}
     try {
       const items=await fetchAtTicketQueue();
+      // Preserve any tickets that are linked to open Datto alerts (even if outside the current query window)
+      // so alert→ticket links don't break. Everything else is replaced.
+      const linkedTicketNumbers = new Set(state.alerts.map(a => a.ticketNumber).filter(Boolean));
+      const preserved = {};
+      linkedTicketNumbers.forEach(tn => {
+        if (state.tickets[tn]) preserved[tn] = state.tickets[tn];
+      });
+      // Rebuild state.tickets from scratch with fresh data
+      state.tickets = { ...preserved };
       items.forEach(t=>{
         state.tickets[t.ticketNumber]={
           id:t.id,ticketNumber:t.ticketNumber,status:t.status,statusLabel:t.statusLabel,statusColor:t.statusColor,isDone:t.isDone,
@@ -2367,6 +2420,12 @@ function wireEvents() {
           assignedResourceID:t.assignedResourceID,assignedResourceName:t.assignedResourceName,
         };
       });
+      // For preserved tickets not in the fresh items list, refresh their status so mismatches update
+      const freshNumbers = new Set(items.map(t => t.ticketNumber));
+      const stalePreserved = Object.keys(preserved).filter(tn => !freshNumbers.has(tn));
+      if (stalePreserved.length) {
+        try { await syncTicketStatuses(stalePreserved); } catch(e) { console.warn('Preserved ticket sync failed:', e.message); }
+      }
       LS.set('msp_tickets',state.tickets);
       render();
       showToast(`✓ Loaded ${items.length} open tickets`,'ok');
