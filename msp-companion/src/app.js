@@ -1835,6 +1835,22 @@ function fmtSlaClock(dueDateStr) {
   return { text: `Due in ${absD}d`, color: 'var(--textmid)' };
 }
 
+function getDattoUiBaseUrl() {
+  // Convert the API URL (e.g. https://concord-api.centrastage.net) to the UI URL (e.g. https://concord.centrastage.net)
+  const apiUrl = (state.settings.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
+  // Strip "-api" from the subdomain — Datto's convention across regions
+  return apiUrl.replace(/-api\./, '.');
+}
+
+function buildDattoDeviceUrl(device) {
+  if (!device) return null;
+  const base = getDattoUiBaseUrl();
+  // Datto's stable deep-link format. Numeric id when available, fall back to uid.
+  if (device.id) return `${base}/csm/device/summary/${device.id}`;
+  if (device.uid) return `${base}/csm/profile/${device.uid}`;
+  return null;
+}
+
 function renderDevicePanel(ticket) {
   // Try to find a linked Datto device via the linked alert
   const linkedAlert = findLinkedAlertForTicket(ticket);
@@ -1847,11 +1863,14 @@ function renderDevicePanel(ticket) {
   const alertPill = alertStillOpen
     ? `<span class="alert-status-pill alert-status-open" title="The Datto alert that opened this ticket is still firing">🔴 ALERT OPEN</span>`
     : `<span class="alert-status-pill alert-status-resolved" title="The Datto alert has been resolved">🟢 ALERT RESOLVED</span>`;
-  // Card shell — will be hydrated async
+  // Card shell — will be hydrated async (Open in Datto button slot is filled by hydrate once device.id is known)
   return `<div class="detail-card" id="devicePanelCard" data-device-uid="${esc(deviceUid)}">
     <div class="card-label" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
       <span style="display:flex;align-items:center;gap:8px">📟 DATTO DEVICE ${alertPill}</span>
-      <button class="inv-step-btn" data-action="device-refresh" data-device-uid="${esc(deviceUid)}" title="Refresh device info" style="width:auto;padding:0 8px;height:22px;font-size:11px">↺</button>
+      <span style="display:flex;align-items:center;gap:6px">
+        <span id="devicePanelOpenSlot"></span>
+        <button class="inv-step-btn" data-action="device-refresh" data-device-uid="${esc(deviceUid)}" title="Refresh device info" style="width:auto;padding:0 8px;height:22px;font-size:11px">↺</button>
+      </span>
     </div>
     <div id="devicePanelBody">
       <div style="color:var(--textdim);font-size:12px;padding:10px 0">Loading device info...</div>
@@ -1861,12 +1880,20 @@ function renderDevicePanel(ticket) {
 
 function hydrateDevicePanel(deviceData) {
   const body = document.getElementById('devicePanelBody');
+  const openSlot = document.getElementById('devicePanelOpenSlot');
   if (!body) return;
   if (!deviceData) {
     body.innerHTML = `<div style="color:var(--textdim);font-size:12px;padding:6px 0">Device info unavailable. Check Datto RMM connection.</div>`;
     return;
   }
   const d = deviceData.device || {};
+  // Populate the "Open in Datto" link in the header — opens device summary, where Web Remote / Agent Browser / Open in PSA all live
+  if (openSlot) {
+    const dattoUrl = buildDattoDeviceUrl(d);
+    if (dattoUrl) {
+      openSlot.innerHTML = `<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="inv-step-btn datto-open-btn" title="Open device in Datto RMM (Web Remote, Agent Browser, etc.)" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">📟 OPEN IN DATTO</a>`;
+    }
+  }
   const openAlerts = deviceData.openAlertCount || 0;
   const online = d.online === true || d.online === 'true';
   const onlineColor = online ? '#2a9d5c' : '#c8102e';
@@ -4350,6 +4377,17 @@ function injectTierAStyles() {
       background: rgba(42,157,92,0.12);
       color: #2a9d5c;
       border: 1px solid rgba(42,157,92,0.4);
+    }
+    .datto-open-btn {
+      color: var(--accent) !important;
+      border-color: rgba(0,180,216,0.4) !important;
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-weight: 700;
+      letter-spacing: 0.07em;
+    }
+    .datto-open-btn:hover {
+      border-color: var(--accent) !important;
+      background: rgba(0,180,216,0.08);
     }
   `;
   document.head.appendChild(style);
