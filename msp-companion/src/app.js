@@ -11,6 +11,7 @@ const state = {
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
   ticketStatusFilter: 'active', ticketShowStale: false,
+  reportsRange: 30, reportsResolvedTickets: null, reportsResolvedAlerts: null,
   autoRefreshTimer: null,
 };
 
@@ -690,7 +691,7 @@ async function fetchAtTicketQueue() {
   const data = await atFetch('/Tickets/query','POST',{
     MaxRecords: 500,
     filter,
-    IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','companyID','lastActivityDate'],
+    IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','companyID','lastActivityDate','createDate'],
   });
   const items = data?.items || [];
   console.log('[fetchAtTicketQueue] AT returned', items.length, 'tickets. Page details:', data?.pageDetails);
@@ -2369,12 +2370,427 @@ function startAutoRefresh() {
   state.autoRefreshTimer = setInterval(()=>refreshAll(), mins*60000);
 }
 
+// ─── REPORTS ──────────────────────────────────────────────────────
+const REPORTS_RANGES = [
+  { days: 7,  label: '7d' },
+  { days: 30, label: '30d' },
+  { days: 90, label: '90d' },
+];
+
+async function fetchResolvedTicketsForReports(days) {
+  // Cache key includes days so switching ranges refetches
+  const cacheKey = `tickets-${days}`;
+  if (state.reportsResolvedTickets?.key === cacheKey &&
+      Date.now() - state.reportsResolvedTickets.fetchedAt < 5 * 60 * 1000) {
+    return state.reportsResolvedTickets.items;
+  }
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+  const pl = await loadAtStatusPicklist();
+  const doneIds = Object.entries(pl).filter(([,i]) => i.done).map(([v]) => parseInt(v)).filter(Boolean);
+  if (!doneIds.length) return [];
+  try {
+    const data = await atFetch('/Tickets/query','POST',{
+      MaxRecords: 500,
+      filter: [
+        { op: 'in',  field: 'status',     value: doneIds },
+        { op: 'gte', field: 'createDate', value: cutoff },
+      ],
+      IncludeFields: ['id','ticketNumber','title','companyID','assignedResourceID','status','createDate','resolvedDateTime','lastActivityDate'],
+    });
+    const items = data?.items || [];
+    state.reportsResolvedTickets = { key: cacheKey, items, fetchedAt: Date.now() };
+    return items;
+  } catch(e) { console.warn('Resolved tickets fetch failed:', e.message); return []; }
+}
+
+async function fetchResolvedAlertsForReports(days) {
+  const cacheKey = `alerts-${days}`;
+  if (state.reportsResolvedAlerts?.key === cacheKey &&
+      Date.now() - state.reportsResolvedAlerts.fetchedAt < 5 * 60 * 1000) {
+    return state.reportsResolvedAlerts.items;
+  }
+  // Datto resolved alerts endpoint — we'll grab a wide window and filter client-side by date
+  try {
+    let allItems = [];
+    let pageNum = 0;
+    const max = 250;
+    // Paginate up to 4 pages (1000 alerts) to be safe; stop early if a page returns < max
+    while (pageNum < 4) {
+      const data = await dattoFetch(`/account/alerts/resolved?max=${max}&page=${pageNum}`);
+      const items = data?.alerts || data?.items || [];
+      if (!items.length) break;
+      allItems = allItems.concat(items);
+      if (items.length < max) break;
+      pageNum++;
+    }
+    // Normalize and filter to window
+    const cutoffMs = Date.now() - days * 86400000;
+    const filtered = allItems
+      .map(a => ({
+        alertUid: a.alertUid || a.id,
+        timestampMs: a.timestamp ? new Date(a.timestamp).getTime() : (a.alertContext?.timestamp || 0),
+        resolvedMs:  a.resolved?.resolvedTimestamp ? new Date(a.resolved.resolvedTimestamp).getTime()
+                    : a.resolvedTimestamp ? new Date(a.resolvedTimestamp).getTime() : null,
+        priority: a.priority || a.alertSourceInfo?.priority || 'Unknown',
+        siteName: a.alertSourceInfo?.siteName || a.siteName || 'Unknown',
+        hostname: a.alertSourceInfo?.deviceName || a.deviceName || 'Unknown',
+      }))
+      .filter(a => a.resolvedMs && a.resolvedMs >= cutoffMs);
+    state.reportsResolvedAlerts = { key: cacheKey, items: filtered, fetchedAt: Date.now() };
+    return filtered;
+  } catch(e) { console.warn('Resolved alerts fetch failed:', e.message); return []; }
+}
+
+// Tiny SVG line-chart helper. Two series overlaid (e.g., opened vs resolved).
+function svgLineChart(buckets, opts = {}) {
+  const w = opts.width || 720;
+  const h = opts.height || 180;
+  const padL = 36, padR = 14, padT = 14, padB = 24;
+  const innerW = w - padL - padR;
+  const innerH = h - padT - padB;
+  const labels = buckets.map(b => b.label);
+  const seriesA = buckets.map(b => b.a || 0);
+  const seriesB = buckets.map(b => b.b || 0);
+  const maxY = Math.max(1, ...seriesA, ...seriesB);
+  const xStep = buckets.length > 1 ? innerW / (buckets.length - 1) : 0;
+  const px = i => padL + i * xStep;
+  const py = v => padT + innerH - (v / maxY) * innerH;
+  const pathA = seriesA.map((v,i) => (i===0?'M':'L') + px(i) + ',' + py(v)).join(' ');
+  const pathB = seriesB.map((v,i) => (i===0?'M':'L') + px(i) + ',' + py(v)).join(' ');
+  const yTicks = [0, Math.ceil(maxY/2), maxY];
+  const colorA = opts.colorA || '#e07b00';
+  const colorB = opts.colorB || '#2a9d5c';
+  // Show every Nth label so they don't overlap
+  const labelStride = Math.max(1, Math.ceil(buckets.length / 8));
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%;height:${h}px;display:block">
+    ${yTicks.map(t => `<line x1="${padL}" y1="${py(t)}" x2="${w-padR}" y2="${py(t)}" stroke="var(--border)" stroke-dasharray="2,3"/>
+                       <text x="4" y="${py(t)+3}" fill="var(--textdim)" font-size="10" font-family="var(--cond)">${t}</text>`).join('')}
+    <path d="${pathA}" stroke="${colorA}" stroke-width="2" fill="none"/>
+    <path d="${pathB}" stroke="${colorB}" stroke-width="2" fill="none"/>
+    ${seriesA.map((v,i) => `<circle cx="${px(i)}" cy="${py(v)}" r="2.5" fill="${colorA}"/>`).join('')}
+    ${seriesB.map((v,i) => `<circle cx="${px(i)}" cy="${py(v)}" r="2.5" fill="${colorB}"/>`).join('')}
+    ${labels.map((l,i) => i % labelStride === 0 ? `<text x="${px(i)}" y="${h-6}" text-anchor="middle" fill="var(--textdim)" font-size="9" font-family="var(--cond)">${esc(l)}</text>` : '').join('')}
+  </svg>`;
+}
+
+function svgBarChart(rows, opts = {}) {
+  const w = opts.width || 360;
+  const h = Math.max(40, rows.length * 28 + 8);
+  const labelW = opts.labelW || 130;
+  const valueW = 36;
+  const barAreaW = w - labelW - valueW - 12;
+  const maxV = Math.max(1, ...rows.map(r => r.value));
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:${h}px;display:block">
+    ${rows.map((r, i) => {
+      const y = i * 28 + 4;
+      const barW = (r.value / maxV) * barAreaW;
+      const color = r.color || '#00b4d8';
+      return `
+        <text x="${labelW-6}" y="${y+18}" text-anchor="end" fill="var(--text)" font-size="12" font-family="inherit">${esc(r.label)}</text>
+        <rect x="${labelW}" y="${y+5}" width="${barW}" height="18" fill="${color}" opacity="0.85" rx="2"/>
+        <text x="${labelW+barW+6}" y="${y+18}" fill="var(--textdim)" font-size="11" font-family="var(--cond);font-weight:700">${r.value}</text>
+      `;
+    }).join('')}
+  </svg>`;
+}
+
+function bucketByDay(items, days, getTime) {
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const buckets = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    buckets.push({
+      day: d,
+      label: (d.getMonth()+1) + '/' + d.getDate(),
+      startMs: d.getTime(),
+      endMs: d.getTime() + 86400000,
+      a: 0, b: 0,
+    });
+  }
+  return buckets;
+}
+
+async function buildAlertTrendData(days) {
+  // a = opened in day, b = resolved in day
+  const buckets = bucketByDay(null, days);
+  // Opened — use current open alerts (state.alerts) timestampMs
+  state.alerts.forEach(a => {
+    const ts = a.timestampMs;
+    if (!ts) return;
+    const b = buckets.find(b => ts >= b.startMs && ts < b.endMs);
+    if (b) b.a++;
+  });
+  // Resolved — fetch from Datto
+  const resolved = await fetchResolvedAlertsForReports(days);
+  resolved.forEach(a => {
+    if (!a.resolvedMs) return;
+    const b = buckets.find(b => a.resolvedMs >= b.startMs && a.resolvedMs < b.endMs);
+    if (b) b.b++;
+  });
+  // Also count opened from resolved alerts (those would be missing from state.alerts)
+  resolved.forEach(a => {
+    if (!a.timestampMs) return;
+    const b = buckets.find(b => a.timestampMs >= b.startMs && a.timestampMs < b.endMs);
+    if (b) b.a++;
+  });
+  return buckets;
+}
+
+function calcMTTR(items, getStartMs, getEndMs) {
+  const durations = items
+    .map(i => {
+      const s = getStartMs(i), e = getEndMs(i);
+      return (s && e && e >= s) ? (e - s) : null;
+    })
+    .filter(d => d !== null && d > 0);
+  if (!durations.length) return null;
+  const avg = durations.reduce((a,b) => a+b, 0) / durations.length;
+  return avg;
+}
+
+function fmtDuration(ms) {
+  if (ms == null) return '—';
+  const hrs = ms / 3600000;
+  if (hrs < 24) return hrs.toFixed(1) + 'h';
+  const days = hrs / 24;
+  return days.toFixed(1) + 'd';
+}
+
+async function buildReportsData(days) {
+  const [resolvedTickets, resolvedAlerts] = await Promise.all([
+    fetchResolvedTicketsForReports(days),
+    fetchResolvedAlertsForReports(days),
+  ]);
+  // Need company name resolution for resolved tickets
+  const companyIds = [...new Set(resolvedTickets.map(t => t.companyID).filter(Boolean))];
+  await loadAtCompanyNames(companyIds);
+  await loadAtResources();
+
+  // MTTR — tickets
+  const ticketMttr = calcMTTR(
+    resolvedTickets,
+    t => t.createDate ? new Date(t.createDate).getTime() : null,
+    t => (t.resolvedDateTime || t.lastActivityDate) ? new Date(t.resolvedDateTime || t.lastActivityDate).getTime() : null
+  );
+  // Prior period for trend
+  const priorTickets = await fetchResolvedTicketsForReports(days * 2);
+  const priorOnly = priorTickets.filter(t => {
+    const cd = new Date(t.createDate).getTime();
+    return cd < Date.now() - days * 86400000;
+  });
+  const priorMttr = calcMTTR(
+    priorOnly,
+    t => t.createDate ? new Date(t.createDate).getTime() : null,
+    t => (t.resolvedDateTime || t.lastActivityDate) ? new Date(t.resolvedDateTime || t.lastActivityDate).getTime() : null
+  );
+  // MTTR — alerts
+  const alertMttr = calcMTTR(
+    resolvedAlerts,
+    a => a.timestampMs,
+    a => a.resolvedMs
+  );
+
+  // Tech workload: open ticket count + average age per resource
+  const openTickets = getOpenTickets({ includeStale: true });
+  const techMap = {};
+  openTickets.forEach(t => {
+    const name = t.assignedResourceName || 'Unassigned';
+    if (!techMap[name]) techMap[name] = { name, count: 0, ageDays: [] };
+    techMap[name].count++;
+    if (t.createDate) {
+      const age = (Date.now() - new Date(t.createDate).getTime()) / 86400000;
+      techMap[name].ageDays.push(age);
+    }
+  });
+  const techRows = Object.values(techMap)
+    .map(t => ({
+      name: t.name,
+      count: t.count,
+      avgAge: t.ageDays.length ? (t.ageDays.reduce((a,b)=>a+b,0)/t.ageDays.length) : 0,
+    }))
+    .sort((a,b) => b.count - a.count);
+
+  // Top clients by ticket volume (opened in window)
+  // Count from resolvedTickets + currently-open tickets created in window
+  const clientCounts = {};
+  resolvedTickets.forEach(t => {
+    const cid = t.companyID;
+    if (!cid) return;
+    const name = atCompanyCache[cid] || `Company ${cid}`;
+    clientCounts[name] = (clientCounts[name] || 0) + 1;
+  });
+  openTickets.forEach(t => {
+    if (!t.createDate) return;
+    const ageMs = Date.now() - new Date(t.createDate).getTime();
+    if (ageMs > days * 86400000) return; // older than window, skip
+    const name = t.companyName || (t.companyID ? `Company ${t.companyID}` : null);
+    if (!name) return;
+    clientCounts[name] = (clientCounts[name] || 0) + 1;
+  });
+  const topClients = Object.entries(clientCounts)
+    .map(([name, count]) => ({ label: name, value: count }))
+    .sort((a,b) => b.value - a.value)
+    .slice(0, 10);
+
+  // Aging tickets — open > 14 days
+  const AGE_THRESHOLD_DAYS = 14;
+  const agingTickets = openTickets
+    .filter(t => t.createDate && (Date.now() - new Date(t.createDate).getTime()) > AGE_THRESHOLD_DAYS * 86400000)
+    .map(t => ({
+      ticketNumber: t.ticketNumber,
+      title: t.title,
+      tech: t.assignedResourceName || 'Unassigned',
+      client: t.companyName || (t.companyID ? `Company ${t.companyID}` : 'Unknown'),
+      ageDays: Math.floor((Date.now() - new Date(t.createDate).getTime()) / 86400000),
+      statusLabel: t.statusLabel,
+      statusColor: t.statusColor,
+    }))
+    .sort((a,b) => b.ageDays - a.ageDays);
+
+  return {
+    days,
+    ticketsResolvedCount: resolvedTickets.length,
+    alertsResolvedCount: resolvedAlerts.length,
+    ticketMttr, priorMttr, alertMttr,
+    techRows,
+    topClients,
+    agingTickets,
+    alertTrendBuckets: await buildAlertTrendData(days),
+  };
+}
+
+function trendArrow(current, prior) {
+  if (current == null || prior == null) return '';
+  if (Math.abs(current - prior) / prior < 0.05) return '<span style="color:var(--textdim)">→ flat</span>';
+  if (current < prior) return `<span style="color:#2a9d5c">↓ ${Math.round((1-current/prior)*100)}% better</span>`;
+  return `<span style="color:#c8102e">↑ ${Math.round((current/prior-1)*100)}% slower</span>`;
+}
+
+async function renderReportsView() {
+  const root = document.getElementById('view-reports');
+  if (!root) return;
+  // Date range tabs + skeleton
+  const days = state.reportsRange || 30;
+  root.innerHTML = `
+    <div class="reports-wrap">
+      <div class="reports-header">
+        <div class="reports-title">📊 Reports</div>
+        <div class="reports-range">
+          ${REPORTS_RANGES.map(r => `<button class="reports-range-btn ${r.days===days?'active':''}" data-action="reports-range" data-days="${r.days}">${r.label}</button>`).join('')}
+          <button class="reports-range-btn" data-action="reports-refresh" title="Refresh data" style="margin-left:auto">↺</button>
+        </div>
+      </div>
+      <div id="reportsBody"><div class="loading-state">Crunching numbers...</div></div>
+    </div>
+  `;
+  try {
+    const data = await buildReportsData(days);
+    renderReportsBody(data);
+  } catch(e) {
+    console.error('Reports error:', e);
+    document.getElementById('reportsBody').innerHTML =
+      `<div class="loading-state" style="color:#c8102e">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderReportsBody(data) {
+  const body = document.getElementById('reportsBody');
+  if (!body) return;
+  const ticketTrend = trendArrow(data.ticketMttr, data.priorMttr);
+
+  body.innerHTML = `
+    <!-- Top stats row -->
+    <div class="reports-stats">
+      <div class="reports-stat-card">
+        <div class="reports-stat-label">TICKETS RESOLVED</div>
+        <div class="reports-stat-value">${data.ticketsResolvedCount}</div>
+        <div class="reports-stat-sub">last ${data.days} days</div>
+      </div>
+      <div class="reports-stat-card">
+        <div class="reports-stat-label">ALERTS RESOLVED</div>
+        <div class="reports-stat-value">${data.alertsResolvedCount}</div>
+        <div class="reports-stat-sub">last ${data.days} days</div>
+      </div>
+      <div class="reports-stat-card">
+        <div class="reports-stat-label">MTTR — TICKETS</div>
+        <div class="reports-stat-value">${fmtDuration(data.ticketMttr)}</div>
+        <div class="reports-stat-sub">${ticketTrend || 'no prior period'}</div>
+      </div>
+      <div class="reports-stat-card">
+        <div class="reports-stat-label">MTTR — ALERTS</div>
+        <div class="reports-stat-value">${fmtDuration(data.alertMttr)}</div>
+        <div class="reports-stat-sub">last ${data.days} days</div>
+      </div>
+    </div>
+
+    <!-- Alert trend -->
+    <div class="reports-card">
+      <div class="card-label" style="display:flex;align-items:center;justify-content:space-between">
+        <span>📈 ALERT TREND — OPENED vs RESOLVED</span>
+        <div class="reports-legend">
+          <span><span class="legend-swatch" style="background:#e07b00"></span>Opened</span>
+          <span><span class="legend-swatch" style="background:#2a9d5c"></span>Resolved</span>
+        </div>
+      </div>
+      ${data.alertTrendBuckets.length ? svgLineChart(data.alertTrendBuckets) :
+        '<div class="loading-state">No data in window</div>'}
+    </div>
+
+    <!-- Two-column: Tech workload + Top clients -->
+    <div class="reports-grid-two">
+      <div class="reports-card">
+        <div class="card-label">👥 TECH WORKLOAD — OPEN TICKETS</div>
+        ${data.techRows.length ? svgBarChart(
+          data.techRows.map(r => ({ label: r.name, value: r.count })),
+          { labelW: 130 }
+        ) + `<div class="reports-tech-detail">
+          ${data.techRows.map(r => `<div class="tech-detail-row">
+            <span>${esc(r.name)}</span>
+            <span class="tech-avg-age">${r.avgAge ? r.avgAge.toFixed(1) + 'd avg age' : '—'}</span>
+          </div>`).join('')}
+        </div>` : '<div class="loading-state">No open tickets</div>'}
+      </div>
+
+      <div class="reports-card">
+        <div class="card-label">🏢 TOP CLIENTS BY TICKET VOLUME</div>
+        ${data.topClients.length ? svgBarChart(data.topClients, { labelW: 160 })
+          : '<div class="loading-state">No client data in window</div>'}
+      </div>
+    </div>
+
+    <!-- Aging tickets -->
+    <div class="reports-card">
+      <div class="card-label">🕐 AGING TICKETS — OPEN > 14 DAYS (${data.agingTickets.length})</div>
+      ${data.agingTickets.length ? `<div class="aging-list">
+        ${data.agingTickets.slice(0, 30).map(t => {
+          const ageColor = t.ageDays > 60 ? '#c8102e' : t.ageDays > 30 ? '#e07b00' : '#c8a000';
+          return `<div class="aging-row" data-ticket-number="${esc(t.ticketNumber)}">
+            <div class="aging-row-main">
+              <span class="aging-tn">${esc(t.ticketNumber)}</span>
+              <span class="aging-title">${esc(t.title || '(no title)')}</span>
+            </div>
+            <div class="aging-row-meta">
+              <span class="aging-tech">${esc(t.tech)}</span>
+              <span class="aging-client">${esc(t.client)}</span>
+              <span class="aging-status" style="color:${t.statusColor||'var(--textdim)'};border-color:${t.statusColor||'var(--border)'}44">${esc(t.statusLabel||'')}</span>
+              <span class="aging-age" style="color:${ageColor};font-weight:700">${t.ageDays}d</span>
+            </div>
+          </div>`;
+        }).join('')}
+        ${data.agingTickets.length > 30 ? `<div class="aging-more">+ ${data.agingTickets.length - 30} more</div>` : ''}
+      </div>` : '<div class="loading-state" style="color:#2a9d5c">✓ Nothing aging — all tickets under 14 days</div>'}
+    </div>
+  `;
+}
+
 // ─── NAVIGATION ───────────────────────────────────────────────────
 function setView(view) {
   state.currentView = view;
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
   if (view==='kb') renderKB();
+  if (view==='reports') renderReportsView();
   if (view==='settings') {
     populateKnownClients();
     // Load queues and populate dropdown
@@ -2459,6 +2875,22 @@ function wireEvents() {
     if(ticket){state.currentTicket=ticket;renderTicketDetail(ticket);renderTicketList();}
   });
 
+  // Aging tickets in Reports — click jumps to ticket detail
+  document.addEventListener('click', e => {
+    const row = e.target.closest('.aging-row[data-ticket-number]');
+    if (!row) return;
+    const tn = row.dataset.ticketNumber;
+    const ticket = state.tickets[tn];
+    if (!ticket) {
+      showToast(`Ticket ${tn} not in cache. Try Tickets → Refresh.`, 'info');
+      return;
+    }
+    state.currentTicket = ticket;
+    setView('tickets');
+    renderTicketDetail(ticket);
+    renderTicketList();
+  });
+
   // Ticket refresh — REPLACES the entire open-ticket cache rather than merging,
   // so tickets that are now closed/assigned-to-someone-else/out-of-window get properly dropped.
   $('ticketRefreshBtn')?.addEventListener('click', async () => {
@@ -2489,6 +2921,7 @@ function wireEvents() {
           id:t.id,ticketNumber:t.ticketNumber,status:t.status,statusLabel:t.statusLabel,statusColor:t.statusColor,isDone:t.isDone,
           priority:t.priority,queueID:t.queueID,
           title:t.title,companyID:t.companyID,companyName:t.companyName,lastActivity:t.lastActivityDate,
+          createDate:t.createDate,
           assignedResourceID:t.assignedResourceID,assignedResourceName:t.assignedResourceName,
         };
       });
@@ -2817,6 +3250,20 @@ function wireEvents() {
       inv.steps.push({ id: newStepId(), text: '', done: false, notes: '', minutes: 0 });
       setInvestigation(ticket.id, inv);
       renderTicketDetail(ticket);
+    }
+
+    if (action==='reports-range') {
+      const days = parseInt(el.dataset.days);
+      if (!days || state.reportsRange === days) return;
+      state.reportsRange = days;
+      renderReportsView();
+    }
+
+    if (action==='reports-refresh') {
+      // Bust caches and re-render
+      state.reportsResolvedTickets = null;
+      state.reportsResolvedAlerts = null;
+      renderReportsView();
     }
 
     if (action==='device-refresh') {
@@ -3555,6 +4002,184 @@ function injectTierAStyles() {
       font-weight: 700;
       letter-spacing: 0.08em;
       color: var(--accent);
+    }
+    /* Reports view */
+    .reports-wrap { padding: 16px; max-width: 1200px; }
+    .reports-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .reports-title {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+    }
+    .reports-range {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .reports-range-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textmid);
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-family: var(--cond);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      transition: all 0.15s;
+    }
+    .reports-range-btn:hover { border-color: var(--accent); color: var(--text); }
+    .reports-range-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .reports-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .reports-stat-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+    }
+    .reports-stat-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--textdim);
+      margin-bottom: 4px;
+    }
+    .reports-stat-value {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.1;
+    }
+    .reports-stat-sub {
+      font-size: 10px;
+      color: var(--textdim);
+      margin-top: 3px;
+    }
+    .reports-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+    }
+    .reports-grid-two {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .reports-grid-two .reports-card { margin-bottom: 0; }
+    @media (max-width: 800px) { .reports-grid-two { grid-template-columns: 1fr; } }
+    .reports-legend {
+      display: flex;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--textmid);
+      font-family: var(--cond);
+      letter-spacing: 0.04em;
+      text-transform: none;
+      font-weight: 400;
+    }
+    .legend-swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .reports-tech-detail {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    .tech-detail-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 0;
+      font-size: 11px;
+      color: var(--textdim);
+    }
+    .tech-avg-age { font-family: var(--cond); font-weight: 700; }
+    .aging-list { display: flex; flex-direction: column; gap: 4px; }
+    .aging-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      flex-wrap: wrap;
+    }
+    .aging-row:hover {
+      border-color: var(--accent);
+      background: rgba(0,180,216,0.04);
+    }
+    .aging-row-main { flex: 1; min-width: 0; }
+    .aging-tn {
+      font-family: var(--cond);
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--accent);
+      margin-right: 8px;
+    }
+    .aging-title {
+      font-size: 13px;
+      color: var(--text);
+    }
+    .aging-row-meta {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 11px;
+      flex-wrap: wrap;
+    }
+    .aging-tech { color: var(--textmid); font-weight: 600; }
+    .aging-client { color: var(--textdim); }
+    .aging-status {
+      padding: 2px 6px;
+      border: 1px solid;
+      border-radius: 3px;
+      font-family: var(--cond);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+    }
+    .aging-age {
+      font-family: var(--cond);
+      font-size: 13px;
+      min-width: 36px;
+      text-align: right;
+    }
+    .aging-more {
+      text-align: center;
+      padding: 8px;
+      color: var(--textdim);
+      font-size: 12px;
     }
   `;
   document.head.appendChild(style);
