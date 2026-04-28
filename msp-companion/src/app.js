@@ -1562,6 +1562,9 @@ async function renderAlertDetail(alert) {
   // ─── LOCKED-DOWN MODE: alert is being worked on the ticket side ───
   if (isTicketed) {
     const tUrl = `${atBase}?Code=OpenTicketDetail&TicketNumber=${encodeURIComponent(alert.ticketNumber)}`;
+    const dattoBtn = alert.deviceUid
+      ? `<button class="abtn abtn-ticket datto-open-btn" data-action="open-in-datto" data-device-uid="${esc(alert.deviceUid)}" title="Open device in Datto RMM (Web Remote, Agent Browser, etc.)">📟 Open in Datto</button>`
+      : '';
     const siteAlerts = getVisibleAlerts().filter(a=>a.siteName===alert.siteName&&a.alertUid!==alert.alertUid);
     dp.innerHTML = `
       <div class="detail-card alert-locked" style="border-top:3px solid ${sv.color}">
@@ -1606,6 +1609,7 @@ async function renderAlertDetail(alert) {
         <div class="action-row" style="margin-top:12px">
           <button class="abtn abtn-ai" data-action="jump-to-ticket" data-ticket-id="${ticket.id}">→ JUMP TO TICKET</button>
           <a href="${tUrl}" target="_blank" class="abtn abtn-ticket">🎫 Open in Autotask</a>
+          ${dattoBtn}
         </div>
       </div>
 
@@ -1632,6 +1636,9 @@ async function renderAlertDetail(alert) {
   const atPriority = priorityMap[alert.priority] || 2;
   const ticketTitle = `${alert.hostname} - ${alert.priority}: ${alert.alertMessage.substring(0, 60)}`;
   const ticketBtn = `<button class="abtn abtn-create" data-action="create-ticket" data-uid="${esc(alert.alertUid)}">＋ CREATE TICKET</button>`;
+  const dattoBtn = alert.deviceUid
+    ? `<button class="abtn abtn-ticket datto-open-btn" data-action="open-in-datto" data-device-uid="${esc(alert.deviceUid)}" title="Open device in Datto RMM (Web Remote, Agent Browser, etc.)">📟 OPEN IN DATTO</button>`
+    : '';
   const siteAlerts = getVisibleAlerts().filter(a=>a.siteName===alert.siteName&&a.alertUid!==alert.alertUid);
 
   dp.innerHTML = `
@@ -1650,7 +1657,7 @@ async function renderAlertDetail(alert) {
       <div class="action-row">
         <button class="abtn abtn-resolve" data-action="resolve" data-uid="${esc(alert.alertUid)}">✓ RESOLVE</button>
         <button class="abtn abtn-snooze"  data-action="snooze"  data-uid="${esc(alert.alertUid)}">⏸ SNOOZE</button>
-        ${ticketBtn}
+        ${ticketBtn}${dattoBtn}
         <button class="abtn abtn-kb" data-action="save-kb" data-uid="${esc(alert.alertUid)}">📚 SAVE TO KB</button>
       </div>
     </div>
@@ -1836,19 +1843,55 @@ function fmtSlaClock(dueDateStr) {
 }
 
 function getDattoUiBaseUrl() {
-  // Convert the API URL (e.g. https://concord-api.centrastage.net) to the UI URL (e.g. https://concord.centrastage.net)
+  // Convert the API URL (e.g. https://concord-api.centrastage.net) to the actual UI URL (e.g. https://concord.rmm.datto.com)
+  // Datto migrated from centrastage.net → rmm.datto.com
   const apiUrl = (state.settings.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
-  // Strip "-api" from the subdomain — Datto's convention across regions
-  return apiUrl.replace(/-api\./, '.');
+  // Extract region from the API hostname (e.g. "concord" from "concord-api.centrastage.net")
+  const m = apiUrl.match(/https?:\/\/([a-z0-9-]+?)(-api)?\.(centrastage\.net|rmm\.datto\.com)/i);
+  const region = m ? m[1] : 'concord';
+  return `https://${region}.rmm.datto.com`;
 }
 
 function buildDattoDeviceUrl(device) {
   if (!device) return null;
   const base = getDattoUiBaseUrl();
-  // Datto's stable deep-link format. Numeric id when available, fall back to uid.
-  if (device.id) return `${base}/csm/device/summary/${device.id}`;
-  if (device.uid) return `${base}/csm/profile/${device.uid}`;
+  // Datto's actual device URL format: /device/<numericId>/<hostname-slug>
+  // The hostname slug is optional for routing but Datto's web app includes it.
+  if (device.id) {
+    const slug = (device.hostname || device.description || '').toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    return slug ? `${base}/device/${device.id}/${slug}` : `${base}/device/${device.id}`;
+  }
   return null;
+}
+
+// For places where we only have the deviceUid (e.g. alert detail) without a numeric id.
+// Returns null — caller should lazy-fetch the device on click to get the numeric ID.
+function buildDattoDeviceUrlFromUid(deviceUid) {
+  // Datto's device URLs require the numeric ID, not the UID — UID-based URLs land on the home page.
+  // Caller must use lazy-fetch via openDattoDeviceForAlert() instead.
+  return null;
+}
+
+// Lazy-fetch device by UID, then open the proper URL in a new tab.
+// Used by alert-side buttons where we only have deviceUid at render time.
+async function openDattoDeviceForAlert(deviceUid, btnEl) {
+  if (!deviceUid) return;
+  const origLabel = btnEl?.textContent;
+  if (btnEl) { btnEl.textContent = 'Loading...'; btnEl.style.pointerEvents = 'none'; }
+  try {
+    const data = await fetchDattoDevice(deviceUid);
+    const device = data?.device;
+    const url = buildDattoDeviceUrl(device);
+    if (url) {
+      window.open(url, '_blank', 'noopener');
+    } else {
+      showToast('Could not resolve device URL — try refreshing alerts', 'err');
+    }
+  } catch(e) {
+    showToast(`Datto fetch failed: ${e.message}`, 'err');
+  } finally {
+    if (btnEl) { btnEl.textContent = origLabel; btnEl.style.pointerEvents = ''; }
+  }
 }
 
 function renderDevicePanel(ticket) {
@@ -3390,6 +3433,11 @@ function wireEvents() {
       setView('tickets');
       renderTicketDetail(ticket);
       renderTicketList();
+    }
+
+    if (action==='open-in-datto') {
+      const deviceUid = el.dataset.deviceUid;
+      await openDattoDeviceForAlert(deviceUid, el);
     }
 
     if (action==='device-refresh') {
