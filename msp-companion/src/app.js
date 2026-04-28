@@ -1516,10 +1516,11 @@ function renderAlertList() {
     const ticket = a.ticketNumber ? state.tickets[a.ticketNumber] : null;
     const rs     = getResolutionState(a);
     const isActive = state.currentAlert?.alertUid === a.alertUid;
+    const isLocked = !!ticket && !ticket.isDone;
     const ticketBadge = ticket
-      ? `<span class="badge" style="color:${ticket.statusColor};background:${ticket.statusColor}22;border:1px solid ${ticket.statusColor}44">AT: ${esc(ticket.statusLabel)}</span>`
+      ? `<span class="badge" style="color:${ticket.statusColor};background:${ticket.statusColor}22;border:1px solid ${ticket.statusColor}44">${isLocked?'🔒 ':''}${esc(ticket.statusLabel)}${ticket.assignedResourceName ? ' · ' + esc(ticket.assignedResourceName.split(' ')[0]) : ''}</span>`
       : `<span class="badge" style="color:#5a7a96;background:rgba(90,122,150,0.1);border:1px solid rgba(90,122,150,0.3)">No Ticket</span>`;
-    return `<div class="list-row ${isActive?'active':''}" data-uid="${esc(a.alertUid)}">
+    return `<div class="list-row ${isActive?'active':''} ${isLocked?'list-row-locked':''}" data-uid="${esc(a.alertUid)}">
       <div class="row-top">
         <span class="row-device">${esc(a.hostname)}</span>
         <div class="row-badges">
@@ -1548,58 +1549,108 @@ function renderClientChips() {
 async function renderAlertDetail(alert) {
   const dp = $('alertDetail'); if(!dp) return;
   state.currentAlert = alert;
-  window._lastAlert = alert; // For console debugging — type debugAlert()
+  window._lastAlert = alert;
   const sv     = SEV[alert.priority]||SEV.Information;
   const ticket = alert.ticketNumber ? state.tickets[alert.ticketNumber] : null;
   const ai     = state.aiResults[alert.alertUid];
   const notes  = state.notesDrafts[alert.alertUid]||'';
-  const rs     = getResolutionState(alert);
   const zone   = state.settings.atZone||'14';
   const atBase = `https://ww${zone}.autotask.net/Autotask/AutotaskExtend/ExecuteCommand.aspx`;
   const created = new Date(alert.timestampMs).toLocaleString();
+  const isTicketed = !!ticket;
 
-  const mismatchWarning = ticket?.isDone ? `
-    <div class="mismatch-warning">⚠ AUTOTASK TICKET IS <strong>${ticket.statusLabel.toUpperCase()}</strong> — DATTO ALERT STILL OPEN. Consider resolving this alert.</div>` : '';
-
-  let ticketBtn = '';
-  if (ticket) {
+  // ─── LOCKED-DOWN MODE: alert is being worked on the ticket side ───
+  if (isTicketed) {
     const tUrl = `${atBase}?Code=OpenTicketDetail&TicketNumber=${encodeURIComponent(alert.ticketNumber)}`;
-    ticketBtn = `<a href="${tUrl}" target="_blank" class="abtn abtn-ticket">🎫 OPEN ${esc(alert.ticketNumber)}</a>`;
-  } else {
-    // Map Datto priority to Autotask priority ID (Synobis AT: 4=Critical, 1=High, 2=Normal)
-    const priorityMap = { Critical: 4, High: 1, Moderate: 2, Low: 2, Information: 2 };
-    const atPriority = priorityMap[alert.priority] || 2;
+    const siteAlerts = getVisibleAlerts().filter(a=>a.siteName===alert.siteName&&a.alertUid!==alert.alertUid);
+    dp.innerHTML = `
+      <div class="detail-card alert-locked" style="border-top:3px solid ${sv.color}">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;flex-wrap:wrap">
+          <span class="alert-title">${esc(alert.hostname)}</span>
+          ${badgeHtml(alert.priority,sv.color,sv.bg)}
+          <span class="badge" style="color:${ticket.statusColor};background:${ticket.statusColor}22;border:1px solid ${ticket.statusColor}44">AT: ${esc(ticket.statusLabel)}</span>
+          <span class="badge alert-locked-badge">🔒 BEING WORKED ON TICKET</span>
+        </div>
+        <div class="alert-meta">
+          <span style="color:#00b4d8;font-weight:600">${esc(alert.siteName)}</span>
+          <span class="meta-sep">·</span><span>${esc(alert.monitorType)}</span>
+          <span class="meta-sep">·</span><span style="color:var(--textdim);font-family:var(--mono);font-size:11px">${esc(alert.ticketNumber)}</span>
+          <span class="meta-sep">·</span><span style="color:var(--textdim)">${created}</span>
+        </div>
+        <div class="alert-msg">${esc(alert.alertMessage)}</div>
+      </div>
 
-    // Keep title short — AT URL has length limits
-    const ticketTitle = `${alert.hostname} - ${alert.priority}: ${alert.alertMessage.substring(0, 60)}`;
+      <div class="detail-card jump-card">
+        <div class="card-label">→ THIS ALERT IS BEING WORKED</div>
+        <div class="jump-summary">
+          <div class="jump-summary-row">
+            <span class="jump-label">TICKET</span>
+            <span class="jump-value">${esc(alert.ticketNumber)}</span>
+          </div>
+          <div class="jump-summary-row">
+            <span class="jump-label">STATUS</span>
+            <span class="jump-value" style="color:${ticket.statusColor||'var(--text)'}">${esc(ticket.statusLabel||'Unknown')}</span>
+          </div>
+          <div class="jump-summary-row">
+            <span class="jump-label">ASSIGNED</span>
+            <span class="jump-value">${esc(ticket.assignedResourceName||'Unassigned')}</span>
+          </div>
+          ${ticket.lastActivity ? `<div class="jump-summary-row">
+            <span class="jump-label">LAST ACTIVITY</span>
+            <span class="jump-value">${esc(fmtRelativeTime(ticket.lastActivity))}</span>
+          </div>` : ''}
+        </div>
+        <div class="jump-locked-msg">
+          Investigation, notes, and resolution drafting all live on the ticket. The alert will be auto-resolved when the ticket is completed.
+        </div>
+        <div class="action-row" style="margin-top:12px">
+          <button class="abtn abtn-ai" data-action="jump-to-ticket" data-ticket-id="${ticket.id}">→ JUMP TO TICKET</button>
+          <a href="${tUrl}" target="_blank" class="abtn abtn-ticket">🎫 Open in Autotask</a>
+        </div>
+      </div>
 
-    ticketBtn = `<button class="abtn abtn-create" data-action="create-ticket" data-uid="${esc(alert.alertUid)}">＋ CREATE TICKET</button>`;
+      <div class="detail-card">
+        <div class="card-label">CLIENT INTELLIGENCE — <span style="color:#00b4d8">${esc(alert.siteName.toUpperCase())}</span></div>
+        <div class="site-stats">
+          <div class="site-stat"><div class="site-stat-val" style="color:#c8102e">${siteAlerts.filter(a=>a.priority==='Critical').length}</div><div class="site-stat-lbl">CRITICAL</div></div>
+          <div class="site-stat"><div class="site-stat-val" style="color:#e07b00">${siteAlerts.filter(a=>a.priority==='High').length}</div><div class="site-stat-lbl">HIGH</div></div>
+          <div class="site-stat"><div class="site-stat-val" style="color:#00b4d8">${siteAlerts.length}</div><div class="site-stat-lbl">OTHER ALERTS</div></div>
+        </div>
+        ${siteAlerts.slice(0,3).map(a2=>`
+          <div class="other-alert" data-uid="${esc(a2.alertUid)}">
+            <span>${esc(a2.hostname)} — ${esc(a2.alertMessage.substring(0,50))}</span>
+            ${badgeHtml(a2.priority,SEV[a2.priority]?.color||'#5a7a96',SEV[a2.priority]?.bg||'transparent')}
+          </div>`).join('')}
+      </div>`;
+    document.querySelectorAll('#alertList .list-row').forEach(r => r.classList.toggle('active', r.dataset.uid===alert.alertUid));
+    return;
   }
 
-  const postBtn = ticket && !ticket.isDone ? `<button class="abtn abtn-post" data-action="post-resolution" data-uid="${esc(alert.alertUid)}">↑ POST RESOLUTION</button>` : '';
-  const timeBtn = ticket ? `<button class="abtn abtn-time" data-action="log-time" data-uid="${esc(alert.alertUid)}">⏱ LOG TIME</button>` : '';
+  // ─── FULL-FUNCTIONAL MODE: no linked ticket, alert is fully workable ───
+  // Map Datto priority to Autotask priority ID
+  const priorityMap = { Critical: 4, High: 1, Moderate: 2, Low: 2, Information: 2 };
+  const atPriority = priorityMap[alert.priority] || 2;
+  const ticketTitle = `${alert.hostname} - ${alert.priority}: ${alert.alertMessage.substring(0, 60)}`;
+  const ticketBtn = `<button class="abtn abtn-create" data-action="create-ticket" data-uid="${esc(alert.alertUid)}">＋ CREATE TICKET</button>`;
   const siteAlerts = getVisibleAlerts().filter(a=>a.siteName===alert.siteName&&a.alertUid!==alert.alertUid);
 
   dp.innerHTML = `
-    ${mismatchWarning}
     <div class="detail-card" style="border-top:3px solid ${sv.color}">
       ${renderResolutionFlow(alert)}
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;flex-wrap:wrap">
         <span class="alert-title">${esc(alert.hostname)}</span>
         ${badgeHtml(alert.priority,sv.color,sv.bg)}
-        ${ticket ? `<span class="badge" style="color:${ticket.statusColor};background:${ticket.statusColor}22;border:1px solid ${ticket.statusColor}44">AT: ${esc(ticket.statusLabel)}</span>` : ''}
       </div>
       <div class="alert-meta">
         <span style="color:#00b4d8;font-weight:600">${esc(alert.siteName)}</span>
         <span class="meta-sep">·</span><span>${esc(alert.monitorType)}</span>
-        ${alert.ticketNumber ? `<span class="meta-sep">·</span><span style="color:var(--textdim);font-family:var(--mono);font-size:11px">${esc(alert.ticketNumber)}</span>` : ''}
         <span class="meta-sep">·</span><span style="color:var(--textdim)">${created}</span>
       </div>
       <div class="alert-msg">${esc(alert.alertMessage)}</div>
       <div class="action-row">
         <button class="abtn abtn-resolve" data-action="resolve" data-uid="${esc(alert.alertUid)}">✓ RESOLVE</button>
         <button class="abtn abtn-snooze"  data-action="snooze"  data-uid="${esc(alert.alertUid)}">⏸ SNOOZE</button>
-        ${ticketBtn}${postBtn}${timeBtn}
+        ${ticketBtn}
         <button class="abtn abtn-kb" data-action="save-kb" data-uid="${esc(alert.alertUid)}">📚 SAVE TO KB</button>
       </div>
     </div>
@@ -1791,10 +1842,15 @@ function renderDevicePanel(ticket) {
   if (!deviceUid) {
     return ''; // No device linkage — skip this card entirely
   }
+  // Alert status pill — quick at-a-glance "is the underlying alert still firing?"
+  const alertStillOpen = !!state.alerts.find(a => a.alertUid === linkedAlert.alertUid);
+  const alertPill = alertStillOpen
+    ? `<span class="alert-status-pill alert-status-open" title="The Datto alert that opened this ticket is still firing">🔴 ALERT OPEN</span>`
+    : `<span class="alert-status-pill alert-status-resolved" title="The Datto alert has been resolved">🟢 ALERT RESOLVED</span>`;
   // Card shell — will be hydrated async
   return `<div class="detail-card" id="devicePanelCard" data-device-uid="${esc(deviceUid)}">
-    <div class="card-label" style="display:flex;align-items:center;justify-content:space-between">
-      <span>📟 DATTO DEVICE</span>
+    <div class="card-label" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+      <span style="display:flex;align-items:center;gap:8px">📟 DATTO DEVICE ${alertPill}</span>
       <button class="inv-step-btn" data-action="device-refresh" data-device-uid="${esc(deviceUid)}" title="Refresh device info" style="width:auto;padding:0 8px;height:22px;font-size:11px">↺</button>
     </div>
     <div id="devicePanelBody">
@@ -3156,9 +3212,39 @@ function wireEvents() {
       try {
         el.textContent = 'Completing...';
         await patchTicketField(ticket, 'status', doneId);
+
+        // Auto-resolve any open Datto alerts linked to this ticket (no confirm — user opted into fast-mode)
+        const linkedAlerts = state.alerts.filter(a => a.ticketNumber === ticket.ticketNumber);
+        let alertsResolved = 0;
+        let alertsFailed = 0;
+        if (linkedAlerts.length) {
+          for (const a of linkedAlerts) {
+            try {
+              await resolveAlert(a.alertUid);
+              alertsResolved++;
+            } catch(e) {
+              console.warn(`Auto-resolve of alert ${a.alertUid} failed:`, e.message);
+              alertsFailed++;
+            }
+          }
+          // Drop resolved alerts from local state
+          if (alertsResolved > 0) {
+            const resolvedUids = new Set(linkedAlerts.map(a => a.alertUid));
+            state.alerts = state.alerts.filter(a => !resolvedUids.has(a.alertUid));
+            LS.set('msp_alerts', state.alerts);
+          }
+        }
         state.currentTicket = ticket;
         renderTicketDetail(ticket); renderTicketList();
-        showToast('✓ Ticket completed', 'ok');
+        if (alertsResolved > 0 && alertsFailed === 0) {
+          showToast(`✓ Ticket completed + ${alertsResolved} alert${alertsResolved!==1?'s':''} resolved`, 'ok');
+        } else if (alertsResolved > 0 && alertsFailed > 0) {
+          showToast(`✓ Ticket completed · ${alertsResolved} alert${alertsResolved!==1?'s':''} resolved, ${alertsFailed} failed (see console)`, 'info');
+        } else if (alertsFailed > 0) {
+          showToast(`✓ Ticket completed · ${alertsFailed} linked alert${alertsFailed!==1?'s':''} failed to auto-resolve (see console)`, 'info');
+        } else {
+          showToast('✓ Ticket completed', 'ok');
+        }
       } catch(e) {
         showToast(`Complete failed: ${e.message}`, 'err');
         resetBtn();
@@ -3264,6 +3350,19 @@ function wireEvents() {
       state.reportsResolvedTickets = null;
       state.reportsResolvedAlerts = null;
       renderReportsView();
+    }
+
+    if (action==='jump-to-ticket') {
+      const tid = el.dataset.ticketId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === tid);
+      if (!ticket) {
+        showToast('Ticket not in cache. Try Tickets → Refresh.', 'info');
+        return;
+      }
+      state.currentTicket = ticket;
+      setView('tickets');
+      renderTicketDetail(ticket);
+      renderTicketList();
     }
 
     if (action==='device-refresh') {
@@ -4180,6 +4279,77 @@ function injectTierAStyles() {
       padding: 8px;
       color: var(--textdim);
       font-size: 12px;
+    }
+    /* Alert/ticket connection visuals */
+    .list-row-locked {
+      opacity: 0.72;
+    }
+    .list-row-locked:hover { opacity: 1; }
+    .list-row-locked.active { opacity: 1; }
+    .alert-locked-badge {
+      background: rgba(0,180,216,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(0,180,216,0.4);
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      letter-spacing: 0.08em;
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .jump-card {
+      background: linear-gradient(135deg, rgba(0,180,216,0.06), rgba(147,51,234,0.04));
+      border: 1px solid rgba(0,180,216,0.3);
+    }
+    .jump-summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px 14px;
+      margin: 10px 0;
+    }
+    .jump-summary-row {
+      display: flex;
+      flex-direction: column;
+    }
+    .jump-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--textdim);
+    }
+    .jump-value {
+      font-size: 14px;
+      color: var(--text);
+      font-weight: 500;
+      margin-top: 2px;
+    }
+    .jump-locked-msg {
+      font-size: 12px;
+      color: var(--textdim);
+      padding: 8px 10px;
+      background: rgba(0,0,0,0.08);
+      border-radius: 4px;
+      border-left: 3px solid var(--accent);
+      margin-top: 10px;
+      line-height: 1.5;
+    }
+    .alert-status-pill {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 2px 7px;
+      border-radius: 3px;
+      text-transform: none;
+    }
+    .alert-status-open {
+      background: rgba(200,16,46,0.12);
+      color: #c8102e;
+      border: 1px solid rgba(200,16,46,0.4);
+    }
+    .alert-status-resolved {
+      background: rgba(42,157,92,0.12);
+      color: #2a9d5c;
+      border: 1px solid rgba(42,157,92,0.4);
     }
   `;
   document.head.appendChild(style);
