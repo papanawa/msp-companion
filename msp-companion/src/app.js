@@ -5430,6 +5430,65 @@ function injectTierAStyles() {
       white-space: nowrap;
     }
     .clients-show-hidden input[type="checkbox"] { cursor: pointer; }
+    /* Verify-with-Datto button + modal */
+    .verify-datto-btn {
+      display: block;
+      width: calc(100% - 20px);
+      margin: 8px 10px;
+      cursor: pointer;
+      background: rgba(0,180,216,0.06);
+      border: 1px dashed rgba(0,180,216,0.4);
+      color: var(--accent);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .verify-datto-btn:hover:not(:disabled) {
+      background: rgba(0,180,216,0.12);
+      border-style: solid;
+    }
+    .verify-datto-btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    .verify-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: var(--text);
+    }
+    .verify-uid {
+      font-family: var(--mono, monospace);
+      font-size: 11px;
+      color: var(--accent);
+      margin-right: 8px;
+    }
+    .verify-resolve-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textmid);
+      padding: 4px 10px;
+      border-radius: 3px;
+      font-family: var(--cond);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+    }
+    .verify-resolve-btn:hover {
+      border-color: #c8102e;
+      color: #c8102e;
+    }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
@@ -5610,6 +5669,115 @@ function injectClientsViewAndNav() {
   }
 }
 
+// ─── ALERT SYNC VERIFY BUTTON ─────────────────────────────────────
+function injectVerifyButton() {
+  if (document.getElementById('alertVerifyBtn')) return;
+  const alertList = document.getElementById('alertList');
+  if (!alertList) return;
+  const btn = document.createElement('button');
+  btn.id = 'alertVerifyBtn';
+  btn.className = 'verify-datto-btn';
+  btn.title = 'Re-fetch from Datto and report any drift between Companion and Datto';
+  btn.innerHTML = '🔍 Verify with Datto';
+  btn.addEventListener('click', verifyAlertSync);
+  // Insert before the alert list
+  alertList.parentNode.insertBefore(btn, alertList);
+}
+
+async function verifyAlertSync() {
+  const btn = document.getElementById('alertVerifyBtn');
+  if (!btn) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '🔍 Checking...';
+  try {
+    const fresh = await fetchAlerts();
+    const cachedUids = new Set(state.alerts.map(a => a.alertUid));
+    const freshUids = new Set(fresh.map(a => a.alertUid));
+    const ghosts = state.alerts.filter(a => !freshUids.has(a.alertUid));
+    const newOnes = fresh.filter(a => !cachedUids.has(a.alertUid));
+    if (!ghosts.length && !newOnes.length) {
+      showToast(`✓ In sync — Companion matches Datto (${fresh.length} alerts)`, 'ok');
+      return;
+    }
+    showVerifyResultModal({ ghosts, newOnes, freshTotal: fresh.length, fresh });
+  } catch(e) {
+    showToast(`Verify failed: ${e.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+function showVerifyResultModal({ ghosts, newOnes, freshTotal, fresh }) {
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  const ghostList = ghosts.length ? ghosts.map(a => `
+    <div class="verify-row">
+      <div>
+        <span class="verify-uid">${esc(a.alertUid?.substring(0, 8) || '')}</span>
+        <span>${esc(a.hostname)} — ${esc((a.alertMessage || '').substring(0, 60))}</span>
+      </div>
+      <button data-uid="${esc(a.alertUid)}" class="verify-resolve-btn">Drop</button>
+    </div>
+  `).join('') : '';
+  const newList = newOnes.length ? newOnes.map(a => `
+    <div class="verify-row" style="border-color:rgba(42,157,92,0.3)">
+      <div>
+        <span class="verify-uid">${esc(a.alertUid?.substring(0, 8) || '')}</span>
+        <span>${esc(a.hostname)} — ${esc((a.alertMessage || '').substring(0, 60))}</span>
+      </div>
+    </div>
+  `).join('') : '';
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:680px;margin:auto">
+    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">🔍 Sync Verification Result</div>
+    <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">Datto returned ${freshTotal} alerts. Companion has ${state.alerts.length}.</div>
+    ${ghosts.length ? `
+      <div style="font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:0.07em;color:#e07b00;margin-bottom:6px">${ghosts.length} GHOST${ghosts.length!==1?'S':''} — IN COMPANION, NOT IN DATTO</div>
+      <div style="font-size:11px;color:var(--textdim);margin-bottom:8px">These alerts no longer exist in Datto. They were probably resolved through Datto directly. Click "Drop" to remove from Companion, or "Drop All" below.</div>
+      ${ghostList}
+    ` : '<div style="color:#2a9d5c;font-size:13px;margin-bottom:10px">✓ No ghosts</div>'}
+    ${newOnes.length ? `
+      <div style="font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:0.07em;color:#2a9d5c;margin:12px 0 6px">${newOnes.length} NEW — IN DATTO, NOT IN COMPANION</div>
+      <div style="font-size:11px;color:var(--textdim);margin-bottom:8px">Refresh All will pull these in normally.</div>
+      ${newList}
+    ` : ''}
+    <div style="display:flex;gap:8px;margin-top:16px">
+      ${ghosts.length ? `<button id="verifyDropAllBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">Drop All ${ghosts.length} Ghost${ghosts.length!==1?'s':''}</button>` : ''}
+      <button id="verifyCloseBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+
+  document.getElementById('verifyCloseBtn').addEventListener('click', () => document.body.removeChild(modal));
+
+  // Per-row drop
+  modal.querySelectorAll('.verify-resolve-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const uid = btn.dataset.uid;
+      state.alerts = state.alerts.filter(a => a.alertUid !== uid);
+      LS.set('msp_alerts', state.alerts);
+      btn.closest('.verify-row').remove();
+      showToast('✓ Dropped from Companion', 'ok');
+    });
+  });
+
+  // Drop all
+  const dropAllBtn = document.getElementById('verifyDropAllBtn');
+  if (dropAllBtn) {
+    dropAllBtn.addEventListener('click', () => {
+      const ghostUids = new Set(ghosts.map(a => a.alertUid));
+      state.alerts = state.alerts.filter(a => !ghostUids.has(a.alertUid));
+      LS.set('msp_alerts', state.alerts);
+      // Refresh views
+      try { renderAlertList?.(); } catch {}
+      try { render?.(); } catch {}
+      document.body.removeChild(modal);
+      showToast(`✓ Dropped ${ghosts.length} ghost${ghosts.length!==1?'s':''} from Companion`, 'ok');
+    });
+  }
+}
+
 function injectAiContextToggles() {
   if (document.getElementById('aiCtxToggleBlock')) return;
   // Anchor on the Save Preferences button — it's a reliable marker for the prefs card
@@ -5674,6 +5842,7 @@ async function boot() {
   loadSettings();
   injectAiContextToggles();
   injectClientsViewAndNav();
+  injectVerifyButton();
   applyMode(LS.get('msp_lightmode', false));
   const lastView = LS.get('msp_view','dashboard');
   setView(lastView);
