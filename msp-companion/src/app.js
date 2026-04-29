@@ -323,6 +323,57 @@ function normalizeAlert(raw) {
 // Debug helper — paste in console: debugAlert()
 // Also expose state itself on window so you can poke at it from the console.
 window.state = state;
+
+// Expose Datto/AT helpers for console diagnostics
+window.dattoAuth = dattoAuth;
+window.fetchAlerts = fetchAlerts;
+window.resolveAlert = resolveAlert;
+window.atFetch = atFetch;
+
+// Diagnostic: compare cached alerts vs fresh fetch from Datto API.
+// Usage: await debugAlertSync('HyperVHost01')   // optional hostname filter
+window.debugAlertSync = async (hostname) => {
+  console.log('=== CACHED in state.alerts ===');
+  const cached = hostname
+    ? state.alerts.filter(a => a.hostname === hostname)
+    : state.alerts;
+  console.log(`Cache total: ${state.alerts.length} | filtered: ${cached.length}`);
+  console.table(cached.map(a => ({
+    uid: a.alertUid?.substring(0, 8),
+    host: a.hostname,
+    msg: (a.alertMessage || '').substring(0, 50),
+    age_min: Math.round((Date.now() - a.timestampMs) / 60000),
+  })));
+
+  console.log('\n=== FRESH from Datto API ===');
+  const fresh = await fetchAlerts();
+  const freshFiltered = hostname ? fresh.filter(a => a.hostname === hostname) : fresh;
+  console.log(`Fresh total: ${fresh.length} | filtered: ${freshFiltered.length}`);
+  console.table(freshFiltered.map(a => ({
+    uid: a.alertUid?.substring(0, 8),
+    host: a.hostname,
+    msg: (a.alertMessage || '').substring(0, 50),
+    age_min: Math.round((Date.now() - a.timestampMs) / 60000),
+  })));
+
+  console.log('\n=== DIFF ===');
+  const cachedUids = new Set(cached.map(a => a.alertUid));
+  const freshUids = new Set(freshFiltered.map(a => a.alertUid));
+  const ghosts = [...cachedUids].filter(u => !freshUids.has(u));
+  const newOnes = [...freshUids].filter(u => !cachedUids.has(u));
+  console.log(`Ghosts (in cache but not in Datto): ${ghosts.length}`, ghosts);
+  console.log(`New (in Datto but not in cache): ${newOnes.length}`, newOnes);
+  return { cached: cached.length, fresh: freshFiltered.length, ghosts, newOnes };
+};
+
+// Force-resolve a list of alert UIDs (e.g. ghosts found by debugAlertSync)
+window.forceResolveAlerts = async (uids) => {
+  for (const uid of uids) {
+    try { await resolveAlert(uid); console.log('✓', uid.substring(0, 8)); }
+    catch(e) { console.log('✗', uid.substring(0, 8), e.message); }
+  }
+};
+
 window.debugAlert = () => {
   const a = window._lastAlert;
   if (!a) { console.log('No alert selected yet'); return; }
