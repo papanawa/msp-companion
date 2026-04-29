@@ -6,6 +6,7 @@ const state = {
   atStatusPicklist: null, atPriorityPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
   resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(), atQueues: [],
   notesDrafts: {}, aiResults: {}, chatHistories: {},
+  ticketChatHistories: {},
   kbContextCache: {}, historyContextCache: {},
   investigations: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
@@ -59,6 +60,7 @@ function loadSettings() {
   state.notesDrafts   = LS.get('msp_notes', {});
   state.aiResults     = LS.get('msp_ai', {});
   state.chatHistories = LS.get('msp_chats', {});
+  state.ticketChatHistories = LS.get('msp_ticket_chats', {});
   state.kbContextCache      = LS.get('msp_kb_context_cache', {});
   state.historyContextCache = LS.get('msp_history_context_cache', {});
   state.investigations      = LS.get('msp_investigations', {});
@@ -1268,6 +1270,91 @@ async function draftResolutionFromSteps(ticket, investigation) {
   return (text || '').trim();
 }
 
+// ─── TICKET INVESTIGATION CHAT ────────────────────────────────────
+function buildTicketChatSystemPrompt(ticket, inv, contextBlob) {
+  const stepsState = (inv?.steps || []).map((s, i) => {
+    const status = s.done ? 'DONE' : 'NOT DONE';
+    const noteSnip = s.notes?.trim() ? ` — Notes: ${s.notes.trim().substring(0, 240)}` : '';
+    const mins = s.minutes ? ` (${s.minutes}m)` : '';
+    return `Step ${i+1} [${status}]${mins}: ${s.text || '(no step text)'}${noteSnip}`;
+  }).join('\n');
+
+  return `You are an expert MSP tier-2/3 engineer at Synobis Network Solutions, helping a technician work through an active ticket investigation.
+
+You are NOT analyzing this ticket fresh — there's already an action plan and the tech has been working it. Your job is to answer follow-up questions, help when steps don't go as expected, suggest next moves, or help the tech think through what they're seeing.
+
+Be concise and concrete. Tech is in the middle of work — they want answers, not lectures.
+
+Rules:
+- Use only the context provided. Don't invent device specifics, errors, or environmental details that weren't given.
+- If the tech asks something you don't have data for, say so plainly and suggest what they could check to find out.
+- Do not propose modifying the action plan structure — the tech edits steps directly. You can suggest what should go in step notes, or recommend a new step they could add.
+- Do not draft the final resolution — there's a separate button for that.
+- Keep replies under ~150 words unless the tech explicitly asks for detail.
+- If a step is marked DONE but the tech is asking about it, treat the notes on that step as ground truth for what actually happened.
+
+──── TICKET CONTEXT ────
+${contextBlob}
+
+──── INVESTIGATION ANALYSIS (what the AI initially concluded) ────
+${inv?.analysis?.understanding || '(no analysis recorded)'}
+Confidence: ${inv?.analysis?.confidence || 0}%
+
+──── CURRENT PLAN STATE ────
+${stepsState || '(no steps)'}
+
+${inv?.techContext ? `──── TECH-PROVIDED CONTEXT (from start of investigation) ────\n${inv.techContext}\n` : ''}`;
+}
+
+async function sendTicketChat(ticketId, message) {
+  const ticket = Object.values(state.tickets).find(t => String(t.id) === String(ticketId));
+  if (!ticket) return;
+  const inv = getInvestigation(ticket.id);
+  if (!inv) return;
+  const input = $('ticketChatInput'), histEl = $('ticketChatHistory');
+  if (!input || !histEl) return;
+  input.value = ''; input.disabled = true;
+  const key = String(ticket.id);
+  if (!state.ticketChatHistories[key]) state.ticketChatHistories[key] = [];
+  state.ticketChatHistories[key].push({ role:'user', content: message });
+  renderTicketChatHistory(ticket.id);
+  const tid = 'tc-typing-' + Date.now();
+  histEl.insertAdjacentHTML('beforeend', `<div id="${tid}" style="display:flex;gap:8px;align-items:center;padding:8px 0"><div style="display:flex;gap:3px"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1s ease-in-out infinite;display:inline-block"></span><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1s ease-in-out 0.2s infinite;display:inline-block"></span><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1s ease-in-out 0.4s infinite;display:inline-block"></span></div><span style="font-family:var(--cond);font-size:11px;color:var(--textdim)">AI IS THINKING...</span></div>`);
+  histEl.scrollTop = histEl.scrollHeight;
+  try {
+    // Build context once per send (cheap — caches under the hood)
+    const contextBlob = await buildTicketContextBlob(ticket);
+    const system = buildTicketChatSystemPrompt(ticket, inv, contextBlob);
+    const msgs = state.ticketChatHistories[key].map(m => ({ role: m.role, content: m.content }));
+    const reply = await callAI(system, msgs);
+    state.ticketChatHistories[key].push({ role:'assistant', content: reply });
+    LS.set('msp_ticket_chats', state.ticketChatHistories);
+  } catch(e) {
+    state.ticketChatHistories[key].push({ role:'assistant', content: `Error: ${e.message}` });
+  }
+  $(tid)?.remove(); input.disabled = false; input.focus();
+  renderTicketChatHistory(ticket.id);
+  histEl.scrollTop = histEl.scrollHeight;
+}
+
+function renderTicketChatHistory(ticketId) {
+  const el = $('ticketChatHistory'); if (!el) return;
+  const key = String(ticketId);
+  el.innerHTML = (state.ticketChatHistories[key] || []).map(msg => {
+    const isUser = msg.role === 'user';
+    return `<div style="display:flex;flex-direction:column;gap:3px;align-self:${isUser?'flex-end':'flex-start'};max-width:92%">
+      <div class="chat-lbl ${isUser?'you':''}">${isUser?'YOU':'★ AI ASSISTANT'}</div>
+      <div class="chat-msg ${isUser?'chat-you':'chat-ai'}">${esc(msg.content)}</div>
+    </div>`;
+  }).join('');
+}
+
+function clearTicketChat(ticketId) {
+  const key = String(ticketId);
+  delete state.ticketChatHistories[key];
+  LS.set('msp_ticket_chats', state.ticketChatHistories);
+}
+
 // ─── ALERT AI SYSTEM PROMPT ───────────────────────────────────────
 async function buildAlertSystemPrompt(alert) {
   const ticket = alert.ticketNumber ? state.tickets[alert.ticketNumber] : null;
@@ -2174,6 +2261,16 @@ function renderInvestigationCard(ticket) {
       <button class="abtn abtn-ai" data-action="ticket-draft-resolution" data-ticket-id="${ticket.id}">✓ DRAFT RESOLUTION</button>
     </div>
     <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
+
+    <div class="inv-chat-section">
+      <div class="inv-chat-label">💬 ASK THE AI ABOUT THIS INVESTIGATION</div>
+      <div class="chat-history" id="ticketChatHistory" data-ticket-id="${ticket.id}"></div>
+      <div class="chat-input-row">
+        <textarea class="chat-textarea" id="ticketChatInput" rows="2" data-ticket-id="${ticket.id}" placeholder="e.g. Step 2 didn't work, the service won't restart — what should I check next?"></textarea>
+        <button class="chat-send" data-action="send-ticket-chat" data-ticket-id="${ticket.id}">SEND ➤</button>
+      </div>
+      <div class="chat-hint">Enter to send · Shift+Enter for new line · The AI sees your plan, your notes, and the ticket context</div>
+    </div>
   </div>`;
 }
 
@@ -2286,6 +2383,11 @@ function renderTicketDetail(ticket) {
   };
   renderTicketDetail._rehydrateSelects(ticket);
   hydrateTierBPanels(ticket);
+  // Hydrate ticket investigation chat history if there's an analyzed plan and prior chat
+  if (state.ticketChatHistories[String(ticket.id)]?.length) {
+    renderTicketChatHistory(ticket.id);
+    const h = $('ticketChatHistory'); if (h) h.scrollTop = h.scrollHeight;
+  }
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
@@ -3156,6 +3258,13 @@ function wireEvents() {
       if(uid&&msg) sendChat(uid,msg);
     }
 
+    if (action==='send-ticket-chat') {
+      const tid = el.dataset.ticketId;
+      const input = $('ticketChatInput');
+      const msg = input?.value.trim();
+      if (tid && msg) sendTicketChat(tid, msg);
+    }
+
     if (action==='save-notes') {
       const input=$('notesInput');
       if(input){
@@ -3391,6 +3500,7 @@ function wireEvents() {
       try {
         const inv = await runTicketInvestigation(ticket, setInvStatus, newCtx.trim());
         setInvestigation(ticket.id, inv);
+        clearTicketChat(ticket.id);
         renderTicketDetail(ticket);
         showToast('✓ Re-analysis complete', 'ok');
       } catch(err) {
@@ -3561,6 +3671,11 @@ function wireEvents() {
       e.preventDefault();
       const uid=e.target.dataset.uid, msg=e.target.value.trim();
       if(uid&&msg) sendChat(uid,msg);
+    }
+    if(e.target.id==='ticketChatInput'&&e.key==='Enter'&&!e.shiftKey){
+      e.preventDefault();
+      const tid = e.target.dataset.ticketId, msg = e.target.value.trim();
+      if (tid && msg) sendTicketChat(tid, msg);
     }
   });
 
@@ -4436,6 +4551,26 @@ function injectTierAStyles() {
     .datto-open-btn:hover {
       border-color: var(--accent) !important;
       background: rgba(0,180,216,0.08);
+    }
+    .inv-chat-section {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .inv-chat-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .inv-chat-section .chat-history {
+      max-height: 360px;
+      overflow-y: auto;
+    }
+    .inv-chat-section .chat-history:empty {
+      display: none;
     }
   `;
   document.head.appendChild(style);
