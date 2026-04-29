@@ -627,9 +627,35 @@ async function loadAtBillingCodes() {
 async function loadAtRoles() {
   if (state.atRoles.length) return;
   try {
-    const data = await atFetch('/Roles/query','POST',{filter:[{op:'eq',field:'isActive',value:true}]});
-    state.atRoles = (data?.items||[]).map(r=>({id:r.id,name:r.name}));
+    const data = await atFetch('/Roles/query','POST',{
+      filter:[{op:'eq',field:'isActive',value:true}],
+      IncludeFields: ['id','name','isSystemRole','roleType'],
+    });
+    state.atRoles = (data?.items||[]).map(r => ({
+      id: r.id,
+      name: r.name,
+      isSystem: !!r.isSystemRole,
+      roleType: r.roleType, // 1 = Service Desk role in AT
+    }));
+    console.log('Loaded roles:', state.atRoles.map(r => `${r.id}: ${r.name} (type ${r.roleType}${r.isSystem?', system':''})`));
   } catch(e) { console.warn('Roles failed:', e.message); }
+}
+
+// Pick a service-desk-eligible role for ticket assignment when a resource has no default.
+// Avoids system roles and non-service-desk role types that AT rejects on ticket patches.
+function findFallbackServiceDeskRoleId() {
+  if (!state.atRoles.length) return null;
+  // Prefer roleType=1 (Service Desk), non-system, name like "Tech" / "Engineer" / "Support"
+  const sdRoles = state.atRoles.filter(r => !r.isSystem);
+  const preferred = sdRoles.find(r =>
+    /tech|engineer|support|service.*desk|tier/i.test(r.name)
+  );
+  if (preferred) return preferred.id;
+  // Otherwise any roleType=1 role
+  const anySd = sdRoles.find(r => r.roleType === 1);
+  if (anySd) return anySd.id;
+  // Last resort
+  return sdRoles[0]?.id || null;
 }
 
 // Cache of Autotask companyID -> company name
@@ -841,10 +867,10 @@ async function patchTicketField(ticket, field, rawValue) {
         } catch(e) { /* ignore */ }
       }
       if (!resolvedRoleId) {
-        // Last resort: pick any active role so AT accepts the patch.
+        // Last resort: pick a service-desk-eligible role so AT accepts the patch.
         await loadAtRoles();
-        resolvedRoleId = state.atRoles[0]?.id || null;
-        if (resolvedRoleId) console.warn(`No default role for resource ${value}, using fallback role ${resolvedRoleId}`);
+        resolvedRoleId = findFallbackServiceDeskRoleId();
+        if (resolvedRoleId) console.warn(`No default role for resource ${value}, using fallback service desk role ${resolvedRoleId}. Set their default in Autotask → Admin → Resources to silence this.`);
       }
       if (!resolvedRoleId) {
         throw new Error('Cannot assign resource — no role available. Check resource has a default service desk role in Autotask.');
