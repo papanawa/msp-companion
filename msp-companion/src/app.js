@@ -14,6 +14,8 @@ const state = {
   ticketStatusFilter: 'active', ticketShowStale: false,
   reportsRange: 30, reportsResolvedTickets: null, reportsResolvedAlerts: null,
   clients: null,                      // unified client list (AT companies + Datto sites)
+  hiddenClients: new Set(),           // client names hidden from the list
+  showHiddenClients: false,           // toggle to reveal hidden clients
   currentClient: null,                // currently-viewed client object
   clientDevicesCache: {},             // siteUid → { devices, fetchedAt }
   clientResolvedCache: null,          // { items, fetchedAt } — resolved tickets last 14d
@@ -62,6 +64,7 @@ function loadSettings() {
   state.snoozedIds    = new Set(LS.get('msp_snoozed', []));
   state.excludedClients    = new Set(LS.get('msp_excluded', []));
   state.psaExcludedClients = new Set(LS.get('msp_psa_excluded', []));
+  state.hiddenClients = new Set(LS.get('msp_hidden_clients', []));
   state.notesDrafts   = LS.get('msp_notes', {});
   state.aiResults     = LS.get('msp_ai', {});
   state.chatHistories = LS.get('msp_chats', {});
@@ -2929,6 +2932,11 @@ async function renderClientsView() {
       <div class="clients-header">
         <div class="clients-title">👥 Clients</div>
         <input id="clientSearch" type="text" placeholder="Filter clients..." class="clients-search" />
+        <label class="clients-show-hidden" title="Show clients you've hidden">
+          <input type="checkbox" id="showHiddenClientsToggle" ${state.showHiddenClients?'checked':''} />
+          <span>Show hidden</span>
+          <span class="ticket-stale-count" id="hiddenClientsCount">${state.hiddenClients.size}</span>
+        </label>
         <button class="reports-range-btn" data-action="clients-refresh" title="Refresh client list">↺</button>
       </div>
       <div id="clientsListBody"><div class="loading-state">Loading clients...</div></div>
@@ -2947,11 +2955,21 @@ function renderClientsListBody(clients, filter) {
   const body = document.getElementById('clientsListBody');
   if (!body) return;
   const f = (filter || '').toLowerCase().trim();
+  let working = clients;
+  // Filter by hidden state — unless toggle says show them
+  if (!state.showHiddenClients) {
+    working = working.filter(c => !state.hiddenClients.has(c.name));
+  }
+  // Apply text filter
   const filtered = f
-    ? clients.filter(c => (c.name || '').toLowerCase().includes(f))
-    : clients;
+    ? working.filter(c => (c.name || '').toLowerCase().includes(f))
+    : working;
   if (!filtered.length) {
-    body.innerHTML = '<div class="loading-state">No clients match.</div>';
+    const totalHidden = clients.filter(c => state.hiddenClients.has(c.name)).length;
+    const hint = !f && totalHidden && !state.showHiddenClients
+      ? `All ${totalHidden} clients are hidden. Toggle "Show hidden" above to see them.`
+      : 'No clients match.';
+    body.innerHTML = `<div class="loading-state">${esc(hint)}</div>`;
     return;
   }
   body.innerHTML = filtered.map(c => {
@@ -2959,8 +2977,9 @@ function renderClientsListBody(clients, filter) {
     const alertsN = getClientOpenAlerts(c).length;
     const ticketsN = getClientOpenTickets(c).length;
     const offline = c.dattoOffline || 0;
-    return `<div class="client-row" data-action="open-client" data-client-name="${esc(c.name)}">
-      <div class="client-row-left">
+    const isHidden = state.hiddenClients.has(c.name);
+    return `<div class="client-row ${isHidden?'client-row-hidden':''}" data-client-name="${esc(c.name)}">
+      <div class="client-row-left" data-action="open-client" data-client-name="${esc(c.name)}">
         <span class="client-health" style="color:${health.color}" title="${health.label}">${health.icon}</span>
         <span class="client-name">${esc(c.name)}</span>
         ${c.city ? `<span class="client-city">${esc(c.city)}${c.stateAbbr?', '+esc(c.stateAbbr):''}</span>` : ''}
@@ -2970,6 +2989,7 @@ function renderClientsListBody(clients, filter) {
         ${ticketsN ? `<span class="client-stat client-stat-tickets">${ticketsN} tickets</span>` : ''}
         ${offline ? `<span class="client-stat client-stat-offline">${offline} offline</span>` : ''}
         ${c.dattoDeviceCount != null ? `<span class="client-stat client-stat-devices">${c.dattoDeviceCount} devices</span>` : ''}
+        <button class="client-hide-btn" data-action="toggle-client-hidden" data-client-name="${esc(c.name)}" title="${isHidden?'Show this client':'Hide this client'}">${isHidden?'👁':'🙈'}</button>
       </div>
     </div>`;
   }).join('');
@@ -4043,6 +4063,22 @@ function wireEvents() {
       state.currentClient = client;
       renderClientDetail(client);
     }
+    if (action==='toggle-client-hidden') {
+      const name = el.dataset.clientName;
+      if (!name) return;
+      if (state.hiddenClients.has(name)) {
+        state.hiddenClients.delete(name);
+      } else {
+        state.hiddenClients.add(name);
+      }
+      LS.set('msp_hidden_clients', [...state.hiddenClients]);
+      // Update count badge in header
+      const count = document.getElementById('hiddenClientsCount');
+      if (count) count.textContent = state.hiddenClients.size;
+      // Re-render list with current filter
+      const filterInput = document.getElementById('clientSearch');
+      renderClientsListBody(state.clients || [], filterInput?.value || '');
+    }
     if (action==='back-to-clients') {
       state.currentClient = null;
       closeDrillPanel();
@@ -4184,6 +4220,13 @@ function wireEvents() {
     if (e.target.id === 'ticketShowStale') {
       state.ticketShowStale = !!e.target.checked;
       renderTicketList();
+      return;
+    }
+    // Show-hidden toggle on clients list
+    if (e.target.id === 'showHiddenClientsToggle') {
+      state.showHiddenClients = !!e.target.checked;
+      const filterInput = document.getElementById('clientSearch');
+      renderClientsListBody(state.clients || [], filterInput?.value || '');
       return;
     }
     // Investigation: toggle step done
@@ -5225,6 +5268,38 @@ function injectTierAStyles() {
     .client-stat-tickets { color: var(--accent); border-color: rgba(0,180,216,0.35); background: rgba(0,180,216,0.06); }
     .client-stat-offline { color: #c8102e; border-color: rgba(200,16,46,0.4); background: rgba(200,16,46,0.08); }
     .client-stat-devices { color: var(--textmid); }
+    .client-hide-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textdim);
+      padding: 3px 6px;
+      border-radius: 3px;
+      font-size: 13px;
+      line-height: 1;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .client-hide-btn:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .client-row-hidden {
+      opacity: 0.5;
+    }
+    .client-row-hidden:hover { opacity: 0.8; }
+    .clients-show-hidden {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--textmid);
+      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .clients-show-hidden input[type="checkbox"] { cursor: pointer; }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
