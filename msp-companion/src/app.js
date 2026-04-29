@@ -11,7 +11,7 @@ const state = {
   investigations: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
-  ticketStatusFilter: 'active', ticketShowStale: false,
+  ticketShowStale: false,
   reportsRange: 30, reportsResolvedTickets: null, reportsResolvedAlerts: null,
   clients: null,                      // unified client list (AT companies + Datto sites)
   hiddenClients: new Set(),           // client names hidden from the list
@@ -697,7 +697,6 @@ async function loadAtRoles() {
       isSystem: !!r.isSystemRole,
       roleType: r.roleType, // 1 = Service Desk role in AT
     }));
-    console.log('Loaded roles:', state.atRoles.map(r => `${r.id}: ${r.name} (type ${r.roleType}${r.isSystem?', system':''})`));
   } catch(e) { console.warn('Roles failed:', e.message); }
 }
 
@@ -731,7 +730,6 @@ async function loadAtQueues() {
       .filter(q => q.isActive !== false && q.label)
       .map(q => ({ id: parseInt(q.value), name: q.label }))
       .sort((a, b) => a.name.localeCompare(b.name));
-    console.log('Loaded queues:', state.atQueues.map(q => q.name));
   } catch(e) { console.warn('Queue fetch failed:', e.message); state.atQueues = []; }
 }
 
@@ -784,14 +782,12 @@ async function fetchAtTicketQueue() {
   const filter = doneValues.length > 0
     ? doneValues.map(v => ({ op:'noteq', field:'status', value:v }))
     : [{ op:'noteq', field:'status', value:5 }];
-  console.log('[fetchAtTicketQueue] Excluding done statuses:', doneValues, 'Filter:', filter);
   const data = await atFetch('/Tickets/query','POST',{
     MaxRecords: 500,
     filter,
     IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','companyID','lastActivityDate','createDate'],
   });
   const items = data?.items || [];
-  console.log('[fetchAtTicketQueue] AT returned', items.length, 'tickets. Page details:', data?.pageDetails);
   await loadAtResources();
   const resourceMap = {};
   state.atResources.forEach(r => { resourceMap[r.id] = r.name; });
@@ -870,7 +866,7 @@ async function createTicketForAlert(alert) {
   // AT REST API returns {"itemId": 12345} on create
   const ticketId = data?.itemId || data?.item?.id || data?.id;
   if (!ticketId) {
-    console.log('AT create ticket response:', JSON.stringify(data));
+    console.warn('AT create ticket — unexpected response shape:', data);
     throw new Error('Ticket created but no ID returned');
   }
   // Fetch the full ticket so we have ticketNumber etc.
@@ -2160,7 +2156,7 @@ function renderTicketList() {
   }).join('');
 }
 
-// ─── TIER B: DEVICE / ACTIVITY / METADATA RENDERERS ─────────────
+// ─── TICKET DETAIL PANELS: DEVICE / ACTIVITY / METADATA ─────────
 function fmtBytes(mb) {
   if (mb == null || isNaN(mb)) return '';
   if (mb > 1024*1024) return (mb/1024/1024).toFixed(1) + ' TB';
@@ -4726,8 +4722,8 @@ function registerSW() {
   }
 }
 
-// ─── TIER A STYLES (inline-injected — self-contained) ────────────
-function injectTierAStyles() {
+// ─── INLINE-INJECTED STYLES (self-contained, no external CSS dependency) ──
+function injectAppStyles() {
   if (document.getElementById('tierA-styles')) return;
   const style = document.createElement('style');
   style.id = 'tierA-styles';
@@ -5791,7 +5787,6 @@ function injectTierAStyles() {
   document.head.appendChild(style);
 }
 
-// ─── AI CONTEXT TOGGLES (injected into Preferences card at boot) ─
 // ─── CLIENTS NAV + VIEW INJECTION ─────────────────────────────────
 function injectClientsViewAndNav() {
   // Inject the view container if not present (renderClientsView writes into #view-clients)
@@ -6014,7 +6009,7 @@ function injectAiContextToggles() {
 
 // ─── BOOT ─────────────────────────────────────────────────────────
 async function boot() {
-  injectTierAStyles();
+  injectAppStyles();
   registerSW();
   loadSettings();
   injectAiContextToggles();
