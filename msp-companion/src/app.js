@@ -2427,7 +2427,6 @@ function renderTicketDetail(ticket) {
         ${!isMine && !isComplete ? `<button class="abtn abtn-accept" data-action="ticket-accept" data-ticket-id="${ticket.id}">✋ Accept</button>` : ''}
         ${!isComplete ? `<button class="abtn abtn-complete" data-action="ticket-complete" data-ticket-id="${ticket.id}">✓ Complete</button>` : ''}
         <button class="abtn abtn-time" data-action="log-time-ticket" data-ticket-id="${ticket.id}">⏱ Log Time</button>
-        <button class="abtn abtn-kb" data-action="save-kb-ticket" data-ticket-id="${ticket.id}">📚 Save to KB</button>
       </div>
     </div>
 
@@ -3875,10 +3874,6 @@ function wireEvents() {
       const input=$('ticketNotesInput'); if(!input?.value.trim()){showToast('Enter notes first','info');return;}
       try { await postResolutionToAt(ticket.id,input.value.trim(),ticket.assignedResourceID); showToast('✓ Resolution posted to Autotask','ok'); }
       catch(e){showToast(`Error: ${e.message}`,'err');}
-    }
-
-    if (action==='save-kb-ticket') {
-      showKBModal();
     }
 
     if (action==='save-ticket-to-kb') {
