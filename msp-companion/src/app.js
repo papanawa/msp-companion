@@ -1346,6 +1346,53 @@ async function draftResolutionFromSteps(ticket, investigation) {
   return (text || '').trim();
 }
 
+function buildKbDraftSystemPrompt() {
+  return `You are an MSP engineer writing a Knowledge Base entry from a completed ticket investigation. The output goes into a searchable internal KB that Synobis techs will read in the future when they encounter similar issues.
+
+You will receive: the ticket title and resolution text, optionally the original analysis and step notes. Produce a clean KB entry with Symptom / Diagnosis / Fix structure.
+
+Respond ONLY with valid JSON in this EXACT shape, no markdown fences, no preamble:
+
+{
+  "title": "Short, searchable title that another tech would type into KB search. ~6-12 words. Lead with the symptom, not the client.",
+  "symptoms": "What does this look like to a tech encountering it for the first time? 2-4 sentences describing the observable problem, error messages, or alert content. Avoid client-specific names — make it generalizable.",
+  "diagnosis": "What was the actual underlying cause? 1-3 sentences. Be specific.",
+  "fix": "Concrete numbered steps to remediate. Use exact commands, paths, or UI navigation. A tech should be able to follow these and resolve the issue without re-investigating.",
+  "tags": ["short", "lowercase", "tags", "for", "search"]
+}
+
+Rules:
+- Strip all client-specific identifiers from title/symptoms/diagnosis/fix (no hostnames, no usernames, no IPs unless they're conventionally meaningful like 127.0.0.1). Make the entry reusable across clients.
+- The "fix" section should be actionable. If the tech's notes only describe the problem and not the solution, say so plainly in the fix field — don't invent steps.
+- Tags should be lowercase, short, and searchable. Examples: "disk", "dhcp", "veeam", "windows-update", "service-restart". Skip tags like the client name, ticket number, or hostname.
+- Do not include markdown formatting in any field.
+- Title must be under 100 characters.`;
+}
+
+async function draftKbEntryFromTicket(ticket, investigation, finalResolution) {
+  const system = buildKbDraftSystemPrompt();
+  const stepNotes = investigation?.steps?.length ? formatStepNotesForResolution(investigation.steps) : '';
+  const analysis = investigation?.analysis?.understanding || '';
+  const userMessage = `TICKET: ${ticket.ticketNumber || ticket.id}
+Title: ${ticket.title || '(no title)'}
+${ticket.companyName ? `Client: ${ticket.companyName}\n` : ''}
+${analysis ? `\nANALYSIS / UNDERSTANDING:\n${analysis}\n` : ''}
+${stepNotes ? `\nSTEP NOTES:\n${stepNotes}\n` : ''}
+${finalResolution ? `\nFINAL RESOLUTION POSTED:\n${finalResolution}\n` : ''}`.trim();
+  const raw = await callAI(system, [{ role: 'user', content: userMessage }]);
+  const cleaned = (raw || '').replace(/```json|```/g, '').trim();
+  let parsed;
+  try { parsed = JSON.parse(cleaned); }
+  catch(e) { throw new Error('AI returned non-JSON. Raw: ' + cleaned.substring(0, 200)); }
+  return {
+    title: String(parsed.title || '').substring(0, 100).trim(),
+    symptoms: String(parsed.symptoms || '').trim(),
+    diagnosis: String(parsed.diagnosis || '').trim(),
+    fix: String(parsed.fix || '').trim(),
+    tags: Array.isArray(parsed.tags) ? parsed.tags.map(t => String(t).trim().toLowerCase()).filter(Boolean) : [],
+  };
+}
+
 // ─── TICKET INVESTIGATION CHAT ────────────────────────────────────
 function buildTicketChatSystemPrompt(ticket, inv, contextBlob) {
   const stepsState = (inv?.steps || []).map((s, i) => {
@@ -2419,7 +2466,10 @@ function renderTicketDetail(ticket) {
       <textarea id="ticketNotesInput" rows="4" placeholder="Final resolution — what fixed the issue? (Posts to the ticket's Resolution field and adds a note.)">${esc(state.notesDrafts['ticket-'+ticket.id]||'')}</textarea>
       <div class="notes-footer">
         <span></span>
-        <button class="abtn abtn-post" data-action="post-ticket-resolution" data-ticket-id="${ticket.id}" style="font-size:11px;padding:6px 12px">↑ POST RESOLUTION</button>
+        <div style="display:flex;gap:6px">
+          <button class="abtn abtn-kb" data-action="save-ticket-to-kb" data-ticket-id="${ticket.id}" style="font-size:11px;padding:6px 12px" title="AI-format this resolution and save to Knowledge Base">💾 Save to KB</button>
+          <button class="abtn abtn-post" data-action="post-ticket-resolution" data-ticket-id="${ticket.id}" style="font-size:11px;padding:6px 12px">↑ POST RESOLUTION</button>
+        </div>
       </div>
     </div>`;
 
@@ -3829,6 +3879,40 @@ function wireEvents() {
 
     if (action==='save-kb-ticket') {
       showKBModal();
+    }
+
+    if (action==='save-ticket-to-kb') {
+      const ticketId = el.dataset.ticketId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      if (!ticket) return;
+      const input = $('ticketNotesInput');
+      const finalResolution = input?.value.trim() || '';
+      const inv = getInvestigation(ticket.id);
+      // Need at least *something* to draft from
+      if (!finalResolution && !inv?.steps?.some(s => s.notes?.trim())) {
+        showToast('Add a resolution or work the investigation first', 'info');
+        return;
+      }
+      const origLabel = el.textContent;
+      el.disabled = true; el.textContent = '✨ Drafting...';
+      try {
+        const draft = await draftKbEntryFromTicket(ticket, inv, finalResolution);
+        // Combine diagnosis + fix into the resolution field of the existing modal
+        const resolutionCombined = [
+          draft.diagnosis ? `DIAGNOSIS:\n${draft.diagnosis}` : '',
+          draft.fix ? `FIX:\n${draft.fix}` : '',
+        ].filter(Boolean).join('\n\n');
+        showKBModal({
+          title: draft.title,
+          symptoms: draft.symptoms,
+          resolution: resolutionCombined,
+          tags: (draft.tags || []).join(', '),
+        });
+      } catch(err) {
+        showToast(`KB draft failed: ${err.message}`, 'err');
+      } finally {
+        el.disabled = false; el.textContent = origLabel;
+      }
     }
 
     if (action==='ticket-accept') {
