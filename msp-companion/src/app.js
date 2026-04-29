@@ -20,6 +20,7 @@ const state = {
   clientDevicesCache: {},             // siteUid → { devices, fetchedAt }
   clientResolvedCache: null,          // { items, fetchedAt } — resolved tickets last 14d
   drillPanel: null,                   // active drill-down panel state
+  pendingTicketEdits: {},             // ticketId → { field: newValue } for unsaved field changes
   autoRefreshTimer: null,
 };
 
@@ -956,6 +957,101 @@ async function patchTicketField(ticket, field, rawValue) {
   }
   state.tickets[ticket.ticketNumber] = ticket;
   LS.set('msp_tickets', state.tickets);
+}
+
+// Batch version: patches multiple fields in one API call.
+// edits = { fieldName: rawValue, ... }
+async function patchTicketFields(ticket, edits) {
+  const fieldNames = Object.keys(edits);
+  if (!fieldNames.length) return [];
+
+  const body = { id: parseInt(ticket.id) };
+  let resolvedRoleId = null;
+
+  // Normalize each field's value into the body
+  for (const field of fieldNames) {
+    let value = edits[field];
+    if (value === '' || value === 'null') value = null;
+    else if (['status','priority','queueID','assignedResourceID'].includes(field) && value !== null) value = parseInt(value);
+
+    if (field === 'assignedResourceID') {
+      if (value === null) {
+        body.assignedResourceID = null;
+        body.assignedResourceRoleID = null;
+      } else {
+        await loadAtResources();
+        const r = state.atResources.find(r => r.id === value);
+        resolvedRoleId = r?.defaultRoleID || null;
+        if (!resolvedRoleId) {
+          try {
+            const fresh = await atFetch(`/Resources/${value}`);
+            resolvedRoleId = (fresh?.item || fresh)?.defaultServiceDeskRoleID || null;
+          } catch(e) { /* ignore */ }
+        }
+        if (!resolvedRoleId) {
+          await loadAtRoles();
+          resolvedRoleId = findFallbackServiceDeskRoleId();
+          if (resolvedRoleId) console.warn(`No default role for resource ${value}, using fallback ${resolvedRoleId}.`);
+        }
+        if (!resolvedRoleId) {
+          throw new Error('Cannot assign resource — no role available.');
+        }
+        body.assignedResourceID = value;
+        body.assignedResourceRoleID = resolvedRoleId;
+      }
+    } else {
+      body[field] = value;
+    }
+  }
+
+  await atFetch('/Tickets', 'PATCH', body);
+
+  // Mirror to local state for each field
+  const changedSummary = [];
+  for (const field of fieldNames) {
+    let value = edits[field];
+    if (value === '' || value === 'null') value = null;
+    else if (['status','priority','queueID','assignedResourceID'].includes(field) && value !== null) value = parseInt(value);
+
+    ticket[field] = value;
+    if (field === 'status') {
+      const pl = state.atStatusPicklist || {};
+      const si = pl[value] || { label:`Status ${value}`, color:'#8bacc8', done:false };
+      ticket.statusLabel = si.label;
+      ticket.statusColor = si.color;
+      ticket.isDone = si.done;
+      changedSummary.push(`status → ${si.label}`);
+    } else if (field === 'priority') {
+      const pl = state.atPriorityPicklist || {};
+      changedSummary.push(`priority → ${pl[value]?.label || value}`);
+    } else if (field === 'queueID') {
+      const q = state.atQueues?.find(q => q.id === value);
+      changedSummary.push(`queue → ${q?.name || (value ? `#${value}` : 'none')}`);
+    } else if (field === 'assignedResourceID') {
+      const r = state.atResources.find(r => r.id === value);
+      ticket.assignedResourceName = r ? r.name : null;
+      ticket.assignedResourceRoleID = resolvedRoleId;
+      changedSummary.push(`resource → ${r?.name || 'unassigned'}`);
+    }
+  }
+  state.tickets[ticket.ticketNumber] = ticket;
+  LS.set('msp_tickets', state.tickets);
+  return changedSummary;
+}
+
+// Updates the visibility and contents of the ticket field save bar based on pending edits.
+function updateTicketSaveBar(ticketId) {
+  const bar = document.getElementById(`ticketSaveBar-${ticketId}`);
+  const summary = document.getElementById(`ticketSaveSummary-${ticketId}`);
+  if (!bar || !summary) return;
+  const pending = state.pendingTicketEdits[ticketId];
+  const fieldCount = pending ? Object.keys(pending).length : 0;
+  if (!fieldCount) {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  summary.textContent = `${fieldCount} unsaved change${fieldCount !== 1 ? 's' : ''}`;
 }
 
 function findCompleteStatusID() {
@@ -2503,6 +2599,13 @@ function renderTicketDetail(ticket) {
           <select class="ticket-field-select" data-field="assignedResourceID" data-ticket-id="${ticket.id}" id="tf-resource"></select>
         </div>
       </div>
+      <div class="ticket-save-bar" id="ticketSaveBar-${ticket.id}" style="display:none">
+        <span class="ticket-save-summary" id="ticketSaveSummary-${ticket.id}"></span>
+        <div class="ticket-save-actions">
+          <button class="abtn abtn-ghost" data-action="ticket-discard-changes" data-ticket-id="${ticket.id}">Discard</button>
+          <button class="abtn abtn-post" data-action="ticket-save-changes" data-ticket-id="${ticket.id}">💾 Save Changes</button>
+        </div>
+      </div>
     </div>
 
     ${renderMetadataPanel(ticket)}
@@ -2526,36 +2629,52 @@ function renderTicketDetail(ticket) {
   // Populate selects — called now and re-called as picklists resolve
   renderTicketDetail._rehydrateSelects = (t) => {
     if (state.currentTicket?.id !== t.id) return; // user moved on
+    const pending = state.pendingTicketEdits[t.id] || {};
+    // Resolve effective value: pending edit if present, else ticket's actual value
+    const effective = (field) => {
+      if (Object.prototype.hasOwnProperty.call(pending, field)) return pending[field];
+      const v = t[field];
+      return v == null ? '' : String(v);
+    };
     const statusSel = document.getElementById('tf-status');
     const prioSel   = document.getElementById('tf-priority');
     const queueSel  = document.getElementById('tf-queue');
     const resSel    = document.getElementById('tf-resource');
 
     if (statusSel && state.atStatusPicklist) {
+      const cur = effective('status');
       const entries = Object.entries(state.atStatusPicklist).sort((a,b)=>a[1].label.localeCompare(b[1].label));
       statusSel.innerHTML = entries.map(([v,i]) =>
-        `<option value="${v}" ${String(t.status)===v?'selected':''}>${esc(i.label)}</option>`
+        `<option value="${v}" ${cur===v?'selected':''}>${esc(i.label)}</option>`
       ).join('');
+      statusSel.classList.toggle('ticket-field-dirty', 'status' in pending);
     }
     if (prioSel && state.atPriorityPicklist) {
+      const cur = effective('priority');
       const entries = Object.entries(state.atPriorityPicklist);
       prioSel.innerHTML = entries.map(([v,i]) =>
-        `<option value="${v}" ${String(t.priority)===v?'selected':''}>${esc(i.label)}</option>`
+        `<option value="${v}" ${cur===v?'selected':''}>${esc(i.label)}</option>`
       ).join('');
+      prioSel.classList.toggle('ticket-field-dirty', 'priority' in pending);
     }
     if (queueSel && state.atQueues?.length) {
+      const cur = effective('queueID');
       queueSel.innerHTML = `<option value="">— None —</option>` +
         state.atQueues.map(q =>
-          `<option value="${q.id}" ${String(t.queueID)===String(q.id)?'selected':''}>${esc(q.name)}</option>`
+          `<option value="${q.id}" ${cur===String(q.id)?'selected':''}>${esc(q.name)}</option>`
         ).join('');
+      queueSel.classList.toggle('ticket-field-dirty', 'queueID' in pending);
     }
     if (resSel && state.atResources?.length) {
+      const cur = effective('assignedResourceID');
       const sorted = [...state.atResources].sort((a,b)=>a.name.localeCompare(b.name));
       resSel.innerHTML = `<option value="">— Unassigned —</option>` +
         sorted.map(r =>
-          `<option value="${r.id}" ${String(t.assignedResourceID)===String(r.id)?'selected':''}>${esc(r.name)}</option>`
+          `<option value="${r.id}" ${cur===String(r.id)?'selected':''}>${esc(r.name)}</option>`
         ).join('');
+      resSel.classList.toggle('ticket-field-dirty', 'assignedResourceID' in pending);
     }
+    updateTicketSaveBar(t.id);
   };
   renderTicketDetail._rehydrateSelects(ticket);
   hydrateTierBPanels(ticket);
@@ -3961,6 +4080,37 @@ function wireEvents() {
       }
     }
 
+    if (action==='ticket-save-changes') {
+      const ticketId = el.dataset.ticketId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const pending = state.pendingTicketEdits[ticketId];
+      if (!ticket || !pending || !Object.keys(pending).length) return;
+      const origLabel = el.textContent;
+      el.disabled = true;
+      el.textContent = 'Saving...';
+      try {
+        const summary = await patchTicketFields(ticket, pending);
+        delete state.pendingTicketEdits[ticketId];
+        state.currentTicket = ticket;
+        renderTicketDetail(ticket);
+        renderTicketList();
+        showToast(`✓ Saved — ${summary.join(' · ')}`, 'ok');
+      } catch(err) {
+        showToast(`Save failed: ${err.message}`, 'err');
+        el.disabled = false;
+        el.textContent = origLabel;
+      }
+    }
+
+    if (action==='ticket-discard-changes') {
+      const ticketId = el.dataset.ticketId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      if (!ticket) return;
+      delete state.pendingTicketEdits[ticketId];
+      // Re-render to reset the dropdowns to ticket's actual values
+      renderTicketDetail(ticket);
+    }
+
     if (action==='ticket-accept') {
       const ticketId=el.dataset.ticketId;
       const ticket=Object.values(state.tickets).find(t=>String(t.id)===ticketId); if(!ticket) return;
@@ -4378,22 +4528,23 @@ function wireEvents() {
     const field = sel.dataset.field;
     const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
     if (!ticket) return;
-    const prevValue = ticket[field];
-    const newValue = sel.value;
-    sel.disabled = true;
-    try {
-      await patchTicketField(ticket, field, newValue);
-      state.currentTicket = ticket;
-      // Refresh header color/badge without blowing away select focus
-      renderTicketDetail(ticket); renderTicketList();
-      const label = sel.options[sel.selectedIndex]?.text || '';
-      showToast(`✓ ${field.replace('ID','')} → ${label}`, 'ok');
-    } catch(err) {
-      sel.value = prevValue ?? '';
-      showToast(`Update failed: ${err.message}`, 'err');
-    } finally {
-      sel.disabled = false;
+    // Compare against the live ticket value — normalize blanks to null
+    const currentValueRaw = ticket[field];
+    const currentValueStr = currentValueRaw == null ? '' : String(currentValueRaw);
+    const newValueStr = sel.value;
+    if (!state.pendingTicketEdits[ticketId]) state.pendingTicketEdits[ticketId] = {};
+    if (newValueStr === currentValueStr) {
+      // User reverted to the original — clear from pending
+      delete state.pendingTicketEdits[ticketId][field];
+      if (!Object.keys(state.pendingTicketEdits[ticketId]).length) {
+        delete state.pendingTicketEdits[ticketId];
+      }
+      sel.classList.remove('ticket-field-dirty');
+    } else {
+      state.pendingTicketEdits[ticketId][field] = newValueStr;
+      sel.classList.add('ticket-field-dirty');
     }
+    updateTicketSaveBar(ticketId);
   });
 
   // Enter to send chat
@@ -4622,6 +4773,32 @@ function injectTierAStyles() {
     select.ticket-field-select:disabled {
       opacity: 0.5;
       cursor: wait;
+    }
+    select.ticket-field-select.ticket-field-dirty {
+      border-color: #c8a000;
+      background: rgba(200,160,0,0.06);
+      box-shadow: 0 0 0 1px rgba(200,160,0,0.25);
+    }
+    .ticket-save-bar {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .ticket-save-summary {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      color: #c8a000;
+    }
+    .ticket-save-actions {
+      display: flex;
+      gap: 8px;
     }
     .abtn-accept {
       background: rgba(0,180,216,0.12);
