@@ -600,10 +600,17 @@ async function syncTicketStatuses(ticketNumbers) {
 async function loadAtResources() {
   if (state.atResources.length) return;
   try {
-    const data = await atFetch('/Resources/query', 'POST', { filter:[{op:'eq',field:'isActive',value:true}] });
+    const data = await atFetch('/Resources/query', 'POST', {
+      filter:[{op:'eq',field:'isActive',value:true}],
+      IncludeFields: ['id','firstName','lastName','defaultServiceDeskRoleID'],
+    });
     state.atResources = (data?.items||[])
       .filter(r => { const n = ((r.firstName||'')+' '+(r.lastName||'')).trim().toLowerCase(); return !n.includes('api')&&!n.includes('integration'); })
-      .map(r => ({ id:r.id, name:((r.firstName||'')+' '+(r.lastName||'')).trim() }));
+      .map(r => ({
+        id: r.id,
+        name: ((r.firstName||'')+' '+(r.lastName||'')).trim(),
+        defaultRoleID: r.defaultServiceDeskRoleID || null,
+      }));
   } catch(e) { console.warn('Resources failed:', e.message); }
 }
 
@@ -812,6 +819,38 @@ async function patchTicketField(ticket, field, rawValue) {
 
   const body = { id: parseInt(ticket.id) };
   body[field] = value;
+
+  // AT requires assignedResourceRoleID alongside assignedResourceID — sending one without the other = 500 "Data violation"
+  let resolvedRoleId = null;
+  if (field === 'assignedResourceID') {
+    if (value === null) {
+      // Unassigning — clear role too
+      body.assignedResourceRoleID = null;
+    } else {
+      // Need a role. Use the resource's default service desk role.
+      await loadAtResources();
+      const r = state.atResources.find(r => r.id === value);
+      resolvedRoleId = r?.defaultRoleID || null;
+      if (!resolvedRoleId) {
+        // Fallback: try to fetch the resource directly to grab its default role
+        try {
+          const fresh = await atFetch(`/Resources/${value}`);
+          resolvedRoleId = (fresh?.item || fresh)?.defaultServiceDeskRoleID || null;
+        } catch(e) { /* ignore */ }
+      }
+      if (!resolvedRoleId) {
+        // Last resort: pick any active role so AT accepts the patch.
+        await loadAtRoles();
+        resolvedRoleId = state.atRoles[0]?.id || null;
+        if (resolvedRoleId) console.warn(`No default role for resource ${value}, using fallback role ${resolvedRoleId}`);
+      }
+      if (!resolvedRoleId) {
+        throw new Error('Cannot assign resource — no role available. Check resource has a default service desk role in Autotask.');
+      }
+      body.assignedResourceRoleID = resolvedRoleId;
+    }
+  }
+
   await atFetch('/Tickets', 'PATCH', body);
 
   // Mirror to local state
@@ -826,6 +865,7 @@ async function patchTicketField(ticket, field, rawValue) {
   if (field === 'assignedResourceID') {
     const r = state.atResources.find(r => r.id === value);
     ticket.assignedResourceName = r ? r.name : null;
+    ticket.assignedResourceRoleID = resolvedRoleId;
   }
   state.tickets[ticket.ticketNumber] = ticket;
   LS.set('msp_tickets', state.tickets);
