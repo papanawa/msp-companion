@@ -11,6 +11,9 @@ const state = {
   investigations: {},
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
+  incidents: {},                      // { incidentId: { id, title, alertUids[], createdAt, source, ticketNumber?, expanded? } }
+  alertSelectMode: false,             // toggled when multi-selecting alerts to create an incident
+  alertSelected: new Set(),           // alertUids currently selected
   ticketShowStale: false,
   reportsRange: 30, reportsResolvedTickets: null, reportsResolvedAlerts: null,
   clients: null,                      // unified client list (AT companies + Datto sites)
@@ -25,11 +28,11 @@ const state = {
 };
 
 const SEV = {
-  Critical:    { color: '#c8102e', bg: 'rgba(200,16,46,0.12)'  },
-  High:        { color: '#e07b00', bg: 'rgba(224,123,0,0.12)'  },
-  Moderate:    { color: '#c8a000', bg: 'rgba(200,160,0,0.12)'  },
-  Low:         { color: '#2a9d5c', bg: 'rgba(42,157,92,0.12)'  },
-  Information: { color: '#5a7a96', bg: 'rgba(90,122,150,0.12)' },
+  Critical:    { color: '#c8102e', bg: 'rgba(200,16,46,0.12)',  rank: 1 },
+  High:        { color: '#e07b00', bg: 'rgba(224,123,0,0.12)',  rank: 2 },
+  Moderate:    { color: '#c8a000', bg: 'rgba(200,160,0,0.12)',  rank: 3 },
+  Low:         { color: '#2a9d5c', bg: 'rgba(42,157,92,0.12)',  rank: 4 },
+  Information: { color: '#5a7a96', bg: 'rgba(90,122,150,0.12)', rank: 5 },
 };
 
 const DONE_LABELS = new Set(['complete','completed','closed','resolved','denied','cancelled','canceled']);
@@ -67,6 +70,7 @@ function loadSettings() {
   state.psaExcludedClients = new Set(LS.get('msp_psa_excluded', []));
   state.hiddenClients = new Set(LS.get('msp_hidden_clients', []));
   state.notesDrafts   = LS.get('msp_notes', {});
+  state.incidents     = LS.get('msp_incidents', {});
   state.aiResults     = LS.get('msp_ai', {});
   state.chatHistories = LS.get('msp_chats', {});
   state.ticketChatHistories = LS.get('msp_ticket_chats', {});
@@ -1855,6 +1859,291 @@ function renderClientGrid(alerts) {
     </div>`).join('');
 }
 
+// ─── INCIDENTS (ALERT GROUPING) ───────────────────────────────────
+const INCIDENT_MIN_CLUSTER_SIZE = 3;        // rule-based clusterer needs at least this many
+const INCIDENT_TIME_WINDOW_MS = 5 * 60000;  // alerts must fire within 5 minutes
+
+function newIncidentId() { return 'inc-' + Math.random().toString(36).slice(2, 10); }
+
+function saveIncidents() { LS.set('msp_incidents', state.incidents); }
+
+function getAlertIncident(alertUid) {
+  return Object.values(state.incidents).find(i => i.alertUids?.includes(alertUid)) || null;
+}
+
+function isAlertGrouped(alertUid) {
+  return !!getAlertIncident(alertUid);
+}
+
+// Returns ungrouped alerts and all incidents (with their alerts hydrated).
+// Used by the alerts list when grouping mode is on.
+function getGroupedAlertView(visibleAlerts) {
+  const visibleUids = new Set(visibleAlerts.map(a => a.alertUid));
+  const incidents = [];
+  Object.values(state.incidents).forEach(inc => {
+    const alerts = (inc.alertUids || []).filter(u => visibleUids.has(u))
+                                         .map(u => visibleAlerts.find(a => a.alertUid === u))
+                                         .filter(Boolean);
+    if (alerts.length) incidents.push({ ...inc, alerts });
+  });
+  // Drop incidents whose alerts are all gone
+  const inIncident = new Set();
+  incidents.forEach(inc => inc.alerts.forEach(a => inIncident.add(a.alertUid)));
+  const ungrouped = visibleAlerts.filter(a => !inIncident.has(a.alertUid));
+  // Sort incidents: by highest-priority child alert, then alert count desc
+  incidents.sort((a, b) => {
+    const ap = Math.min(...a.alerts.map(x => SEV[x.priority]?.rank ?? 99));
+    const bp = Math.min(...b.alerts.map(x => SEV[x.priority]?.rank ?? 99));
+    if (ap !== bp) return ap - bp;
+    return b.alerts.length - a.alerts.length;
+  });
+  return { incidents, ungrouped };
+}
+
+function pruneEmptyIncidents() {
+  // Drop any incident whose alertUids are all gone from state.alerts (e.g. after a refresh)
+  const liveUids = new Set(state.alerts.map(a => a.alertUid));
+  let changed = false;
+  Object.entries(state.incidents).forEach(([id, inc]) => {
+    inc.alertUids = (inc.alertUids || []).filter(u => liveUids.has(u));
+    if (inc.alertUids.length === 0) {
+      delete state.incidents[id];
+      changed = true;
+    } else if (inc.alertUids.length === 1) {
+      // Solo alert, no point keeping the incident wrapper
+      delete state.incidents[id];
+      changed = true;
+    }
+  });
+  if (changed) saveIncidents();
+}
+
+// Rule-based clusterer. Groups ungrouped alerts by site + monitorType within a time window.
+function runRuleBasedClustering() {
+  if (state.settings.groupAlerts !== true) return 0;
+  const ungrouped = state.alerts.filter(a => !isAlertGrouped(a.alertUid));
+  // Bucket by (siteName, monitorType)
+  const buckets = {};
+  ungrouped.forEach(a => {
+    const key = `${a.siteName || ''}\u0001${a.monitorType || ''}`;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(a);
+  });
+
+  let createdCount = 0;
+  for (const [key, alerts] of Object.entries(buckets)) {
+    if (alerts.length < INCIDENT_MIN_CLUSTER_SIZE) continue;
+    // Sort by time, then walk and split when time gap exceeds window
+    alerts.sort((x, y) => x.timestampMs - y.timestampMs);
+    let currentBatch = [alerts[0]];
+    const finalized = [];
+    for (let i = 1; i < alerts.length; i++) {
+      if (alerts[i].timestampMs - currentBatch[currentBatch.length - 1].timestampMs <= INCIDENT_TIME_WINDOW_MS) {
+        currentBatch.push(alerts[i]);
+      } else {
+        if (currentBatch.length >= INCIDENT_MIN_CLUSTER_SIZE) finalized.push(currentBatch);
+        currentBatch = [alerts[i]];
+      }
+    }
+    if (currentBatch.length >= INCIDENT_MIN_CLUSTER_SIZE) finalized.push(currentBatch);
+
+    for (const batch of finalized) {
+      const [siteName, monitorType] = key.split('\u0001');
+      const id = newIncidentId();
+      state.incidents[id] = {
+        id,
+        title: `${batch.length}× ${monitorType || 'alerts'} on ${siteName || 'site'}`,
+        alertUids: batch.map(a => a.alertUid),
+        createdAt: Date.now(),
+        source: 'rule',
+        expanded: false,
+      };
+      createdCount++;
+    }
+  }
+  if (createdCount > 0) saveIncidents();
+  return createdCount;
+}
+
+function createManualIncident(alertUids, title) {
+  if (!alertUids || alertUids.length < 2) throw new Error('Manual incident needs at least 2 alerts');
+  // Eject any of these alerts from existing incidents first
+  alertUids.forEach(uid => ejectAlertFromIncident(uid, /* skipSave */ true));
+  const id = newIncidentId();
+  state.incidents[id] = {
+    id,
+    title: title || `Manual incident — ${alertUids.length} alerts`,
+    alertUids: [...alertUids],
+    createdAt: Date.now(),
+    source: 'manual',
+    expanded: true,
+  };
+  saveIncidents();
+  return state.incidents[id];
+}
+
+function ejectAlertFromIncident(alertUid, skipSave) {
+  const inc = getAlertIncident(alertUid);
+  if (!inc) return;
+  inc.alertUids = inc.alertUids.filter(u => u !== alertUid);
+  if (inc.alertUids.length < 2) {
+    // Drop the incident entirely if it would be a 1-alert incident
+    delete state.incidents[inc.id];
+  }
+  if (!skipSave) saveIncidents();
+}
+
+function ungroupIncident(incidentId) {
+  if (state.incidents[incidentId]) {
+    delete state.incidents[incidentId];
+    saveIncidents();
+  }
+}
+
+function toggleIncidentExpand(incidentId) {
+  if (state.incidents[incidentId]) {
+    state.incidents[incidentId].expanded = !state.incidents[incidentId].expanded;
+    saveIncidents();
+  }
+}
+
+// ─── AI INCIDENT CLUSTERING ───────────────────────────────────────
+function buildIncidentClusterPrompt() {
+  return `You are an MSP engineer reviewing a list of currently-open monitoring alerts. Your job: identify which alerts are part of the same incident — meaning they share a single root cause and would be worked together.
+
+Examples of what counts as one incident:
+- A domain controller goes offline and triggers logon-failure alerts on workstations across the site → 1 incident
+- A backup job fails and reports failure alerts for every protected device → 1 incident
+- A core switch dies and devices behind it all go offline → 1 incident
+- Same device firing CPU + memory + disk alerts simultaneously → 1 incident (device under load)
+
+Examples of what is NOT one incident:
+- Two unrelated devices at the same client both having issues → separate incidents
+- Same monitor type (disk usage) across different clients → separate incidents
+- Routine simultaneous alerts that happen to fire close in time → separate incidents
+
+Rules:
+- Only group alerts that share a clear causal connection. Err on the side of LEAVING ALERTS UNGROUPED if you're not sure.
+- Each incident must have at least 2 alerts. Single-alert "incidents" are not incidents.
+- An alert can belong to at most one incident.
+- Title should be short and descriptive: "{root cause} on {site}" e.g. "DC2 offline on Wallquest" or "Veeam backup failure cascade".
+- Reasoning should be 1 sentence explaining the causal link.
+
+Respond ONLY with valid JSON in this EXACT shape, no markdown fences, no preamble:
+{
+  "incidents": [
+    {
+      "title": "Short descriptive title",
+      "alertUids": ["uid1", "uid2", ...],
+      "reasoning": "One sentence on why these are connected"
+    }
+  ]
+}
+
+If no alerts cluster meaningfully, return { "incidents": [] }.`;
+}
+
+async function runAiIncidentClustering() {
+  // Only consider ungrouped alerts to avoid re-shuffling existing incidents
+  const ungrouped = state.alerts.filter(a => !isAlertGrouped(a.alertUid));
+  if (ungrouped.length < 2) {
+    return { proposals: [], totalCandidates: 0 };
+  }
+  const summary = ungrouped.map(a => ({
+    uid: a.alertUid,
+    host: a.hostname,
+    site: a.siteName,
+    priority: a.priority,
+    monitor: a.monitorType,
+    msg: (a.alertMessage || '').substring(0, 200),
+    ts: new Date(a.timestampMs).toISOString(),
+  }));
+  const system = buildIncidentClusterPrompt();
+  const userMsg = `OPEN ALERTS TO ANALYZE (${ungrouped.length}):\n\n${JSON.stringify(summary, null, 2)}`;
+  const raw = await callAI(system, [{ role: 'user', content: userMsg }]);
+  const cleaned = (raw || '').replace(/```json|```/g, '').trim();
+  let parsed;
+  try { parsed = JSON.parse(cleaned); }
+  catch(e) { throw new Error('AI returned non-JSON. Raw: ' + cleaned.substring(0, 200)); }
+  const proposals = (parsed.incidents || [])
+    .filter(p => Array.isArray(p.alertUids) && p.alertUids.length >= 2)
+    .map(p => ({
+      title: String(p.title || '').substring(0, 100),
+      reasoning: String(p.reasoning || ''),
+      alertUids: p.alertUids.filter(u => ungrouped.some(a => a.alertUid === u)),
+    }))
+    .filter(p => p.alertUids.length >= 2);
+  return { proposals, totalCandidates: ungrouped.length };
+}
+
+function showAiClusterReviewModal(proposals, totalCandidates) {
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  if (!proposals.length) {
+    modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:520px;margin:auto">
+      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:8px">✨ AI Incident Detection</div>
+      <div style="font-size:13px;color:var(--textmid);margin-bottom:14px">Reviewed ${totalCandidates} alerts. AI didn't find any clusters — they all look like separate incidents.</div>
+      <button id="aiClusterCloseBtn" style="cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">OK</button>
+    </div>`;
+    document.body.appendChild(modal);
+    document.getElementById('aiClusterCloseBtn').addEventListener('click', () => document.body.removeChild(modal));
+    return;
+  }
+
+  const proposalsHtml = proposals.map((p, i) => {
+    const alerts = p.alertUids.map(u => state.alerts.find(a => a.alertUid === u)).filter(Boolean);
+    const alertsHtml = alerts.map(a => `
+      <div class="ai-cluster-alert">
+        <span class="badge" style="color:${SEV[a.priority]?.color||'#5a7a96'};background:${SEV[a.priority]?.color||'#5a7a96'}22;border:1px solid ${SEV[a.priority]?.color||'#5a7a96'}55">${esc(a.priority)}</span>
+        <span class="ai-cluster-host">${esc(a.hostname)}</span>
+        <span class="ai-cluster-msg">${esc((a.alertMessage || '').substring(0, 80))}</span>
+      </div>`).join('');
+    return `<div class="ai-cluster-proposal" data-proposal-index="${i}">
+      <div class="ai-cluster-head">
+        <label class="ai-cluster-checkbox">
+          <input type="checkbox" class="ai-cluster-accept" data-idx="${i}" checked />
+          <span class="ai-cluster-title">${esc(p.title)}</span>
+        </label>
+        <span class="ai-cluster-count">${p.alertUids.length} alerts</span>
+      </div>
+      <div class="ai-cluster-reasoning">${esc(p.reasoning)}</div>
+      <div class="ai-cluster-alerts">${alertsHtml}</div>
+    </div>`;
+  }).join('');
+
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:720px;margin:auto">
+    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">✨ AI Incident Detection</div>
+    <div style="font-size:12px;color:var(--textdim);margin-bottom:16px">Reviewed ${totalCandidates} alerts. AI proposes ${proposals.length} incident${proposals.length!==1?'s':''}. Uncheck any you disagree with.</div>
+    <div style="max-height:60vh;overflow-y:auto;margin-bottom:16px">${proposalsHtml}</div>
+    <div style="display:flex;gap:8px">
+      <button id="aiClusterAcceptBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">Create Selected Incidents</button>
+      <button id="aiClusterCancelBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Cancel</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+
+  document.getElementById('aiClusterCancelBtn').addEventListener('click', () => document.body.removeChild(modal));
+  document.getElementById('aiClusterAcceptBtn').addEventListener('click', () => {
+    const checked = [...modal.querySelectorAll('.ai-cluster-accept:checked')].map(el => parseInt(el.dataset.idx));
+    let created = 0;
+    checked.forEach(idx => {
+      const p = proposals[idx];
+      if (!p) return;
+      try {
+        const inc = createManualIncident(p.alertUids, p.title);
+        inc.source = 'ai';
+        saveIncidents();
+        created++;
+      } catch(e) { console.warn('Failed to create AI incident:', e.message); }
+    });
+    document.body.removeChild(modal);
+    if (created > 0) {
+      showToast(`✓ Created ${created} incident${created!==1?'s':''}`, 'ok');
+      renderAlertList();
+    }
+  });
+}
+
 // ─── ALERT LIST ───────────────────────────────────────────────────
 function renderAlertList() {
   const filtered = getFilteredAlerts();
@@ -1864,7 +2153,9 @@ function renderAlertList() {
   if (!filtered.length) { el.innerHTML='<div class="loading-state">No alerts match current filters</div>'; return; }
   const order = {Critical:0,High:1,Moderate:2,Low:3,Information:4};
   const sorted = [...filtered].sort((a,b)=>(order[a.priority]??5)-(order[b.priority]??5)||b.timestampMs-a.timestampMs);
-  el.innerHTML = sorted.map(a => {
+
+  const groupingOn = state.settings.groupAlerts === true;
+  const renderAlertRow = (a, opts = {}) => {
     const sv     = SEV[a.priority]||SEV.Information;
     const ticket = a.ticketNumber ? state.tickets[a.ticketNumber] : null;
     const rs     = getResolutionState(a);
@@ -1873,19 +2164,76 @@ function renderAlertList() {
     const ticketBadge = ticket
       ? `<span class="badge" style="color:${ticket.statusColor};background:${ticket.statusColor}22;border:1px solid ${ticket.statusColor}44">${isLocked?'🔒 ':''}${esc(ticket.statusLabel)}${ticket.assignedResourceName ? ' · ' + esc(ticket.assignedResourceName.split(' ')[0]) : ''}</span>`
       : `<span class="badge" style="color:#5a7a96;background:rgba(90,122,150,0.1);border:1px solid rgba(90,122,150,0.3)">No Ticket</span>`;
-    return `<div class="list-row ${isActive?'active':''} ${isLocked?'list-row-locked':''}" data-uid="${esc(a.alertUid)}">
+    const selectable = state.alertSelectMode;
+    const checked = state.alertSelected.has(a.alertUid);
+    const childIndicator = opts.isChild ? '<span class="incident-child-indicator">↳</span>' : '';
+    const ejectBtn = opts.isChild
+      ? `<button class="incident-eject-btn" data-action="incident-eject" data-uid="${esc(a.alertUid)}" title="Remove from incident">×</button>`
+      : '';
+    const selectBox = selectable
+      ? `<input type="checkbox" class="alert-select-cb" data-action="alert-select" data-uid="${esc(a.alertUid)}" ${checked?'checked':''} onclick="event.stopPropagation()" />`
+      : '';
+    return `<div class="list-row ${isActive?'active':''} ${isLocked?'list-row-locked':''} ${opts.isChild?'list-row-child':''}" data-uid="${esc(a.alertUid)}">
       <div class="row-top">
+        ${selectBox}${childIndicator}
         <span class="row-device">${esc(a.hostname)}</span>
         <div class="row-badges">
           ${badgeHtml(a.priority,sv.color,sv.bg)}
           ${rs==='mismatch' ? badgeHtml('⚠ MISMATCH','#c8960c','rgba(200,150,12,0.12)') : ''}
+          ${ejectBtn}
         </div>
       </div>
       <div class="row-client">${esc(a.siteName)}</div>
       <div class="row-msg">${esc(a.alertMessage)}</div>
       <div class="row-foot"><span class="row-type">${esc(a.monitorType)}</span>${ticketBadge}</div>
     </div>`;
+  };
+
+  // Toolbar above the list — multi-select toggles + AI button + "Create incident from selected"
+  const toolbarHtml = `<div class="alert-list-toolbar">
+    ${groupingOn ? `<button class="abtn abtn-ghost" data-action="toggle-alert-select" title="Multi-select alerts to manually group">${state.alertSelectMode ? '✓ Selecting' : '☐ Select'}</button>` : ''}
+    ${groupingOn && state.alertSelectMode && state.alertSelected.size >= 2 ? `<button class="abtn abtn-post" data-action="create-manual-incident">+ Group ${state.alertSelected.size}</button>` : ''}
+    ${groupingOn ? `<button class="abtn abtn-ai" data-action="ai-cluster-alerts" title="Use AI to detect related alerts">✨ AI Detect</button>` : ''}
+  </div>`;
+
+  if (!groupingOn) {
+    // Old behavior — flat list
+    el.innerHTML = toolbarHtml + sorted.map(a => renderAlertRow(a)).join('');
+    return;
+  }
+
+  // Grouped view — incidents as expandable parent rows, ungrouped alerts inline
+  const { incidents, ungrouped } = getGroupedAlertView(sorted);
+
+  const incidentHtml = incidents.map(inc => {
+    const childCritical = inc.alerts.filter(a => a.priority === 'Critical').length;
+    const topPrio = inc.alerts.reduce((acc, a) => {
+      const r = SEV[a.priority]?.rank ?? 99;
+      return r < acc.rank ? { rank: r, name: a.priority } : acc;
+    }, { rank: 99, name: 'Information' });
+    const sv = SEV[topPrio.name] || SEV.Information;
+    const sourceLabel = inc.source === 'ai' ? '✨ AI' : inc.source === 'manual' ? '👤 Manual' : '⚙ Auto';
+    const childRows = inc.expanded ? inc.alerts.map(a => renderAlertRow(a, { isChild: true })).join('') : '';
+    return `<div class="incident-block">
+      <div class="incident-header" data-action="incident-toggle" data-incident-id="${esc(inc.id)}">
+        <span class="incident-arrow">${inc.expanded ? '▼' : '▶'}</span>
+        <div class="incident-meta">
+          <div class="incident-title">${esc(inc.title)}</div>
+          <div class="incident-sub">
+            ${badgeHtml(topPrio.name, sv.color, sv.bg)}
+            <span class="incident-count">${inc.alerts.length} alerts${childCritical?' · '+childCritical+' critical':''}</span>
+            <span class="incident-source">${sourceLabel}</span>
+          </div>
+        </div>
+        <button class="incident-ungroup-btn" data-action="incident-ungroup" data-incident-id="${esc(inc.id)}" title="Ungroup this incident" onclick="event.stopPropagation()">Ungroup</button>
+      </div>
+      ${childRows}
+    </div>`;
   }).join('');
+
+  const ungroupedHtml = ungrouped.map(a => renderAlertRow(a)).join('');
+
+  el.innerHTML = toolbarHtml + incidentHtml + ungroupedHtml;
 }
 
 function renderClientChips() {
@@ -2847,6 +3195,9 @@ async function refreshAll() {
     }
     state.alerts = alerts;
     LS.set('msp_alerts', alerts);
+    // Prune incidents whose alerts are gone, then run rule-based clustering on fresh data
+    pruneEmptyIncidents();
+    runRuleBasedClustering();
     const sites = await fetchSites();
     state.sites = sites;
     const ticketNumbers = [...new Set(alerts.map(a=>a.ticketNumber).filter(Boolean))];
@@ -4107,6 +4458,80 @@ function wireEvents() {
       renderTicketDetail(ticket);
     }
 
+    // ─── INCIDENT (ALERT GROUPING) HANDLERS ────────────────────
+    if (action==='toggle-alert-select') {
+      state.alertSelectMode = !state.alertSelectMode;
+      if (!state.alertSelectMode) state.alertSelected.clear();
+      renderAlertList();
+    }
+
+    if (action==='alert-select') {
+      const uid = el.dataset.uid;
+      if (!uid) return;
+      if (el.checked) state.alertSelected.add(uid);
+      else state.alertSelected.delete(uid);
+      // Re-render to update the "Group N" button visibility
+      renderAlertList();
+    }
+
+    if (action==='create-manual-incident') {
+      if (state.alertSelected.size < 2) {
+        showToast('Pick at least 2 alerts to group', 'info');
+        return;
+      }
+      const uids = [...state.alertSelected];
+      const defaultTitle = `Manual incident — ${uids.length} alerts`;
+      const title = prompt('Incident title:', defaultTitle);
+      if (title === null) return; // cancelled
+      try {
+        createManualIncident(uids, title.trim() || defaultTitle);
+        state.alertSelected.clear();
+        state.alertSelectMode = false;
+        renderAlertList();
+        showToast(`✓ Grouped ${uids.length} alerts into incident`, 'ok');
+      } catch(err) {
+        showToast(`Group failed: ${err.message}`, 'err');
+      }
+    }
+
+    if (action==='incident-toggle') {
+      const id = el.dataset.incidentId;
+      toggleIncidentExpand(id);
+      renderAlertList();
+    }
+
+    if (action==='incident-eject') {
+      const uid = el.dataset.uid;
+      ejectAlertFromIncident(uid);
+      renderAlertList();
+      showToast('Removed from incident', 'ok');
+    }
+
+    if (action==='incident-ungroup') {
+      const id = el.dataset.incidentId;
+      const inc = state.incidents[id];
+      if (!inc) return;
+      if (!confirm(`Ungroup "${inc.title}"? The ${inc.alertUids.length} alerts will become individual again.`)) return;
+      ungroupIncident(id);
+      renderAlertList();
+      showToast('✓ Ungrouped', 'ok');
+    }
+
+    if (action==='ai-cluster-alerts') {
+      const origLabel = el.textContent;
+      el.disabled = true;
+      el.textContent = '✨ Analyzing...';
+      try {
+        const { proposals, totalCandidates } = await runAiIncidentClustering();
+        showAiClusterReviewModal(proposals, totalCandidates);
+      } catch(err) {
+        showToast(`AI cluster failed: ${err.message}`, 'err');
+      } finally {
+        el.disabled = false;
+        el.textContent = origLabel;
+      }
+    }
+
     if (action==='ticket-accept') {
       const ticketId=el.dataset.ticketId;
       const ticket=Object.values(state.tickets).find(t=>String(t.id)===ticketId); if(!ticket) return;
@@ -4187,7 +4612,16 @@ function wireEvents() {
         await patchTicketField(ticket, 'status', doneId);
 
         // Auto-resolve any open Datto alerts linked to this ticket (no confirm — user opted into fast-mode)
-        const linkedAlerts = state.alerts.filter(a => a.ticketNumber === ticket.ticketNumber);
+        const directlyLinked = state.alerts.filter(a => a.ticketNumber === ticket.ticketNumber);
+        // Also include any alerts that are siblings in the same incident as a directly-linked alert
+        const siblingUids = new Set();
+        directlyLinked.forEach(a => {
+          const inc = getAlertIncident(a.alertUid);
+          if (inc) inc.alertUids.forEach(u => siblingUids.add(u));
+        });
+        const linkedAlerts = state.alerts.filter(a =>
+          a.ticketNumber === ticket.ticketNumber || siblingUids.has(a.alertUid)
+        );
         let alertsResolved = 0;
         let alertsFailed = 0;
         if (linkedAlerts.length) {
@@ -5662,6 +6096,193 @@ function injectAppStyles() {
       border-color: #c8102e;
       color: #c8102e;
     }
+    /* Alert list toolbar (multi-select + AI cluster button) */
+    .alert-list-toolbar {
+      display: flex;
+      gap: 6px;
+      padding: 6px 10px 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .alert-list-toolbar .abtn {
+      font-size: 11px;
+      padding: 5px 10px;
+    }
+    /* Incidents */
+    .incident-block {
+      border: 1px solid rgba(224,123,0,0.35);
+      border-radius: 5px;
+      margin: 6px 10px;
+      background: rgba(224,123,0,0.04);
+      overflow: hidden;
+    }
+    .incident-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .incident-header:hover {
+      background: rgba(224,123,0,0.08);
+    }
+    .incident-arrow {
+      font-size: 11px;
+      color: var(--textdim);
+      width: 12px;
+      flex-shrink: 0;
+    }
+    .incident-meta {
+      flex: 1;
+      min-width: 0;
+    }
+    .incident-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+    .incident-sub {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 11px;
+    }
+    .incident-count {
+      color: var(--textmid);
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+    .incident-source {
+      color: var(--textdim);
+      font-family: var(--cond);
+      font-size: 10px;
+      letter-spacing: 0.07em;
+    }
+    .incident-ungroup-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textdim);
+      padding: 3px 9px;
+      border-radius: 3px;
+      font-family: var(--cond);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      flex-shrink: 0;
+    }
+    .incident-ungroup-btn:hover {
+      border-color: #c8102e;
+      color: #c8102e;
+    }
+    .list-row-child {
+      margin-left: 22px;
+      margin-right: 6px;
+      border-color: rgba(224,123,0,0.2);
+      background: rgba(0,0,0,0.04);
+    }
+    .incident-child-indicator {
+      color: var(--textdim);
+      font-size: 11px;
+      margin-right: 4px;
+    }
+    .incident-eject-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textdim);
+      width: 22px;
+      height: 22px;
+      border-radius: 3px;
+      padding: 0;
+      font-size: 14px;
+      line-height: 1;
+      margin-left: 4px;
+    }
+    .incident-eject-btn:hover {
+      border-color: #c8102e;
+      color: #c8102e;
+    }
+    .alert-select-cb {
+      width: 16px;
+      height: 16px;
+      cursor: pointer;
+      flex-shrink: 0;
+      margin-right: 6px;
+    }
+    /* AI cluster review modal */
+    .ai-cluster-proposal {
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: rgba(0,0,0,0.05);
+    }
+    .ai-cluster-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .ai-cluster-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      flex: 1;
+      min-width: 0;
+    }
+    .ai-cluster-checkbox input { cursor: pointer; flex-shrink: 0; }
+    .ai-cluster-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .ai-cluster-count {
+      font-family: var(--cond);
+      font-size: 11px;
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: 0.07em;
+    }
+    .ai-cluster-reasoning {
+      font-size: 11px;
+      color: var(--textdim);
+      font-style: italic;
+      margin-bottom: 8px;
+      line-height: 1.4;
+    }
+    .ai-cluster-alerts {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .ai-cluster-alert {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 3px;
+      background: rgba(0,0,0,0.04);
+    }
+    .ai-cluster-host {
+      font-family: var(--mono, monospace);
+      font-weight: 600;
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+    .ai-cluster-msg {
+      color: var(--textmid);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
@@ -5950,6 +6571,44 @@ function showVerifyResultModal({ ghosts, newOnes, freshTotal, fresh }) {
   }
 }
 
+function injectAlertGroupingToggle() {
+  if (document.getElementById('alertGroupToggleBlock')) return;
+  const saveBtn = document.getElementById('savePrefsBtn');
+  if (!saveBtn) return;
+  const container = saveBtn.parentElement;
+  if (!container) return;
+
+  const groupOn = state.settings.groupAlerts === true;
+
+  const block = document.createElement('div');
+  block.id = 'alertGroupToggleBlock';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(224,123,0,0.04)';
+  block.innerHTML = `
+    <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">⚡ ALERT GROUPING</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
+      <input type="checkbox" id="set-groupAlerts" ${groupOn?'checked':''} style="cursor:pointer" />
+      <span>Group related alerts as incidents</span>
+    </label>
+    <div style="font-size:11px;color:var(--textdim);margin-top:4px;line-height:1.5">When enabled, alerts at the same site with the same monitor type firing within 5 minutes are clustered into incidents. You can also manually group alerts or use AI detection. Off by default.</div>
+  `;
+  container.insertBefore(block, saveBtn);
+
+  document.getElementById('set-groupAlerts')?.addEventListener('change', e => {
+    const on = !!e.target.checked;
+    saveSettings({ groupAlerts: on });
+    if (on) {
+      // Run clustering immediately if turning on
+      pruneEmptyIncidents();
+      runRuleBasedClustering();
+      showToast('✓ Alert grouping ON — incidents clustered', 'ok');
+    } else {
+      // Don't delete incidents, just stop showing them — turning back on later will surface them again
+      showToast('✓ Alert grouping OFF', 'ok');
+    }
+    renderAlertList();
+  });
+}
+
 function injectAiContextToggles() {
   if (document.getElementById('aiCtxToggleBlock')) return;
   // Anchor on the Save Preferences button — it's a reliable marker for the prefs card
@@ -6013,6 +6672,7 @@ async function boot() {
   registerSW();
   loadSettings();
   injectAiContextToggles();
+  injectAlertGroupingToggle();
   injectClientsViewAndNav();
   injectVerifyButton();
   applyMode(LS.get('msp_lightmode', false));
