@@ -313,6 +313,8 @@ function normalizeAlert(raw) {
 }
 
 // Debug helper — paste in console: debugAlert()
+// Also expose state itself on window so you can poke at it from the console.
+window.state = state;
 window.debugAlert = () => {
   const a = window._lastAlert;
   if (!a) { console.log('No alert selected yet'); return; }
