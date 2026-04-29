@@ -5139,6 +5139,8 @@ function injectTierAStyles() {
       display: none;
     }
     /* Clients view */
+    #view-clients { display: none; }
+    #view-clients.active { display: flex; flex-direction: column; flex: 1 1 0%; overflow-y: auto; }
     .clients-wrap { padding: 16px; max-width: 1200px; }
     .clients-header {
       display: flex;
@@ -5353,32 +5355,49 @@ function injectTierAStyles() {
 function injectClientsViewAndNav() {
   // Inject the view container if not present (renderClientsView writes into #view-clients)
   if (!document.getElementById('view-clients')) {
-    const main = document.querySelector('.app-main') || document.querySelector('main') || document.body;
+    // Find the parent of an existing view to put our new view alongside
+    const sibling = document.getElementById('view-tickets')
+                 || document.getElementById('view-dashboard')
+                 || document.getElementById('view-alerts');
     const div = document.createElement('div');
     div.id = 'view-clients';
-    div.className = 'view';
-    div.style.cssText = 'display:none;flex:1;overflow-y:auto';
-    // Insert near other views — append to main
-    main.appendChild(div);
+    div.className = 'view'; // .active class is toggled by setView; CSS in main.css controls display
+    if (sibling?.parentNode) {
+      sibling.parentNode.appendChild(div);
+    } else {
+      (document.querySelector('main') || document.body).appendChild(div);
+    }
   }
-  // Inject the nav button next to the Tickets nav item, before KB
+  // Inject the nav button between Tickets and KB
   const tickets = document.querySelector('.nav-item[data-view="tickets"]');
-  const kb = document.querySelector('.nav-item[data-view="kb"]');
   if (!tickets || document.querySelector('.nav-item[data-view="clients"]')) return;
-  const navItem = document.createElement('div');
-  navItem.className = 'nav-item';
+  // Clone the Tickets nav for identical structural CSS, then replace its label and icon.
+  const navItem = tickets.cloneNode(true);
   navItem.dataset.view = 'clients';
-  // Mirror the existing nav-item structure — peek at an existing one for class names
-  navItem.innerHTML = tickets.innerHTML
-    .replace(/[A-Z][A-Z\s]+/, 'CLIENTS')
-    .replace(/[\u{1F4C8}-\u{1F4FF}]|🎫|⚡|📊|📚|⚙|👥/gu, '👥');
-  // Fallback if the regex match was weird — just set sensible content
-  if (!navItem.textContent.toUpperCase().includes('CLIENT')) {
-    navItem.innerHTML = '<span style="margin-right:8px">👥</span><span>CLIENTS</span>';
-    navItem.style.cssText = 'display:flex;align-items:center;padding:12px 16px;cursor:pointer;font-family:var(--cond,sans-serif);font-weight:700;letter-spacing:0.08em';
+  navItem.classList.remove('active');
+  // Remove any badge counts that came along with the clone
+  navItem.querySelectorAll('.nav-badge, [class*="badge"], [class*="count"]').forEach(el => el.remove());
+  // Replace the text node(s). Walk children and find/replace text content.
+  const setLabel = (root, label) => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeValue.trim()) { node.nodeValue = label; return true; }
+    }
+    return false;
+  };
+  setLabel(navItem, 'CLIENTS');
+  // Replace icon — cloned tickets has its own SVG/icon. Replace the first SVG or icon-bearing element.
+  const icon = navItem.querySelector('svg, i, [class*="icon"], [class*="lucide"]');
+  if (icon) {
+    const span = document.createElement('span');
+    span.textContent = '👥';
+    span.style.cssText = 'font-size:16px;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px';
+    icon.parentNode.replaceChild(span, icon);
   }
   navItem.addEventListener('click', () => setView('clients'));
   // Insert after Tickets, before KB if KB exists
+  const kb = document.querySelector('.nav-item[data-view="kb"]');
   if (kb && kb.parentNode === tickets.parentNode) {
     tickets.parentNode.insertBefore(navItem, kb);
   } else {
