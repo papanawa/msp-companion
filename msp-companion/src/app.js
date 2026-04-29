@@ -13,6 +13,11 @@ const state = {
   alertFilter: 'all', alertClient: 'all', settings: {},
   ticketStatusFilter: 'active', ticketShowStale: false,
   reportsRange: 30, reportsResolvedTickets: null, reportsResolvedAlerts: null,
+  clients: null,                      // unified client list (AT companies + Datto sites)
+  currentClient: null,                // currently-viewed client object
+  clientDevicesCache: {},             // siteUid → { devices, fetchedAt }
+  clientResolvedCache: null,          // { items, fetchedAt } — resolved tickets last 14d
+  drillPanel: null,                   // active drill-down panel state
   autoRefreshTimer: null,
 };
 
@@ -2666,6 +2671,430 @@ function startAutoRefresh() {
   state.autoRefreshTimer = setInterval(()=>refreshAll(), mins*60000);
 }
 
+// ─── CLIENT HEALTH DASHBOARD ──────────────────────────────────────
+const CLIENT_RESOLVED_CACHE_TTL = 5 * 60 * 1000;
+const CLIENT_DEVICES_CACHE_TTL = 30 * 60 * 1000;
+
+async function fetchAllAtCompanies() {
+  // Pulls every active company so quiet clients show up in the list
+  try {
+    const data = await atFetch('/Companies/query', 'POST', {
+      MaxRecords: 500,
+      filter: [{ op: 'eq', field: 'isActive', value: true }],
+      IncludeFields: ['id', 'companyName', 'companyType', 'phone', 'city', 'state'],
+    });
+    return (data?.items || []).map(c => ({
+      atId: c.id,
+      name: c.companyName,
+      city: c.city,
+      stateAbbr: c.state,
+      phone: c.phone,
+      companyType: c.companyType,
+    }));
+  } catch(e) { console.warn('Companies fetch failed:', e.message); return []; }
+}
+
+async function fetchAllDattoSites() {
+  // Datto's /account/sites returns every site
+  try {
+    const data = await dattoFetch('/account/sites');
+    return (data?.sites || data?.items || []).map(s => ({
+      siteUid: s.uid || s.id,
+      name: s.name,
+      numberOfOpenAlerts: s.numberOfOpenAlerts,
+      numberOfOpenCriticalAlerts: s.numberOfOpenCriticalAlerts,
+      numberOfDevices: s.numberOfDevices,
+      numberOfOnlineDevices: s.numberOfOnlineDevices,
+      numberOfOfflineDevices: s.numberOfOfflineDevices,
+    }));
+  } catch(e) { console.warn('Datto sites fetch failed:', e.message); return []; }
+}
+
+function buildUnifiedClientList(atCompanies, dattoSites) {
+  // Match Datto sites to AT companies by name (case-insensitive). Unmatched ones still appear.
+  const byName = {};
+  atCompanies.forEach(c => {
+    const key = (c.name || '').toLowerCase().trim();
+    if (!key) return;
+    byName[key] = { name: c.name, atId: c.atId, city: c.city, stateAbbr: c.stateAbbr, phone: c.phone };
+  });
+  dattoSites.forEach(s => {
+    const key = (s.name || '').toLowerCase().trim();
+    if (!key) return;
+    if (byName[key]) {
+      Object.assign(byName[key], {
+        siteUid: s.siteUid,
+        dattoOpenAlerts: s.numberOfOpenAlerts,
+        dattoCriticalAlerts: s.numberOfOpenCriticalAlerts,
+        dattoDeviceCount: s.numberOfDevices,
+        dattoOnline: s.numberOfOnlineDevices,
+        dattoOffline: s.numberOfOfflineDevices,
+      });
+    } else {
+      byName[key] = {
+        name: s.name,
+        siteUid: s.siteUid,
+        dattoOpenAlerts: s.numberOfOpenAlerts,
+        dattoCriticalAlerts: s.numberOfOpenCriticalAlerts,
+        dattoDeviceCount: s.numberOfDevices,
+        dattoOnline: s.numberOfOnlineDevices,
+        dattoOffline: s.numberOfOfflineDevices,
+      };
+    }
+  });
+  return Object.values(byName).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+}
+
+async function loadClients(force = false) {
+  if (state.clients && !force) return state.clients;
+  const [atCompanies, dattoSites] = await Promise.all([
+    fetchAllAtCompanies(),
+    fetchAllDattoSites(),
+  ]);
+  state.clients = buildUnifiedClientList(atCompanies, dattoSites);
+  // Refresh atCompanyCache too — useful elsewhere
+  atCompanies.forEach(c => { if (c.atId) atCompanyCache[c.atId] = c.name; });
+  LS.set('msp_at_companies', atCompanyCache);
+  return state.clients;
+}
+
+function getClientOpenAlerts(client) {
+  if (!client?.name) return [];
+  return state.alerts.filter(a => (a.siteName || '').toLowerCase() === client.name.toLowerCase());
+}
+
+function getClientOpenTickets(client) {
+  if (!client) return [];
+  return Object.values(state.tickets).filter(t => {
+    if (t.isDone) return false;
+    if (client.atId && t.companyID === client.atId) return true;
+    if (client.name && t.companyName && t.companyName.toLowerCase() === client.name.toLowerCase()) return true;
+    return false;
+  });
+}
+
+async function getClientResolvedTickets(client, days = 14) {
+  if (!client) return [];
+  // Reuse the reports cache pattern — pull last 14d resolved tickets, filter to this client
+  if (!state.clientResolvedCache ||
+      Date.now() - state.clientResolvedCache.fetchedAt > CLIENT_RESOLVED_CACHE_TTL) {
+    state.clientResolvedCache = {
+      items: await fetchResolvedTicketsForReports(days),
+      fetchedAt: Date.now(),
+    };
+  }
+  const all = state.clientResolvedCache.items || [];
+  return all.filter(t => {
+    if (client.atId && t.companyID === client.atId) return true;
+    return false;
+  });
+}
+
+async function fetchClientDevices(client) {
+  if (!client?.siteUid) return [];
+  const cached = state.clientDevicesCache[client.siteUid];
+  if (cached && Date.now() - cached.fetchedAt < CLIENT_DEVICES_CACHE_TTL) return cached.devices;
+  try {
+    const data = await dattoFetch(`/site/${client.siteUid}/devices`);
+    const devices = (data?.devices || data?.items || []).map(d => ({
+      uid: d.uid || d.id,
+      id: d.id,
+      hostname: d.hostname || d.description || 'unknown',
+      online: d.online === true || d.online === 'true',
+      lastSeen: d.lastSeen || d.lastSeenDate,
+      operatingSystem: d.operatingSystem || d.osType,
+      type: d.deviceType || d.type,
+    }));
+    state.clientDevicesCache[client.siteUid] = { devices, fetchedAt: Date.now() };
+    return devices;
+  } catch(e) { console.warn('Client devices fetch failed:', e.message); return []; }
+}
+
+function calcClientHealth(client) {
+  const alerts = getClientOpenAlerts(client);
+  const tickets = getClientOpenTickets(client);
+  const hasCriticalAlert = alerts.some(a => a.priority === 'Critical');
+  const hasHighAlert = alerts.some(a => a.priority === 'High');
+  const oldestTicketDays = tickets.reduce((max, t) => {
+    if (!t.createDate) return max;
+    const age = (Date.now() - new Date(t.createDate).getTime()) / 86400000;
+    return age > max ? age : max;
+  }, 0);
+  const offline = client.dattoOffline || 0;
+  if (hasCriticalAlert || oldestTicketDays > 60) {
+    return { level: 'critical', color: '#c8102e', label: 'CRITICAL', icon: '🔴' };
+  }
+  if (hasHighAlert || oldestTicketDays > 14 || offline > 0) {
+    return { level: 'watch', color: '#e07b00', label: 'WATCH', icon: '🟡' };
+  }
+  return { level: 'healthy', color: '#2a9d5c', label: 'HEALTHY', icon: '🟢' };
+}
+
+// ─── DRILL-DOWN PANEL ─────────────────────────────────────────────
+function ensureDrillPanelEl() {
+  let panel = document.getElementById('drillPanel');
+  if (panel) return panel;
+  panel = document.createElement('div');
+  panel.id = 'drillPanel';
+  panel.className = 'drill-panel';
+  panel.innerHTML = `
+    <div class="drill-panel-header">
+      <span class="drill-panel-title" id="drillPanelTitle">—</span>
+      <button class="drill-panel-close" data-action="drill-close" title="Close">×</button>
+    </div>
+    <div class="drill-panel-body" id="drillPanelBody"></div>
+  `;
+  document.body.appendChild(panel);
+  return panel;
+}
+
+function openDrillPanel(title, bodyHtml) {
+  const panel = ensureDrillPanelEl();
+  document.getElementById('drillPanelTitle').textContent = title;
+  document.getElementById('drillPanelBody').innerHTML = bodyHtml;
+  panel.classList.add('open');
+  state.drillPanel = { open: true, title };
+}
+
+function closeDrillPanel() {
+  const panel = document.getElementById('drillPanel');
+  if (panel) panel.classList.remove('open');
+  state.drillPanel = null;
+}
+
+function drillTicketRows(tickets) {
+  if (!tickets.length) return '<div class="drill-empty">No tickets to show.</div>';
+  return tickets.map(t => {
+    const ageDays = t.createDate ? Math.floor((Date.now() - new Date(t.createDate).getTime()) / 86400000) : null;
+    return `<div class="drill-row" data-action="drill-open-ticket" data-ticket-number="${esc(t.ticketNumber || '')}">
+      <div class="drill-row-main">
+        <span class="drill-tn">${esc(t.ticketNumber || '')}</span>
+        <span class="drill-title">${esc(t.title || '(no title)')}</span>
+      </div>
+      <div class="drill-row-meta">
+        ${t.statusLabel ? `<span class="drill-pill" style="color:${t.statusColor||'var(--textdim)'};border-color:${t.statusColor||'var(--border)'}44">${esc(t.statusLabel)}</span>` : ''}
+        <span class="drill-tech">${esc(t.assignedResourceName || 'Unassigned')}</span>
+        ${ageDays != null ? `<span class="drill-age">${ageDays}d</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function drillAlertRows(alerts) {
+  if (!alerts.length) return '<div class="drill-empty">No alerts to show.</div>';
+  return alerts.map(a => {
+    const sv = SEV[a.priority] || SEV.Information;
+    return `<div class="drill-row" data-action="drill-open-alert" data-alert-uid="${esc(a.alertUid)}">
+      <div class="drill-row-main">
+        <span class="drill-tn">${esc(a.hostname)}</span>
+        <span class="drill-title">${esc(a.alertMessage || '')}</span>
+      </div>
+      <div class="drill-row-meta">
+        <span class="drill-pill" style="color:${sv.color};border-color:${sv.color}55">${esc(a.priority)}</span>
+        <span class="drill-tech">${esc(a.monitorType || '')}</span>
+        ${a.ticketNumber ? `<span class="drill-age">${esc(a.ticketNumber)}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function drillDeviceRows(devices) {
+  if (!devices.length) return '<div class="drill-empty">No devices to show.</div>';
+  return devices.map(d => {
+    const onlineColor = d.online ? '#2a9d5c' : '#c8102e';
+    return `<div class="drill-row">
+      <div class="drill-row-main">
+        <span class="drill-tn">${esc(d.hostname)}</span>
+        <span class="drill-title">${esc(d.operatingSystem || '')}</span>
+      </div>
+      <div class="drill-row-meta">
+        <span class="drill-pill" style="color:${onlineColor};border-color:${onlineColor}55">${d.online?'ONLINE':'OFFLINE'}</span>
+        ${d.lastSeen ? `<span class="drill-age">${esc(fmtRelativeTime(d.lastSeen))}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ─── CLIENT LIST + DETAIL VIEWS ───────────────────────────────────
+async function renderClientsView() {
+  const root = document.getElementById('view-clients');
+  if (!root) return;
+
+  if (state.currentClient) {
+    return renderClientDetail(state.currentClient);
+  }
+
+  root.innerHTML = `
+    <div class="clients-wrap">
+      <div class="clients-header">
+        <div class="clients-title">👥 Clients</div>
+        <input id="clientSearch" type="text" placeholder="Filter clients..." class="clients-search" />
+        <button class="reports-range-btn" data-action="clients-refresh" title="Refresh client list">↺</button>
+      </div>
+      <div id="clientsListBody"><div class="loading-state">Loading clients...</div></div>
+    </div>
+  `;
+
+  try {
+    const clients = await loadClients();
+    renderClientsListBody(clients, '');
+  } catch(e) {
+    document.getElementById('clientsListBody').innerHTML = `<div class="loading-state" style="color:#c8102e">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderClientsListBody(clients, filter) {
+  const body = document.getElementById('clientsListBody');
+  if (!body) return;
+  const f = (filter || '').toLowerCase().trim();
+  const filtered = f
+    ? clients.filter(c => (c.name || '').toLowerCase().includes(f))
+    : clients;
+  if (!filtered.length) {
+    body.innerHTML = '<div class="loading-state">No clients match.</div>';
+    return;
+  }
+  body.innerHTML = filtered.map(c => {
+    const health = calcClientHealth(c);
+    const alertsN = getClientOpenAlerts(c).length;
+    const ticketsN = getClientOpenTickets(c).length;
+    const offline = c.dattoOffline || 0;
+    return `<div class="client-row" data-action="open-client" data-client-name="${esc(c.name)}">
+      <div class="client-row-left">
+        <span class="client-health" style="color:${health.color}" title="${health.label}">${health.icon}</span>
+        <span class="client-name">${esc(c.name)}</span>
+        ${c.city ? `<span class="client-city">${esc(c.city)}${c.stateAbbr?', '+esc(c.stateAbbr):''}</span>` : ''}
+      </div>
+      <div class="client-row-right">
+        ${alertsN ? `<span class="client-stat client-stat-alerts">${alertsN} alerts</span>` : ''}
+        ${ticketsN ? `<span class="client-stat client-stat-tickets">${ticketsN} tickets</span>` : ''}
+        ${offline ? `<span class="client-stat client-stat-offline">${offline} offline</span>` : ''}
+        ${c.dattoDeviceCount != null ? `<span class="client-stat client-stat-devices">${c.dattoDeviceCount} devices</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function renderClientDetail(client) {
+  const root = document.getElementById('view-clients');
+  if (!root) return;
+  const health = calcClientHealth(client);
+  const openAlerts = getClientOpenAlerts(client);
+  const openTickets = getClientOpenTickets(client);
+  const criticalAlerts = openAlerts.filter(a => a.priority === 'Critical');
+  const highAlerts = openAlerts.filter(a => a.priority === 'High');
+  const otherAlerts = openAlerts.filter(a => !['Critical','High'].includes(a.priority));
+  const aging = openTickets.filter(t => t.createDate && (Date.now() - new Date(t.createDate).getTime()) > 14 * 86400000);
+  const zone = state.settings.atZone || '14';
+  const atUrl = client.atId ? `https://ww${zone}.autotask.net/Mvc/CRM/AccountDetails.mvc?accountId=${client.atId}` : null;
+  const dattoUrl = client.siteUid ? `${getDattoUiBaseUrl()}/site/${client.siteUid}` : null;
+
+  root.innerHTML = `
+    <div class="clients-wrap">
+      <div class="clients-header" style="margin-bottom:14px">
+        <button class="abtn abtn-ghost" data-action="back-to-clients" style="margin-right:8px">← Back</button>
+        <div class="clients-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="color:${health.color}">${health.icon}</span>
+          <span>${esc(client.name)}</span>
+          <span class="health-badge" style="color:${health.color};background:${health.color}22;border:1px solid ${health.color}44">${health.label}</span>
+        </div>
+        <div style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          ${atUrl ? `<a href="${esc(atUrl)}" target="_blank" rel="noopener" class="reports-range-btn">🎫 Open in Autotask</a>` : ''}
+          ${dattoUrl ? `<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="reports-range-btn">📟 Open in Datto</a>` : ''}
+          <button class="reports-range-btn" data-action="client-refresh" data-client-name="${esc(client.name)}" title="Refresh">↺</button>
+        </div>
+      </div>
+
+      <div class="reports-stats">
+        <div class="reports-stat-card client-drill" data-action="drill" data-drill="open-alerts" data-client-name="${esc(client.name)}">
+          <div class="reports-stat-label">OPEN ALERTS</div>
+          <div class="reports-stat-value" style="color:${openAlerts.length?'#e07b00':'var(--text)'}">${openAlerts.length}</div>
+          <div class="reports-stat-sub">${criticalAlerts.length} crit · ${highAlerts.length} high · ${otherAlerts.length} other</div>
+        </div>
+        <div class="reports-stat-card client-drill" data-action="drill" data-drill="open-tickets" data-client-name="${esc(client.name)}">
+          <div class="reports-stat-label">OPEN TICKETS</div>
+          <div class="reports-stat-value">${openTickets.length}</div>
+          <div class="reports-stat-sub">${aging.length} aging > 14d</div>
+        </div>
+        <div class="reports-stat-card client-drill" data-action="drill" data-drill="aging-tickets" data-client-name="${esc(client.name)}">
+          <div class="reports-stat-label">AGING TICKETS</div>
+          <div class="reports-stat-value" style="color:${aging.length?'#e07b00':'var(--text)'}">${aging.length}</div>
+          <div class="reports-stat-sub">open > 14 days</div>
+        </div>
+        <div class="reports-stat-card client-drill" data-action="drill" data-drill="devices" data-client-name="${esc(client.name)}">
+          <div class="reports-stat-label">DEVICES</div>
+          <div class="reports-stat-value">${client.dattoDeviceCount != null ? client.dattoDeviceCount : '—'}</div>
+          <div class="reports-stat-sub">${client.dattoOnline != null ? `${client.dattoOnline} online · ${client.dattoOffline||0} offline` : 'no Datto site linked'}</div>
+        </div>
+        <div class="reports-stat-card client-drill" data-action="drill" data-drill="recent-resolutions" data-client-name="${esc(client.name)}">
+          <div class="reports-stat-label">RESOLVED 14D</div>
+          <div class="reports-stat-value" id="clientResolvedCount">…</div>
+          <div class="reports-stat-sub">click to see what we did</div>
+        </div>
+      </div>
+
+      ${criticalAlerts.length ? `<div class="reports-card">
+        <div class="card-label" style="color:#c8102e">🚨 ACTIVE CRITICALS (${criticalAlerts.length})</div>
+        ${drillAlertRows(criticalAlerts)}
+      </div>` : ''}
+
+      ${aging.length ? `<div class="reports-card">
+        <div class="card-label" style="color:#e07b00">🕐 AGING TICKETS</div>
+        ${drillTicketRows(aging.slice(0, 10))}
+        ${aging.length > 10 ? `<div class="aging-more">+ ${aging.length - 10} more (click stat above to see all)</div>` : ''}
+      </div>` : ''}
+
+      ${client.phone || client.city ? `<div class="reports-card">
+        <div class="card-label">CONTACT INFO</div>
+        <div class="meta-grid">
+          ${client.phone ? `<div class="meta-cell"><div class="meta-label">PHONE</div><div class="meta-value">${esc(client.phone)}</div></div>` : ''}
+          ${client.city ? `<div class="meta-cell"><div class="meta-label">CITY</div><div class="meta-value">${esc(client.city)}${client.stateAbbr?', '+esc(client.stateAbbr):''}</div></div>` : ''}
+          ${client.atId ? `<div class="meta-cell"><div class="meta-label">AT ID</div><div class="meta-value">${client.atId}</div></div>` : ''}
+        </div>
+      </div>` : ''}
+    </div>
+  `;
+
+  // Async-fetch resolved count
+  getClientResolvedTickets(client).then(items => {
+    const el = document.getElementById('clientResolvedCount');
+    if (el) el.textContent = items.length;
+  });
+}
+
+async function handleClientDrill(drill, clientName) {
+  const client = (state.clients || []).find(c => c.name === clientName);
+  if (!client) return;
+  if (drill === 'open-alerts') {
+    openDrillPanel(`Open alerts — ${client.name}`, drillAlertRows(getClientOpenAlerts(client)));
+  } else if (drill === 'open-tickets') {
+    openDrillPanel(`Open tickets — ${client.name}`, drillTicketRows(getClientOpenTickets(client)));
+  } else if (drill === 'aging-tickets') {
+    const aging = getClientOpenTickets(client).filter(t => t.createDate && (Date.now() - new Date(t.createDate).getTime()) > 14 * 86400000)
+      .sort((a, b) => new Date(a.createDate).getTime() - new Date(b.createDate).getTime());
+    openDrillPanel(`Aging tickets — ${client.name}`, drillTicketRows(aging));
+  } else if (drill === 'devices') {
+    openDrillPanel(`Devices — ${client.name}`, '<div class="loading-state">Loading from Datto...</div>');
+    const devices = await fetchClientDevices(client);
+    devices.sort((a, b) => Number(a.online) - Number(b.online)); // offline first
+    openDrillPanel(`Devices — ${client.name} (${devices.filter(d=>!d.online).length} offline)`, drillDeviceRows(devices));
+  } else if (drill === 'recent-resolutions') {
+    openDrillPanel(`Resolved last 14d — ${client.name}`, '<div class="loading-state">Loading...</div>');
+    const items = await getClientResolvedTickets(client);
+    // Items don't have all the fields used by drillTicketRows; reshape
+    const reshaped = items.map(t => ({
+      ticketNumber: t.ticketNumber,
+      title: t.title,
+      statusLabel: 'Complete',
+      statusColor: '#2a9d5c',
+      assignedResourceName: state.atResources.find(r => r.id === t.assignedResourceID)?.name || 'Unassigned',
+      createDate: t.createDate,
+    }));
+    openDrillPanel(`Resolved last 14d — ${client.name} (${reshaped.length})`, drillTicketRows(reshaped));
+  }
+}
+
+
 // ─── REPORTS ──────────────────────────────────────────────────────
 const REPORTS_RANGES = [
   { days: 7,  label: '7d' },
@@ -3086,6 +3515,7 @@ function setView(view) {
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
   if (view==='kb') renderKB();
+  if (view==='clients') renderClientsView();
   if (view==='reports') renderReportsView();
   if (view==='settings') {
     populateKnownClients();
@@ -3600,6 +4030,66 @@ function wireEvents() {
       renderReportsView();
     }
 
+    // ─── CLIENTS / DRILL-DOWN HANDLERS ────────────────────────────
+    if (action==='clients-refresh') {
+      state.clients = null;
+      state.clientResolvedCache = null;
+      renderClientsView();
+    }
+    if (action==='open-client') {
+      const name = el.dataset.clientName;
+      const client = (state.clients || []).find(c => c.name === name);
+      if (!client) return;
+      state.currentClient = client;
+      renderClientDetail(client);
+    }
+    if (action==='back-to-clients') {
+      state.currentClient = null;
+      closeDrillPanel();
+      renderClientsView();
+    }
+    if (action==='client-refresh') {
+      const name = el.dataset.clientName;
+      const client = (state.clients || []).find(c => c.name === name);
+      if (!client) return;
+      state.clientResolvedCache = null;
+      if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
+      renderClientDetail(client);
+    }
+    if (action==='drill') {
+      const drill = el.dataset.drill;
+      const name = el.dataset.clientName;
+      await handleClientDrill(drill, name);
+    }
+    if (action==='drill-close') {
+      closeDrillPanel();
+    }
+    if (action==='drill-open-ticket') {
+      const tn = el.dataset.ticketNumber;
+      const ticket = state.tickets[tn];
+      if (!ticket) {
+        showToast(`Ticket ${tn} not in cache. Try Tickets → Refresh.`, 'info');
+        return;
+      }
+      closeDrillPanel();
+      state.currentTicket = ticket;
+      setView('tickets');
+      renderTicketDetail(ticket);
+      renderTicketList();
+    }
+    if (action==='drill-open-alert') {
+      const uid = el.dataset.alertUid;
+      const alert = state.alerts.find(a => a.alertUid === uid);
+      if (!alert) {
+        showToast('Alert not in cache.', 'info');
+        return;
+      }
+      closeDrillPanel();
+      state.currentAlert = alert;
+      setView('alerts');
+      renderAlertDetail(alert);
+    }
+
     if (action==='jump-to-ticket') {
       const tid = el.dataset.ticketId;
       const ticket = Object.values(state.tickets).find(t => String(t.id) === tid);
@@ -3745,6 +4235,10 @@ function wireEvents() {
       const tid = e.target.dataset.ticketId, msg = e.target.value.trim();
       if (tid && msg) sendTicketChat(tid, msg);
     }
+    // ESC closes drill panel if open
+    if (e.key === 'Escape' && state.drillPanel?.open) {
+      closeDrillPanel();
+    }
   });
 
   // Notes autosave
@@ -3764,6 +4258,10 @@ function wireEvents() {
         clearTimeout(window._techCtxSaveTimer);
         window._techCtxSaveTimer = setTimeout(() => LS.set('msp_notes', state.notesDrafts), 400);
       }
+    }
+    // Client list filter
+    if (e.target.id === 'clientSearch') {
+      renderClientsListBody(state.clients || [], e.target.value);
     }
     // Investigation per-step autosave (text / notes / minutes)
     const invField = e.target.dataset?.action;
@@ -4640,11 +5138,254 @@ function injectTierAStyles() {
     .inv-chat-section .chat-history:empty {
       display: none;
     }
+    /* Clients view */
+    .clients-wrap { padding: 16px; max-width: 1200px; }
+    .clients-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .clients-title {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+    }
+    .clients-search {
+      flex: 1;
+      min-width: 200px;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .clients-search:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .client-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      padding: 10px 14px;
+      margin-bottom: 6px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s, transform 0.1s;
+      flex-wrap: wrap;
+    }
+    .client-row:hover {
+      border-color: var(--accent);
+      background: rgba(0,180,216,0.04);
+    }
+    .client-row:active { transform: scale(0.998); }
+    .client-row-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      min-width: 0;
+    }
+    .client-health { font-size: 14px; }
+    .client-name {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .client-city {
+      font-size: 11px;
+      color: var(--textdim);
+    }
+    .client-row-right {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .client-stat {
+      font-family: var(--cond);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 3px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      color: var(--textdim);
+    }
+    .client-stat-alerts { color: #e07b00; border-color: rgba(224,123,0,0.4); background: rgba(224,123,0,0.08); }
+    .client-stat-tickets { color: var(--accent); border-color: rgba(0,180,216,0.35); background: rgba(0,180,216,0.06); }
+    .client-stat-offline { color: #c8102e; border-color: rgba(200,16,46,0.4); background: rgba(200,16,46,0.08); }
+    .client-stat-devices { color: var(--textmid); }
+    .health-badge {
+      font-family: var(--cond);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      padding: 3px 8px;
+      border-radius: 3px;
+    }
+    .client-drill {
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .client-drill:hover {
+      border-color: var(--accent);
+      background: rgba(0,180,216,0.04);
+    }
+    /* Drill panel */
+    .drill-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 460px;
+      max-width: 100%;
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      box-shadow: -4px 0 20px rgba(0,0,0,0.3);
+      transform: translateX(100%);
+      transition: transform 0.25s cubic-bezier(0.2, 0, 0.2, 1);
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+    }
+    .drill-panel.open { transform: translateX(0); }
+    @media (max-width: 600px) {
+      .drill-panel { width: 100%; }
+    }
+    .drill-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .drill-panel-title {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      color: var(--text);
+    }
+    .drill-panel-close {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textmid);
+      width: 28px; height: 28px;
+      border-radius: 4px;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .drill-panel-close:hover { border-color: var(--accent); color: var(--text); }
+    .drill-panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 14px;
+    }
+    .drill-row {
+      padding: 9px 10px;
+      margin-bottom: 4px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .drill-row:hover {
+      border-color: var(--accent);
+      background: rgba(0,180,216,0.04);
+    }
+    .drill-row-main {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      margin-bottom: 4px;
+    }
+    .drill-tn {
+      font-family: var(--cond);
+      font-weight: 700;
+      font-size: 12px;
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+    .drill-title {
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.4;
+    }
+    .drill-row-meta {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 11px;
+    }
+    .drill-pill {
+      font-family: var(--cond);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      padding: 2px 6px;
+      border: 1px solid;
+      border-radius: 3px;
+    }
+    .drill-tech { color: var(--textmid); }
+    .drill-age { color: var(--textdim); font-family: var(--cond); font-weight: 700; }
+    .drill-empty {
+      padding: 20px;
+      text-align: center;
+      color: var(--textdim);
+      font-size: 13px;
+    }
   `;
   document.head.appendChild(style);
 }
 
 // ─── AI CONTEXT TOGGLES (injected into Preferences card at boot) ─
+// ─── CLIENTS NAV + VIEW INJECTION ─────────────────────────────────
+function injectClientsViewAndNav() {
+  // Inject the view container if not present (renderClientsView writes into #view-clients)
+  if (!document.getElementById('view-clients')) {
+    const main = document.querySelector('.app-main') || document.querySelector('main') || document.body;
+    const div = document.createElement('div');
+    div.id = 'view-clients';
+    div.className = 'view';
+    div.style.cssText = 'display:none;flex:1;overflow-y:auto';
+    // Insert near other views — append to main
+    main.appendChild(div);
+  }
+  // Inject the nav button next to the Tickets nav item, before KB
+  const tickets = document.querySelector('.nav-item[data-view="tickets"]');
+  const kb = document.querySelector('.nav-item[data-view="kb"]');
+  if (!tickets || document.querySelector('.nav-item[data-view="clients"]')) return;
+  const navItem = document.createElement('div');
+  navItem.className = 'nav-item';
+  navItem.dataset.view = 'clients';
+  // Mirror the existing nav-item structure — peek at an existing one for class names
+  navItem.innerHTML = tickets.innerHTML
+    .replace(/[A-Z][A-Z\s]+/, 'CLIENTS')
+    .replace(/[\u{1F4C8}-\u{1F4FF}]|🎫|⚡|📊|📚|⚙|👥/gu, '👥');
+  // Fallback if the regex match was weird — just set sensible content
+  if (!navItem.textContent.toUpperCase().includes('CLIENT')) {
+    navItem.innerHTML = '<span style="margin-right:8px">👥</span><span>CLIENTS</span>';
+    navItem.style.cssText = 'display:flex;align-items:center;padding:12px 16px;cursor:pointer;font-family:var(--cond,sans-serif);font-weight:700;letter-spacing:0.08em';
+  }
+  navItem.addEventListener('click', () => setView('clients'));
+  // Insert after Tickets, before KB if KB exists
+  if (kb && kb.parentNode === tickets.parentNode) {
+    tickets.parentNode.insertBefore(navItem, kb);
+  } else {
+    tickets.parentNode.insertBefore(navItem, tickets.nextSibling);
+  }
+}
+
 function injectAiContextToggles() {
   if (document.getElementById('aiCtxToggleBlock')) return;
   // Anchor on the Save Preferences button — it's a reliable marker for the prefs card
@@ -4708,6 +5449,7 @@ async function boot() {
   registerSW();
   loadSettings();
   injectAiContextToggles();
+  injectClientsViewAndNav();
   applyMode(LS.get('msp_lightmode', false));
   const lastView = LS.get('msp_view','dashboard');
   setView(lastView);
