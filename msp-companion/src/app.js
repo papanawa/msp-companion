@@ -3875,6 +3875,15 @@ function renderTicketDetail(ticket) {
   const atBase=`https://ww${zone}.autotask.net/Autotask/AutotaskExtend/ExecuteCommand.aspx`;
   const tUrl=`${atBase}?Code=OpenTicketDetail&TicketNumber=${encodeURIComponent(ticket.ticketNumber)}`;
 
+  // Start the timer BEFORE building HTML — so the time badge renders with the active state
+  // (only if there's an investigation; otherwise nothing to track).
+  // Don't restart if it's already running on this ticket, and don't auto-resume if user has paused.
+  if (getInvestigation(ticket.id) && !isTimerActiveFor(ticket.id) && !isTimerPausedFor(ticket.id)) {
+    startTicketTimer(ticket.id);
+  } else if (!getInvestigation(ticket.id)) {
+    stopTicketTimer();
+  }
+
   // Kick off picklist loads in parallel — rebuild when each resolves
   loadAtStatusPicklist().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
   loadAtPriorityPicklist().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
@@ -4022,12 +4031,6 @@ function renderTicketDetail(ticket) {
   if (state.ticketChatHistories[String(ticket.id)]?.length) {
     renderTicketChatHistory(ticket.id);
     const h = $('ticketChatHistory'); if (h) h.scrollTop = h.scrollHeight;
-  }
-  // Start the time tracker for this ticket (only if it has an investigation)
-  if (getInvestigation(ticket.id)) {
-    startTicketTimer(ticket.id);
-  } else {
-    stopTicketTimer();
   }
 }
 
@@ -8634,7 +8637,7 @@ function injectAlertGroupingToggle() {
 
   const block = document.createElement('div');
   block.id = 'alertGroupToggleBlock';
-  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(224,123,0,0.04)';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;width:100%;flex:1 1 100%;box-sizing:border-box;background:rgba(224,123,0,0.04)';
   block.innerHTML = `
     <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">⚡ ALERT GROUPING</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
@@ -8769,7 +8772,7 @@ function injectCriticalPromptSettings() {
 
   const block = document.createElement('div');
   block.id = 'criticalPromptBlock';
-  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(200,16,46,0.04)';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;width:100%;flex:1 1 100%;box-sizing:border-box;background:rgba(200,16,46,0.04)';
   block.innerHTML = `
     <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">⚠ CRITICAL ALERT PROMPTS</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
@@ -8850,7 +8853,7 @@ function injectBackupRestore() {
 
   const block = document.createElement('div');
   block.id = 'backupRestoreBlock';
-  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(42,157,92,0.04)';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;width:100%;flex:1 1 100%;box-sizing:border-box;background:rgba(42,157,92,0.04)';
   block.innerHTML = `
     <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">💾 BACKUP & RESTORE</div>
     <div style="font-size:11px;color:var(--textdim);margin-bottom:10px;line-height:1.5">
@@ -8929,7 +8932,7 @@ function injectAiContextToggles() {
 
   const block = document.createElement('div');
   block.id = 'aiCtxToggleBlock';
-  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(0,180,216,0.04)';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;width:100%;flex:1 1 100%;box-sizing:border-box;background:rgba(0,180,216,0.04)';
   block.innerHTML = `
     <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">★ AI CONTEXT ENRICHMENT</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
