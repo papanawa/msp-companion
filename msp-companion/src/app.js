@@ -3653,6 +3653,39 @@ async function refreshAll() {
     runRuleBasedClustering();
     const sites = await fetchSites();
     state.sites = sites;
+
+    // Pull the full active ticket list — same logic as the Tickets-tab refresh.
+    // Without this, refreshAll only knows about tickets that are linked to an alert.
+    if (state.settings.atUser) {
+      try {
+        const ticketItems = await fetchAtTicketQueue();
+        // Preserve tickets linked to alerts even if outside the active query window
+        const linkedTicketNumbers = new Set(alerts.map(a => a.ticketNumber).filter(Boolean));
+        const preserved = {};
+        linkedTicketNumbers.forEach(tn => {
+          if (state.tickets[tn]) preserved[tn] = state.tickets[tn];
+        });
+        state.tickets = { ...preserved };
+        ticketItems.forEach(t => {
+          state.tickets[t.ticketNumber] = {
+            id:t.id, ticketNumber:t.ticketNumber,
+            status:t.status, statusLabel:t.statusLabel, statusColor:t.statusColor, isDone:t.isDone,
+            priority:t.priority, queueID:t.queueID, billingCodeID:t.billingCodeID,
+            title:t.title, companyID:t.companyID, companyName:t.companyName,
+            lastActivity:t.lastActivityDate, createDate:t.createDate,
+            assignedResourceID:t.assignedResourceID, assignedResourceName:t.assignedResourceName,
+          };
+        });
+        // Sync any preserved-but-not-fresh tickets, including dropping ghosts
+        const freshNumbers = new Set(ticketItems.map(t => t.ticketNumber));
+        const stalePreserved = Object.keys(preserved).filter(tn => !freshNumbers.has(tn));
+        if (stalePreserved.length) {
+          try { await syncTicketStatuses(stalePreserved); } catch(e) { console.warn('Stale preserved sync failed:', e.message); }
+        }
+        LS.set('msp_tickets', state.tickets);
+      } catch(e) { console.warn('Ticket fetch in refreshAll failed:', e.message); }
+    }
+    // Also sync any link-only tickets that came in from alerts (catches edge cases)
     const ticketNumbers = [...new Set(alerts.map(a=>a.ticketNumber).filter(Boolean))];
     if (ticketNumbers.length && state.settings.atUser) await syncTicketStatuses(ticketNumbers);
 
@@ -3669,7 +3702,8 @@ async function refreshAll() {
     LS.set('msp_alerts', alerts);
 
     render();
-    showToast(`✓ Refreshed — ${alerts.length} alerts`,'ok');
+    const ticketCount = Object.keys(state.tickets).length;
+    showToast(`✓ Refreshed — ${alerts.length} alerts, ${ticketCount} tickets`,'ok');
   } catch(e) {
     showToast(`Error: ${e.message}`,'err');
     console.error('Refresh error:', e);
