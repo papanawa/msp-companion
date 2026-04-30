@@ -635,10 +635,11 @@ async function fetchAtTicketActivityNotes(ticketId) {
 }
 
 async function syncTicketStatuses(ticketNumbers) {
-  if (!ticketNumbers?.length) return;
+  if (!ticketNumbers?.length) return { droppedGhosts: [] };
   const pl = await loadAtStatusPicklist();
   const chunks = [];
   for (let i = 0; i < ticketNumbers.length; i += 50) chunks.push(ticketNumbers.slice(i, i+50));
+  const seenInAt = new Set();
   for (const chunk of chunks) {
     try {
       const data = await atFetch('/Tickets/query', 'POST', {
@@ -650,6 +651,7 @@ async function syncTicketStatuses(ticketNumbers) {
       await loadAtCompanyNames(companyIds2);
       const companyNameMap = buildCompanyNameMap();
       (data?.items || []).forEach(t => {
+        seenInAt.add(t.ticketNumber);
         const si = pl[t.status] || { label:`Status ${t.status}`, color:'#8bacc8', done:false };
         state.tickets[t.ticketNumber] = {
           id: t.id, ticketNumber: t.ticketNumber,
@@ -662,7 +664,22 @@ async function syncTicketStatuses(ticketNumbers) {
       });
     } catch(e) { console.warn('Ticket sync chunk failed:', e.message); }
   }
+  // Identify and drop ghost tickets — ones we asked AT about but AT didn't return
+  const droppedGhosts = [];
+  ticketNumbers.forEach(tn => {
+    if (!seenInAt.has(tn) && state.tickets[tn]) {
+      droppedGhosts.push(tn);
+      delete state.tickets[tn];
+      // Also unlink any alerts that pointed to this ghost
+      state.alerts.forEach(a => { if (a.ticketNumber === tn) a.ticketNumber = null; });
+    }
+  });
+  if (droppedGhosts.length) {
+    LS.set('msp_alerts', state.alerts);
+    console.warn(`Dropped ${droppedGhosts.length} ghost tickets no longer in AT:`, droppedGhosts);
+  }
   LS.set('msp_tickets', state.tickets);
+  return { droppedGhosts };
 }
 
 async function loadAtResources() {
@@ -4654,15 +4671,21 @@ function wireEvents() {
           assignedResourceID:t.assignedResourceID,assignedResourceName:t.assignedResourceName,
         };
       });
-      // For preserved tickets not in the fresh items list, refresh their status so mismatches update
+      // For preserved tickets not in the fresh items list, refresh their status so mismatches update.
+      // syncTicketStatuses now drops any preserved ticket AT no longer returns (ghost cleanup).
       const freshNumbers = new Set(items.map(t => t.ticketNumber));
       const stalePreserved = Object.keys(preserved).filter(tn => !freshNumbers.has(tn));
+      let droppedGhosts = [];
       if (stalePreserved.length) {
-        try { await syncTicketStatuses(stalePreserved); } catch(e) { console.warn('Preserved ticket sync failed:', e.message); }
+        try {
+          const result = await syncTicketStatuses(stalePreserved);
+          droppedGhosts = result?.droppedGhosts || [];
+        } catch(e) { console.warn('Preserved ticket sync failed:', e.message); }
       }
       LS.set('msp_tickets',state.tickets);
       render();
-      showToast(`✓ Loaded ${items.length} open tickets`,'ok');
+      const ghostMsg = droppedGhosts.length ? ` · cleaned ${droppedGhosts.length} ghost${droppedGhosts.length!==1?'s':''}` : '';
+      showToast(`✓ Loaded ${items.length} open tickets${ghostMsg}`,'ok');
     } catch(e){showToast(`Ticket sync error: ${e.message}`,'err'); console.error('[refresh] fetch threw:', e);}
     finally{if(btn){btn.textContent='↺ Refresh';btn.disabled=false;}}
   });
@@ -7203,6 +7226,106 @@ function injectVerifyButton() {
   alertList.parentNode.insertBefore(btn, alertList);
 }
 
+function injectVerifyAutotaskButton() {
+  if (document.getElementById('ticketVerifyBtn')) return;
+  const ticketList = document.getElementById('ticketList');
+  if (!ticketList) return;
+  const btn = document.createElement('button');
+  btn.id = 'ticketVerifyBtn';
+  btn.className = 'verify-datto-btn';
+  btn.title = 'Re-check every cached ticket against Autotask and drop ghosts that no longer exist';
+  btn.innerHTML = '🔍 Verify with Autotask';
+  btn.addEventListener('click', verifyTicketSync);
+  ticketList.parentNode.insertBefore(btn, ticketList);
+}
+
+async function verifyTicketSync() {
+  const btn = document.getElementById('ticketVerifyBtn');
+  if (!btn) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '🔍 Checking...';
+  try {
+    // Fetch fresh active tickets — anything in our cache NOT returned here AND not actually in AT is a ghost
+    const freshActive = await fetchAtTicketQueue();
+    const freshNumbers = new Set(freshActive.map(t => t.ticketNumber));
+    // Tickets we have cached but didn't see in fresh fetch — could be ghosts OR could be done/closed tickets
+    // that fell out of the active query window. Verify each one directly against AT.
+    const suspect = Object.values(state.tickets).filter(t => !freshNumbers.has(t.ticketNumber));
+    const ghosts = [];
+    for (const t of suspect) {
+      try {
+        const data = await atFetch(`/Tickets/${t.id}`);
+        if (!data?.item && !data?.id) ghosts.push(t);
+      } catch(e) {
+        if (/404|not found|null/i.test(e.message)) ghosts.push(t);
+      }
+    }
+    if (!ghosts.length) {
+      showToast(`✓ In sync — all ${Object.keys(state.tickets).length} cached tickets exist in Autotask`, 'ok');
+      return;
+    }
+    showVerifyTicketResultModal({ ghosts, totalCached: Object.keys(state.tickets).length });
+  } catch(e) {
+    showToast(`Verify failed: ${e.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+function showVerifyTicketResultModal({ ghosts, totalCached }) {
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  const ghostList = ghosts.map(t => `
+    <div class="verify-row">
+      <div>
+        <span class="verify-uid">${esc(t.ticketNumber || '')}</span>
+        <span>${esc(t.title || '(no title)')}</span>
+      </div>
+      <button data-tn="${esc(t.ticketNumber)}" class="verify-resolve-btn">Drop</button>
+    </div>
+  `).join('');
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:680px;margin:auto">
+    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">🔍 Autotask Sync Verification</div>
+    <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">Companion has ${totalCached} cached tickets. ${ghosts.length} no longer exist in Autotask (deleted or merged).</div>
+    <div style="font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:0.07em;color:#e07b00;margin-bottom:6px">${ghosts.length} GHOST${ghosts.length!==1?'S':''} — IN COMPANION, NOT IN AUTOTASK</div>
+    <div style="font-size:11px;color:var(--textdim);margin-bottom:8px">Click "Drop" to remove individually, or "Drop All" below. Linked alerts will be unlinked.</div>
+    ${ghostList}
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button id="verifyTicketDropAllBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">Drop All ${ghosts.length} Ghost${ghosts.length!==1?'s':''}</button>
+      <button id="verifyTicketCloseBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+
+  document.getElementById('verifyTicketCloseBtn').addEventListener('click', () => document.body.removeChild(modal));
+
+  const dropOne = (tn) => {
+    delete state.tickets[tn];
+    state.alerts.forEach(a => { if (a.ticketNumber === tn) a.ticketNumber = null; });
+    LS.set('msp_tickets', state.tickets);
+    LS.set('msp_alerts', state.alerts);
+  };
+
+  modal.querySelectorAll('.verify-resolve-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tn = btn.dataset.tn;
+      dropOne(tn);
+      btn.closest('.verify-row').remove();
+      showToast(`✓ Dropped ${tn} from Companion`, 'ok');
+    });
+  });
+
+  document.getElementById('verifyTicketDropAllBtn').addEventListener('click', () => {
+    ghosts.forEach(t => dropOne(t.ticketNumber));
+    try { renderTicketList?.(); } catch {}
+    try { render?.(); } catch {}
+    document.body.removeChild(modal);
+    showToast(`✓ Dropped ${ghosts.length} ghost ticket${ghosts.length!==1?'s':''}`, 'ok');
+  });
+}
+
 async function verifyAlertSync() {
   const btn = document.getElementById('alertVerifyBtn');
   if (!btn) return;
@@ -7401,6 +7524,7 @@ async function boot() {
   injectAlertGroupingToggle();
   injectClientsViewAndNav();
   injectVerifyButton();
+  injectVerifyAutotaskButton();
   applyMode(LS.get('msp_lightmode', false));
   const lastView = LS.get('msp_view','dashboard');
   setView(lastView);
