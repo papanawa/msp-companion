@@ -1367,6 +1367,80 @@ function setInvestigation(ticketId, inv) {
   saveInvestigations();
 }
 
+// ─── TIME-ON-TICKET TRACKING ──────────────────────────────────────
+// state-level — only one timer can be active at a time (the currently-viewed ticket)
+state.activeTimer = null; // { ticketId, startedMs }
+
+function getOrInitTimeTracking(inv) {
+  if (!inv.timeTracking) {
+    inv.timeTracking = { sessions: [], totalMs: 0, technicians: {} };
+  }
+  if (!inv.timeTracking.technicians) inv.timeTracking.technicians = {};
+  return inv.timeTracking;
+}
+
+function startTicketTimer(ticketId) {
+  if (!ticketId) return;
+  // If a different ticket has an active timer, stop it first
+  if (state.activeTimer && state.activeTimer.ticketId !== String(ticketId)) {
+    stopTicketTimer();
+  }
+  if (state.activeTimer && state.activeTimer.ticketId === String(ticketId)) return; // already running
+  const inv = getInvestigation(ticketId);
+  if (!inv) return; // No investigation = no timer
+  state.activeTimer = { ticketId: String(ticketId), startedMs: Date.now() };
+  // Tick the display once a minute while running
+  if (state._timerTickInterval) clearInterval(state._timerTickInterval);
+  state._timerTickInterval = setInterval(() => {
+    if (!state.activeTimer) { clearInterval(state._timerTickInterval); state._timerTickInterval = null; return; }
+    const display = document.getElementById(`invTimeDisplay-${state.activeTimer.ticketId}`);
+    if (display) display.textContent = fmtMsAsDuration(getInvestigationTotalMs(state.activeTimer.ticketId));
+  }, 60000);
+}
+
+function stopTicketTimer() {
+  if (state._timerTickInterval) { clearInterval(state._timerTickInterval); state._timerTickInterval = null; }
+  if (!state.activeTimer) return;
+  const { ticketId, startedMs } = state.activeTimer;
+  const endedMs = Date.now();
+  const durationMs = endedMs - startedMs;
+  state.activeTimer = null;
+  if (durationMs < 5000) return; // ignore sub-5-second sessions (tab switches, accidental clicks)
+  const inv = getInvestigation(ticketId);
+  if (!inv) return;
+  const tt = getOrInitTimeTracking(inv);
+  const techName = getMyResourceName();
+  tt.sessions.push({ startMs: startedMs, endMs: endedMs, durationMs, tech: techName });
+  tt.totalMs = (tt.totalMs || 0) + durationMs;
+  tt.technicians[techName] = (tt.technicians[techName] || 0) + durationMs;
+  setInvestigation(ticketId, inv);
+}
+
+function getCurrentSessionMs() {
+  if (!state.activeTimer) return 0;
+  return Date.now() - state.activeTimer.startedMs;
+}
+
+function getInvestigationTotalMs(ticketId) {
+  const inv = getInvestigation(ticketId);
+  if (!inv?.timeTracking) return 0;
+  let total = inv.timeTracking.totalMs || 0;
+  // Add live session time if this ticket has the active timer
+  if (state.activeTimer?.ticketId === String(ticketId)) {
+    total += getCurrentSessionMs();
+  }
+  return total;
+}
+
+function fmtMsAsDuration(ms) {
+  if (!ms || ms < 1000) return '0m';
+  const totalMin = Math.floor(ms / 60000);
+  if (totalMin < 60) return `${totalMin}m`;
+  const hrs = Math.floor(totalMin / 60);
+  const mins = totalMin % 60;
+  return mins ? `${hrs}h ${mins}m` : `${hrs}h`;
+}
+
 function newStepId() { return 's-' + Math.random().toString(36).slice(2, 10); }
 
 async function fetchAtTicketFull(ticketId) {
@@ -3333,9 +3407,17 @@ async function hydrateTierBPanels(ticket) {
 function renderInvestigationCard(ticket) {
   const inv = getInvestigation(ticket.id);
   const hasInv = !!(inv && inv.steps?.length);
-  const headerHtml = `<div class="card-label" style="display:flex;align-items:center;justify-content:space-between">
+  const totalMs = hasInv ? getInvestigationTotalMs(ticket.id) : 0;
+  const isActive = state.activeTimer?.ticketId === String(ticket.id);
+  const timeBadge = hasInv && (totalMs > 0 || isActive)
+    ? `<span class="inv-time-badge ${isActive?'inv-time-active':''}" title="${isActive ? 'Timer running' : 'Total tracked time'}">⏱ <span id="invTimeDisplay-${ticket.id}">${esc(fmtMsAsDuration(totalMs))}</span></span>`
+    : '';
+  const headerHtml = `<div class="card-label" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
     <span>★ AI INVESTIGATION</span>
-    ${hasInv ? `<span style="font-size:11px;color:var(--textdim);font-weight:400;letter-spacing:0.03em;text-transform:none">Last analyzed ${new Date(inv.lastAnalyzedAt).toLocaleString()}</span>` : ''}
+    <span style="display:flex;align-items:center;gap:8px">
+      ${timeBadge}
+      ${hasInv ? `<span style="font-size:11px;color:var(--textdim);font-weight:400;letter-spacing:0.03em;text-transform:none">Last analyzed ${new Date(inv.lastAnalyzedAt).toLocaleString()}</span>` : ''}
+    </span>
   </div>`;
 
   if (!hasInv) {
@@ -3590,6 +3672,12 @@ function renderTicketDetail(ticket) {
   if (state.ticketChatHistories[String(ticket.id)]?.length) {
     renderTicketChatHistory(ticket.id);
     const h = $('ticketChatHistory'); if (h) h.scrollTop = h.scrollHeight;
+  }
+  // Start the time tracker for this ticket (only if it has an investigation)
+  if (getInvestigation(ticket.id)) {
+    startTicketTimer(ticket.id);
+  } else {
+    stopTicketTimer();
   }
 }
 
@@ -4557,6 +4645,22 @@ async function buildReportsData(days) {
     }))
     .sort((a,b) => b.ageDays - a.ageDays);
 
+  // Tracked labor — sum tracked time across all investigations within the window
+  const cutoffMs = Date.now() - days * 86400000;
+  const laborTotals = { totalMs: 0, byTech: {}, ticketCount: 0 };
+  Object.values(state.investigations || {}).forEach(inv => {
+    if (!inv?.timeTracking?.sessions) return;
+    const sessionsInWindow = inv.timeTracking.sessions.filter(s => (s.endMs || s.startMs) >= cutoffMs);
+    if (!sessionsInWindow.length) return;
+    laborTotals.ticketCount++;
+    sessionsInWindow.forEach(s => {
+      const dur = s.durationMs || 0;
+      laborTotals.totalMs += dur;
+      const tech = s.tech || 'Unknown';
+      laborTotals.byTech[tech] = (laborTotals.byTech[tech] || 0) + dur;
+    });
+  });
+
   return {
     days,
     ticketsResolvedCount: resolvedTickets.length,
@@ -4565,6 +4669,7 @@ async function buildReportsData(days) {
     techRows,
     topClients,
     agingTickets,
+    laborTotals,
     alertTrendBuckets: await buildAlertTrendData(days),
   };
 }
@@ -4631,6 +4736,11 @@ function renderReportsBody(data) {
         <div class="reports-stat-value">${fmtDuration(data.alertMttr)}</div>
         <div class="reports-stat-sub">last ${data.days} days</div>
       </div>
+      <div class="reports-stat-card">
+        <div class="reports-stat-label">TRACKED LABOR</div>
+        <div class="reports-stat-value">${esc(fmtMsAsDuration(data.laborTotals.totalMs))}</div>
+        <div class="reports-stat-sub">${data.laborTotals.ticketCount} ticket${data.laborTotals.ticketCount!==1?'s':''} worked</div>
+      </div>
     </div>
 
     <!-- Alert trend -->
@@ -4668,6 +4778,25 @@ function renderReportsBody(data) {
       </div>
     </div>
 
+    <!-- Tracked labor per tech -->
+    ${Object.keys(data.laborTotals.byTech || {}).length ? `<div class="reports-card">
+      <div class="card-label">⏱ TRACKED LABOR PER TECH (last ${data.days} days)</div>
+      ${svgBarChart(
+        Object.entries(data.laborTotals.byTech)
+          .map(([name, ms]) => ({ label: name, value: Math.round(ms / 60000) })) // minutes for chart scaling
+          .sort((a, b) => b.value - a.value),
+        { labelW: 130 }
+      )}
+      <div class="reports-tech-detail">
+        ${Object.entries(data.laborTotals.byTech)
+          .sort((a,b) => b[1] - a[1])
+          .map(([name, ms]) => `<div class="tech-detail-row">
+            <span>${esc(name)}</span>
+            <span class="tech-avg-age">${esc(fmtMsAsDuration(ms))}</span>
+          </div>`).join('')}
+      </div>
+    </div>` : ''}
+
     <!-- Aging tickets -->
     <div class="reports-card">
       <div class="card-label">🕐 AGING TICKETS — OPEN > 14 DAYS (${data.agingTickets.length})</div>
@@ -4695,6 +4824,10 @@ function renderReportsBody(data) {
 
 // ─── NAVIGATION ───────────────────────────────────────────────────
 function setView(view) {
+  // Stop timer if leaving the tickets view (we're no longer viewing that ticket)
+  if (state.currentView === 'tickets' && view !== 'tickets') {
+    stopTicketTimer();
+  }
   state.currentView = view;
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
@@ -5598,6 +5731,8 @@ function wireEvents() {
     if (action==='ticket-draft-resolution') {
       const ticket = findTicketByBtn(); if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
+      // Stop the timer — work is wrapping up
+      stopTicketTimer();
       const hasAnyNotes = inv.steps.some(s => s.notes?.trim());
       if (!hasAnyNotes) {
         if (!confirm('No step notes captured yet. Draft will be minimal / honest about lack of documentation. Continue?')) return;
@@ -7301,6 +7436,29 @@ function injectAppStyles() {
       padding: 0 4px;
     }
     .excluded-chip button:hover { color: #c8102e; }
+    /* Investigation time tracker badge */
+    .inv-time-badge {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      padding: 3px 8px;
+      border-radius: 3px;
+      color: var(--textmid);
+      background: rgba(0,180,216,0.08);
+      border: 1px solid rgba(0,180,216,0.3);
+      text-transform: none;
+    }
+    .inv-time-badge.inv-time-active {
+      color: #2a9d5c;
+      background: rgba(42,157,92,0.1);
+      border-color: rgba(42,157,92,0.4);
+      animation: time-pulse 2s ease-in-out infinite;
+    }
+    @keyframes time-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(42,157,92,0.3); }
+      50%      { box-shadow: 0 0 0 4px rgba(42,157,92,0); }
+    }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
@@ -8085,5 +8243,21 @@ async function boot() {
     showToast('Welcome to MSP Companion — configure your credentials in Settings','info');
   }
 }
+
+// Stop timer cleanly when user closes tab or navigates away
+window.addEventListener('beforeunload', () => stopTicketTimer());
+
+// Pause/resume on tab visibility — if user is on another tab, don't count that time
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // Save any in-progress session, stop the timer
+    stopTicketTimer();
+  } else {
+    // Tab is visible again — resume timer if currently looking at a ticket with an investigation
+    if (state.currentView === 'tickets' && state.currentTicket && getInvestigation(state.currentTicket.id)) {
+      startTicketTimer(state.currentTicket.id);
+    }
+  }
+});
 
 boot();
