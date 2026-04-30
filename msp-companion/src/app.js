@@ -643,7 +643,7 @@ async function syncTicketStatuses(ticketNumbers) {
     try {
       const data = await atFetch('/Tickets/query', 'POST', {
         filter: [{ op:'in', field:'ticketNumber', value:chunk }],
-        IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','lastActivityDate','companyID'],
+        IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','billingCodeID','lastActivityDate','companyID'],
       });
       // Build company name map from alerts
       const companyIds2 = (data?.items||[]).map(t=>t.companyID).filter(Boolean);
@@ -654,7 +654,7 @@ async function syncTicketStatuses(ticketNumbers) {
         state.tickets[t.ticketNumber] = {
           id: t.id, ticketNumber: t.ticketNumber,
           status: t.status, statusLabel: si.label, statusColor: si.color, isDone: si.done,
-          priority: t.priority, queueID: t.queueID,
+          priority: t.priority, queueID: t.queueID, billingCodeID: t.billingCodeID,
           title: t.title, companyID: t.companyID, companyName: companyNameMap[t.companyID] || null,
           assignedResourceID: t.assignedResourceID, assignedResourceName: null,
           lastActivity: t.lastActivityDate,
@@ -791,7 +791,7 @@ async function fetchAtTicketQueue() {
   const data = await atFetch('/Tickets/query','POST',{
     MaxRecords: 500,
     filter,
-    IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','companyID','lastActivityDate','createDate'],
+    IncludeFields: ['id','ticketNumber','status','title','priority','queueID','assignedResourceID','billingCodeID','companyID','lastActivityDate','createDate'],
   });
   const items = data?.items || [];
   await loadAtResources();
@@ -974,7 +974,7 @@ async function patchTicketFields(ticket, edits) {
   for (const field of fieldNames) {
     let value = edits[field];
     if (value === '' || value === 'null') value = null;
-    else if (['status','priority','queueID','assignedResourceID'].includes(field) && value !== null) value = parseInt(value);
+    else if (['status','priority','queueID','assignedResourceID','billingCodeID'].includes(field) && value !== null) value = parseInt(value);
 
     if (field === 'assignedResourceID') {
       if (value === null) {
@@ -1013,7 +1013,7 @@ async function patchTicketFields(ticket, edits) {
   for (const field of fieldNames) {
     let value = edits[field];
     if (value === '' || value === 'null') value = null;
-    else if (['status','priority','queueID','assignedResourceID'].includes(field) && value !== null) value = parseInt(value);
+    else if (['status','priority','queueID','assignedResourceID','billingCodeID'].includes(field) && value !== null) value = parseInt(value);
 
     ticket[field] = value;
     if (field === 'status') {
@@ -1034,6 +1034,9 @@ async function patchTicketFields(ticket, edits) {
       ticket.assignedResourceName = r ? r.name : null;
       ticket.assignedResourceRoleID = resolvedRoleId;
       changedSummary.push(`resource → ${r?.name || 'unassigned'}`);
+    } else if (field === 'billingCodeID') {
+      const b = state.atBillingCodes.find(b => b.id === value);
+      changedSummary.push(`work type → ${b?.name || (value ? `#${value}` : 'none')}`);
     }
   }
   state.tickets[ticket.ticketNumber] = ticket;
@@ -3135,16 +3138,12 @@ function hydrateMetadataPanel(ticket, fullTicket, picklists, contractName) {
   const sourceLabel    = lookup(pl.source,       f.source);
   const due = f.dueDateTime || f.dueDate;
   const sla = fmtSlaClock(due);
-  const workType = f.billingCodeID
-    ? (state.atBillingCodes.find(b => b.id === f.billingCodeID)?.name || `#${f.billingCodeID}`)
-    : '—';
 
   body.innerHTML = `
     <div class="meta-grid">
       <div class="meta-cell"><div class="meta-label">ISSUE TYPE</div><div class="meta-value">${esc(issueLabel)}</div></div>
       <div class="meta-cell"><div class="meta-label">SUB-ISSUE</div><div class="meta-value">${esc(subIssueLabel)}</div></div>
       <div class="meta-cell"><div class="meta-label">SOURCE</div><div class="meta-value">${esc(sourceLabel)}</div></div>
-      <div class="meta-cell"><div class="meta-label">WORK TYPE</div><div class="meta-value">${esc(workType)}</div></div>
       <div class="meta-cell"><div class="meta-label">DUE DATE</div><div class="meta-value">${due ? esc(new Date(due).toLocaleDateString()) : '—'}</div></div>
       <div class="meta-cell"><div class="meta-label">SLA</div><div class="meta-value" style="color:${sla.color};font-weight:600">${esc(sla.text)}</div></div>
       <div class="meta-cell"><div class="meta-label">EST. HOURS</div><div class="meta-value">${f.estimatedHours != null ? esc(String(f.estimatedHours)) : '—'}</div></div>
@@ -3302,6 +3301,7 @@ function renderTicketDetail(ticket) {
   loadAtPriorityPicklist().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
   loadAtQueues().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
   loadAtResources().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
+  loadAtBillingCodes().then(() => renderTicketDetail._rehydrateSelects?.(ticket));
 
   const myRid = parseInt(state.settings.myResourceID) || null;
   const isMine = myRid && ticket.assignedResourceID === myRid;
@@ -3345,6 +3345,10 @@ function renderTicketDetail(ticket) {
           <label>PRIMARY RESOURCE</label>
           <select class="ticket-field-select" data-field="assignedResourceID" data-ticket-id="${ticket.id}" id="tf-resource"></select>
         </div>
+        <div class="field-group">
+          <label>WORK TYPE</label>
+          <select class="ticket-field-select" data-field="billingCodeID" data-ticket-id="${ticket.id}" id="tf-worktype"></select>
+        </div>
       </div>
       <div class="ticket-save-bar" id="ticketSaveBar-${ticket.id}" style="display:none">
         <span class="ticket-save-summary" id="ticketSaveSummary-${ticket.id}"></span>
@@ -3387,6 +3391,7 @@ function renderTicketDetail(ticket) {
     const prioSel   = document.getElementById('tf-priority');
     const queueSel  = document.getElementById('tf-queue');
     const resSel    = document.getElementById('tf-resource');
+    const wtSel     = document.getElementById('tf-worktype');
 
     if (statusSel && state.atStatusPicklist) {
       const cur = effective('status');
@@ -3420,6 +3425,15 @@ function renderTicketDetail(ticket) {
           `<option value="${r.id}" ${cur===String(r.id)?'selected':''}>${esc(r.name)}</option>`
         ).join('');
       resSel.classList.toggle('ticket-field-dirty', 'assignedResourceID' in pending);
+    }
+    if (wtSel && state.atBillingCodes?.length) {
+      const cur = effective('billingCodeID');
+      const sorted = [...state.atBillingCodes].sort((a,b)=>a.name.localeCompare(b.name));
+      wtSel.innerHTML = `<option value="">— None —</option>` +
+        sorted.map(b =>
+          `<option value="${b.id}" ${cur===String(b.id)?'selected':''}>${esc(b.name)}</option>`
+        ).join('');
+      wtSel.classList.toggle('ticket-field-dirty', 'billingCodeID' in pending);
     }
     updateTicketSaveBar(t.id);
   };
@@ -4634,7 +4648,7 @@ function wireEvents() {
       items.forEach(t=>{
         state.tickets[t.ticketNumber]={
           id:t.id,ticketNumber:t.ticketNumber,status:t.status,statusLabel:t.statusLabel,statusColor:t.statusColor,isDone:t.isDone,
-          priority:t.priority,queueID:t.queueID,
+          priority:t.priority,queueID:t.queueID,billingCodeID:t.billingCodeID,
           title:t.title,companyID:t.companyID,companyName:t.companyName,lastActivity:t.lastActivityDate,
           createDate:t.createDate,
           assignedResourceID:t.assignedResourceID,assignedResourceName:t.assignedResourceName,
