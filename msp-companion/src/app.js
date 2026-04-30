@@ -1307,6 +1307,17 @@ function getInvestigation(ticketId) {
   return state.investigations[key] || null;
 }
 
+// Find a ticket by its numeric id. Falls back to state.currentTicket when the
+// ticket isn't in state.tickets (e.g. tickets dropped from cache by status filter,
+// or opened from a drill-down with a stale reference).
+function findTicketById(ticketId) {
+  const idStr = String(ticketId);
+  const fromCache = Object.values(state.tickets).find(t => String(t.id) === idStr);
+  if (fromCache) return fromCache;
+  if (state.currentTicket && String(state.currentTicket.id) === idStr) return state.currentTicket;
+  return null;
+}
+
 function setInvestigation(ticketId, inv) {
   const key = String(ticketId);
   state.investigations[key] = inv;
@@ -1944,7 +1955,7 @@ ${inv?.techContext ? `──── TECH-PROVIDED CONTEXT (from start of investig
 }
 
 async function sendTicketChat(ticketId, message) {
-  const ticket = Object.values(state.tickets).find(t => String(t.id) === String(ticketId));
+  const ticket = findTicketById(ticketId);
   if (!ticket) return;
   const inv = getInvestigation(ticket.id);
   if (!inv) return;
@@ -4787,7 +4798,7 @@ function wireEvents() {
 
     if (action==='save-ticket-to-kb') {
       const ticketId = el.dataset.ticketId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const ticket = findTicketById(ticketId);
       if (!ticket) return;
       const input = $('ticketNotesInput');
       const finalResolution = input?.value.trim() || '';
@@ -4821,7 +4832,7 @@ function wireEvents() {
 
     if (action==='ticket-save-changes') {
       const ticketId = el.dataset.ticketId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const ticket = findTicketById(ticketId);
       const pending = state.pendingTicketEdits[ticketId];
       if (!ticket || !pending || !Object.keys(pending).length) return;
       const origLabel = el.textContent;
@@ -4843,7 +4854,7 @@ function wireEvents() {
 
     if (action==='ticket-discard-changes') {
       const ticketId = el.dataset.ticketId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const ticket = findTicketById(ticketId);
       if (!ticket) return;
       delete state.pendingTicketEdits[ticketId];
       // Re-render to reset the dropdowns to ticket's actual values
@@ -5054,7 +5065,7 @@ function wireEvents() {
     // ─── TICKET INVESTIGATION HANDLERS ────────────────────────────
     const findTicketByBtn = () => {
       const tid = el.dataset.ticketId;
-      return Object.values(state.tickets).find(t => String(t.id) === tid);
+      return findTicketById(tid);
     };
 
     const setInvStatus = (msg) => {
@@ -5140,7 +5151,7 @@ function wireEvents() {
 
     if (action==='inv-step-add-verification') {
       const stepEl = el.closest('.inv-step'); if (!stepEl) return;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
+      const ticket = findTicketById(stepEl.dataset.ticketId);
       if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
       const step = inv.steps.find(s => s.id === stepEl.dataset.stepId); if (!step) return;
@@ -5158,7 +5169,7 @@ function wireEvents() {
     // ─── TEMPLATE HANDLERS ────────────────────────────────────────
     if (action==='save-as-template') {
       const ticketId = el.dataset.ticketId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const ticket = findTicketById(ticketId);
       const inv = ticket ? getInvestigation(ticket.id) : null;
       if (!ticket || !inv?.steps?.length) {
         showToast('Need an investigation with steps to save as template', 'info');
@@ -5169,7 +5180,7 @@ function wireEvents() {
 
     if (action==='open-template-picker') {
       const ticketId = el.dataset.ticketId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const ticket = findTicketById(ticketId);
       if (!ticket) return;
       showTemplatePickerModal(ticket);
     }
@@ -5178,7 +5189,7 @@ function wireEvents() {
       const tplId = el.dataset.templateId;
       const ticketId = el.dataset.ticketId;
       const tpl = state.templates[tplId];
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const ticket = findTicketById(ticketId);
       if (!tpl || !ticket) return;
       const existingInv = getInvestigation(ticket.id);
       if (existingInv?.steps?.length) {
@@ -5296,7 +5307,7 @@ function wireEvents() {
 
     if (action==='jump-to-ticket') {
       const tid = el.dataset.ticketId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === tid);
+      const ticket = findTicketById(tid);
       if (!ticket) {
         showToast('Ticket not in cache. Try Tickets → Refresh.', 'info');
         return;
@@ -5335,7 +5346,7 @@ function wireEvents() {
       const stepEl = el.closest('.inv-step'); if (!stepEl) return;
       const tid = stepEl.dataset.ticketId;
       const sid = stepEl.dataset.stepId;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === tid); if (!ticket) return;
+      const ticket = findTicketById(tid); if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
       const idx = inv.steps.findIndex(s => s.id === sid);
       if (idx < 0) return;
@@ -5406,7 +5417,7 @@ function wireEvents() {
     // Investigation: toggle step done
     if (e.target.classList?.contains('inv-step-done-cb')) {
       const stepEl = e.target.closest('.inv-step'); if (!stepEl) return;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
+      const ticket = findTicketById(stepEl.dataset.ticketId);
       if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
       const step = inv.steps.find(s => s.id === stepEl.dataset.stepId);
@@ -5420,7 +5431,7 @@ function wireEvents() {
     const sel = e.target;
     const ticketId = sel.dataset.ticketId;
     const field = sel.dataset.field;
-    const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+    const ticket = findTicketById(ticketId);
     if (!ticket) return;
     // Compare against the live ticket value — normalize blanks to null
     const currentValueRaw = ticket[field];
@@ -5485,7 +5496,7 @@ function wireEvents() {
     const invField = e.target.dataset?.action;
     if (invField === 'inv-step-text' || invField === 'inv-step-notes' || invField === 'inv-step-mins' || invField === 'inv-step-verification') {
       const stepEl = e.target.closest('.inv-step'); if (!stepEl) return;
-      const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
+      const ticket = findTicketById(stepEl.dataset.ticketId);
       if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
       const step = inv.steps.find(s => s.id === stepEl.dataset.stepId); if (!step) return;
