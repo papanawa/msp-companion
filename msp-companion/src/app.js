@@ -9,6 +9,7 @@ const state = {
   ticketChatHistories: {},
   kbContextCache: {}, historyContextCache: {},
   investigations: {},
+  templates: {},                      // { templateId: { name, steps, ... } } reusable investigation patterns
   currentView: 'dashboard', currentAlert: null, currentTicket: null,
   alertFilter: 'all', alertClient: 'all', settings: {},
   incidents: {},                      // { incidentId: { id, title, alertUids[], createdAt, source, ticketNumber?, expanded? } }
@@ -77,6 +78,7 @@ function loadSettings() {
   state.kbContextCache      = LS.get('msp_kb_context_cache', {});
   state.historyContextCache = LS.get('msp_history_context_cache', {});
   state.investigations      = LS.get('msp_investigations', {});
+  state.templates           = LS.get('msp_templates', {});
   const s = state.settings;
   setVal('set-apiKey',          s.apiKey || '');
   setVal('set-secretKey',       s.secretKey || '');
@@ -1406,14 +1408,15 @@ Respond ONLY with valid JSON in this EXACT shape, no markdown fences, no preambl
   "confidence": 0-100,
   "relevantContext": ["brief bullet citing which KB article or prior ticket informed the plan, if any"],
   "plan": [
-    { "num": 1, "text": "Concrete actionable step with specific commands, paths, or check criteria." },
-    { "num": 2, "text": "..." }
+    { "num": 1, "text": "Concrete actionable step.", "verification": "How the tech knows this step succeeded — a measurable check." },
+    { "num": 2, "text": "...", "verification": "..." }
   ]
 }
 
 Rules:
 - plan MUST have 4-7 steps, ordered from verify-first → remediate → verify-after → document.
 - Each step must be concrete and verifiable. Prefer exact commands, file paths, UI navigation ("Services.msc → find X → Restart"), or specific thresholds.
+- Each step's "verification" should be a short, measurable success check (e.g. "Disk free space > 20GB", "Service status returns 'Running'", "Ping returns < 50ms"). If a step is purely investigatory and has no measurable success, set verification to "" (empty string).
 - Avoid steps like "investigate further" or "check logs" without saying which logs.
 - relevantContext may be an empty array if nothing provided was materially relevant. Do not invent citations.
 - Do not restate the ticket description. Do not include markdown.`;
@@ -1469,6 +1472,7 @@ async function runTicketInvestigation(ticket, progressFn, techContext) {
   const steps = parsed.plan.map(p => ({
     id: newStepId(),
     text: String(p.text || '').trim(),
+    verification: String(p.verification || '').trim(),
     done: false,
     notes: '',
     minutes: 0,
@@ -1540,14 +1544,376 @@ ${finalResolution ? `\nFINAL RESOLUTION POSTED:\n${finalResolution}\n` : ''}`.tr
   };
 }
 
+// ─── INVESTIGATION TEMPLATES ──────────────────────────────────────
+function newTemplateId() { return 'tpl-' + Math.random().toString(36).slice(2, 10); }
+
+function saveTemplates() { LS.set('msp_templates', state.templates); }
+
+function getTemplate(id) {
+  return state.templates[id] || null;
+}
+
+function getMyResourceName() {
+  const id = state.settings.myResourceID;
+  if (!id) return 'Unknown';
+  const r = state.atResources.find(r => r.id === parseInt(id));
+  return r?.name || 'Unknown';
+}
+
+// Convert an investigation into a template by stripping per-instance data.
+function buildTemplateFromInvestigation(inv, ticket, opts = {}) {
+  const steps = (inv.steps || []).map(s => ({
+    text: (s.text || '').trim(),
+    verification: (s.verification || '').trim(),
+  })).filter(s => s.text);
+  if (!steps.length) throw new Error('Investigation has no steps to save as template');
+  return {
+    id: newTemplateId(),
+    name: opts.name || `${ticket?.title?.substring(0, 60) || 'Untitled template'}`,
+    description: opts.description || '',
+    steps,
+    tags: opts.tags || [],
+    isPublic: opts.isPublic !== false,
+    createdBy: getMyResourceName(),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sourceTicketId: ticket?.id || null,
+    usageCount: 0,
+    version: 1,
+  };
+}
+
+function saveTemplate(template) {
+  state.templates[template.id] = template;
+  saveTemplates();
+  return template;
+}
+
+function deleteTemplate(id) {
+  if (state.templates[id]) {
+    delete state.templates[id];
+    saveTemplates();
+  }
+}
+
+// Update an existing template (bumps version, updatedAt).
+function updateTemplate(id, changes) {
+  const t = state.templates[id];
+  if (!t) return null;
+  Object.assign(t, changes, {
+    updatedAt: Date.now(),
+    version: (t.version || 1) + 1,
+  });
+  saveTemplates();
+  return t;
+}
+
+// Apply a template to a ticket — produces a fresh investigation with template steps as the plan.
+function applyTemplateToTicket(template, ticket) {
+  const t = template;
+  // Bump usage
+  t.usageCount = (t.usageCount || 0) + 1;
+  saveTemplates();
+  const inv = {
+    analysis: {
+      understanding: `Applied template: ${t.name}${t.description ? ' — ' + t.description : ''}`,
+      confidence: 0,
+      relevantContext: t.tags?.length ? [`Template tags: ${t.tags.join(', ')}`] : [],
+    },
+    steps: t.steps.map(s => ({
+      id: newStepId(),
+      text: s.text,
+      verification: s.verification || '',
+      done: false,
+      notes: '',
+      minutes: 0,
+    })),
+    techContext: '',
+    appliedTemplateId: t.id,
+    // Snapshot of the original template steps — used later to detect changes
+    appliedTemplateSnapshot: t.steps.map(s => ({ text: s.text, verification: s.verification || '' })),
+    lastAnalyzedAt: Date.now(),
+  };
+  setInvestigation(ticket.id, inv);
+  return inv;
+}
+
+// Score a template's relevance to a ticket — used for auto-suggestions.
+function scoreTemplateForTicket(template, ticket) {
+  if (!ticket) return 0;
+  const titleWords = (ticket.title || '').toLowerCase().split(/\W+/).filter(w => w.length >= 4);
+  const tagSet = new Set((template.tags || []).map(t => t.toLowerCase()));
+  let score = 0;
+  // Tag overlap with ticket title keywords
+  titleWords.forEach(w => { if (tagSet.has(w)) score += 3; });
+  // Linked alert's monitor type matching tags
+  const linkedAlert = findLinkedAlertForTicket(ticket);
+  if (linkedAlert) {
+    const monitor = (linkedAlert.monitorType || '').toLowerCase();
+    tagSet.forEach(tag => { if (monitor.includes(tag) || tag.includes(monitor)) score += 5; });
+  }
+  // Template name overlap with ticket title
+  const tplWords = (template.name || '').toLowerCase().split(/\W+/).filter(w => w.length >= 4);
+  const titleSet = new Set(titleWords);
+  tplWords.forEach(w => { if (titleSet.has(w)) score += 2; });
+  // Lightly favor frequently-used templates
+  score += Math.min(template.usageCount || 0, 5) * 0.5;
+  return score;
+}
+
+function suggestTemplatesForTicket(ticket, limit = 3, minScore = 4) {
+  if (!ticket) return [];
+  const myName = getMyResourceName();
+  const candidates = Object.values(state.templates)
+    .filter(t => t.isPublic !== false || t.createdBy === myName) // private only visible to creator
+    .map(t => ({ template: t, score: scoreTemplateForTicket(t, ticket) }))
+    .filter(x => x.score >= minScore)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+  return candidates.map(c => c.template);
+}
+
+function getVisibleTemplatesForUser() {
+  const myName = getMyResourceName();
+  return Object.values(state.templates)
+    .filter(t => t.isPublic !== false || t.createdBy === myName)
+    .sort((a, b) => (b.usageCount || 0) - (a.usageCount || 0) || a.name.localeCompare(b.name));
+}
+
+// Detect if the current investigation has diverged from its applied template.
+function detectTemplateDrift(inv) {
+  if (!inv?.appliedTemplateId || !inv.appliedTemplateSnapshot) return null;
+  const tpl = state.templates[inv.appliedTemplateId];
+  if (!tpl) return null; // template was deleted; nothing to update
+  const snapshot = inv.appliedTemplateSnapshot;
+  const current = (inv.steps || []).map(s => ({
+    text: (s.text || '').trim(),
+    verification: (s.verification || '').trim(),
+  }));
+  // Compute simple diff
+  const added = [];
+  const modified = [];
+  const removedTexts = [];
+
+  // Check for added/modified
+  current.forEach((cur, i) => {
+    const orig = snapshot[i];
+    if (!orig) {
+      added.push(cur);
+    } else if (orig.text !== cur.text || orig.verification !== cur.verification) {
+      modified.push({ from: orig, to: cur, idx: i });
+    }
+  });
+  // Snapshot longer than current = removed
+  if (snapshot.length > current.length) {
+    for (let i = current.length; i < snapshot.length; i++) {
+      removedTexts.push(snapshot[i]);
+    }
+  }
+  if (!added.length && !modified.length && !removedTexts.length) return null;
+  return { template: tpl, added, modified, removed: removedTexts, currentSteps: current };
+}
+
+// Auto-suggest tags for a new template based on the ticket and steps.
+function suggestTagsForTemplate(ticket, steps) {
+  const tags = new Set();
+  const linkedAlert = ticket ? findLinkedAlertForTicket(ticket) : null;
+  if (linkedAlert?.monitorType) {
+    linkedAlert.monitorType.toLowerCase().split(/[\s_-]+/).forEach(w => {
+      if (w.length >= 3) tags.add(w);
+    });
+  }
+  // Mine the steps for common keywords
+  const KEYWORDS = ['disk','cleanup','dhcp','dns','dc','restart','service','backup','veeam','windows','update','patch','restart','reboot','memory','cpu','network','vpn','printer','firewall','sql','exchange','m365','office','anti?virus','av','printer','offline','online','event','log'];
+  const allText = steps.map(s => (s.text + ' ' + (s.verification || '')).toLowerCase()).join(' ');
+  KEYWORDS.forEach(kw => {
+    const re = new RegExp(`\\b${kw}\\b`, 'i');
+    if (re.test(allText)) tags.add(kw.replace('?', ''));
+  });
+  return [...tags].slice(0, 6);
+}
+
+// ─── TEMPLATE MODALS ──────────────────────────────────────────────
+function showSaveTemplateModal(ticket, inv) {
+  const suggestedTags = suggestTagsForTemplate(ticket, inv.steps || []);
+  const defaultName = ticket?.title?.substring(0, 80) || 'Untitled template';
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:560px;margin:auto">
+    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">💾 Save as Template</div>
+    <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">Saving ${(inv.steps || []).length} steps. Per-instance data (notes, done state, minutes) is stripped — only step text and verification criteria are kept.</div>
+
+    <label class="tpl-modal-label">NAME</label>
+    <input id="tplModalName" type="text" class="tpl-modal-input" maxlength="120" value="${esc(defaultName)}" placeholder="Disk Space Cleanup — Windows Server" />
+
+    <label class="tpl-modal-label">DESCRIPTION (optional)</label>
+    <textarea id="tplModalDesc" class="tpl-modal-input" rows="2" placeholder="When to use this template — what symptoms or alert types it applies to."></textarea>
+
+    <label class="tpl-modal-label">TAGS (comma-separated, used for search and auto-suggestion)</label>
+    <input id="tplModalTags" type="text" class="tpl-modal-input" value="${esc(suggestedTags.join(', '))}" placeholder="disk, cleanup, windows" />
+
+    <div style="display:flex;align-items:center;gap:8px;margin:14px 0 4px">
+      <input type="checkbox" id="tplModalPublic" checked style="cursor:pointer" />
+      <label for="tplModalPublic" style="cursor:pointer;font-size:13px">Public — visible to all techs</label>
+    </div>
+    <div style="font-size:11px;color:var(--textdim);margin-bottom:14px">Uncheck to keep this template private to you. Default is public so the team benefits.</div>
+
+    <div style="display:flex;gap:8px">
+      <button id="tplSaveBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">✓ SAVE TEMPLATE</button>
+      <button id="tplCancelBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Cancel</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  document.getElementById('tplModalName').focus();
+
+  const close = () => document.body.removeChild(modal);
+  document.getElementById('tplCancelBtn').addEventListener('click', close);
+  document.getElementById('tplSaveBtn').addEventListener('click', () => {
+    const name = document.getElementById('tplModalName').value.trim();
+    const description = document.getElementById('tplModalDesc').value.trim();
+    const tagsRaw = document.getElementById('tplModalTags').value.trim();
+    const tags = tagsRaw.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+    const isPublic = document.getElementById('tplModalPublic').checked;
+    if (!name) {
+      showToast('Template needs a name', 'info');
+      return;
+    }
+    try {
+      const tpl = buildTemplateFromInvestigation(inv, ticket, { name, description, tags, isPublic });
+      saveTemplate(tpl);
+      close();
+      showToast(`✓ Saved template — "${tpl.name}"`, 'ok');
+    } catch(err) {
+      showToast(`Save failed: ${err.message}`, 'err');
+    }
+  });
+}
+
+function showTemplatePickerModal(ticket) {
+  const templates = getVisibleTemplatesForUser();
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+
+  if (!templates.length) {
+    modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:480px;margin:auto">
+      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Apply a Template</div>
+      <div style="font-size:13px;color:var(--textmid);margin-bottom:14px">No templates saved yet. Templates are created by clicking "💾 Save as Template" after working through an investigation.</div>
+      <button id="tplPickerCloseBtn" style="cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">OK</button>
+    </div>`;
+    document.body.appendChild(modal);
+    document.getElementById('tplPickerCloseBtn').addEventListener('click', () => document.body.removeChild(modal));
+    return;
+  }
+
+  const myName = getMyResourceName();
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:680px;margin:auto">
+    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Apply a Template</div>
+    <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">${templates.length} template${templates.length!==1?'s':''} available. Applying populates the investigation plan — you can still edit before starting work.</div>
+    <input id="tplPickerSearch" type="text" class="tpl-modal-input" placeholder="Filter templates..." style="margin-bottom:12px" />
+    <div id="tplPickerList" style="max-height:60vh;overflow-y:auto;margin-bottom:14px">
+      ${templates.map(t => `
+        <div class="tpl-picker-row" data-template-id="${esc(t.id)}">
+          <div class="tpl-picker-main">
+            <div class="tpl-picker-name">
+              ${esc(t.name)}
+              ${t.isPublic === false ? `<span class="tpl-private-pill">private</span>` : ''}
+              ${t.createdBy === myName ? `<span class="tpl-mine-pill">yours</span>` : ''}
+            </div>
+            ${t.description ? `<div class="tpl-picker-desc">${esc(t.description)}</div>` : ''}
+            <div class="tpl-picker-meta">
+              <span>${t.steps.length} steps</span>
+              ${t.usageCount ? `<span>· used ${t.usageCount}×</span>` : ''}
+              ${t.tags?.length ? `<span>· ${esc(t.tags.join(', '))}</span>` : ''}
+              <span class="tpl-picker-author">· by ${esc(t.createdBy || 'unknown')}</span>
+            </div>
+          </div>
+          <div class="tpl-picker-actions">
+            <button class="abtn abtn-ai" data-action="apply-template" data-template-id="${esc(t.id)}" data-ticket-id="${ticket.id}">Apply</button>
+            <button class="tpl-delete-btn" data-action="delete-template" data-template-id="${esc(t.id)}" title="Delete template">×</button>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+    <button id="tplPickerCloseBtn" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Close</button>
+  </div>`;
+  document.body.appendChild(modal);
+
+  // Wire close
+  const closeFn = () => { if (document.body.contains(modal)) document.body.removeChild(modal); };
+  document.getElementById('tplPickerCloseBtn').addEventListener('click', closeFn);
+  modal._closeFn = closeFn;
+
+  // Filter
+  document.getElementById('tplPickerSearch').addEventListener('input', e => {
+    const q = e.target.value.toLowerCase().trim();
+    const rows = modal.querySelectorAll('.tpl-picker-row');
+    rows.forEach(r => {
+      const tplId = r.dataset.templateId;
+      const t = state.templates[tplId];
+      if (!t) { r.style.display = 'none'; return; }
+      const haystack = [t.name, t.description || '', ...(t.tags || [])].join(' ').toLowerCase();
+      r.style.display = (q === '' || haystack.includes(q)) ? '' : 'none';
+    });
+  });
+  document.getElementById('tplPickerSearch').focus();
+}
+
+function showTemplateDriftModal(drift, inv, ticket) {
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  const tpl = drift.template;
+  const summaryParts = [];
+  if (drift.added.length) summaryParts.push(`${drift.added.length} step${drift.added.length!==1?'s':''} added`);
+  if (drift.modified.length) summaryParts.push(`${drift.modified.length} edited`);
+  if (drift.removed.length) summaryParts.push(`${drift.removed.length} removed`);
+
+  const addedHtml = drift.added.map(s => `<li>${esc(s.text)}${s.verification?` <em style="color:var(--textdim)">(${esc(s.verification)})</em>`:''}</li>`).join('');
+  const modifiedHtml = drift.modified.map(m => `<li>Step ${m.idx+1}: <span style="text-decoration:line-through;color:var(--textdim)">${esc(m.from.text)}</span> → ${esc(m.to.text)}</li>`).join('');
+  const removedHtml = drift.removed.map(s => `<li style="color:var(--textdim)"><s>${esc(s.text)}</s></li>`).join('');
+
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:600px;margin:auto">
+    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Update Template?</div>
+    <div style="font-size:13px;color:var(--textmid);margin-bottom:14px">You modified the <strong>${esc(tpl.name)}</strong> template during this investigation (${summaryParts.join(', ')}). Apply your changes back to the template so the next tech benefits?</div>
+    ${drift.added.length ? `<div class="tpl-drift-section"><div class="tpl-drift-label" style="color:#2a9d5c">+ ADDED</div><ul>${addedHtml}</ul></div>` : ''}
+    ${drift.modified.length ? `<div class="tpl-drift-section"><div class="tpl-drift-label" style="color:#c8a000">~ EDITED</div><ul>${modifiedHtml}</ul></div>` : ''}
+    ${drift.removed.length ? `<div class="tpl-drift-section"><div class="tpl-drift-label" style="color:#c8102e">− REMOVED</div><ul>${removedHtml}</ul></div>` : ''}
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button id="tplDriftUpdateBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">✓ Update Template</button>
+      <button id="tplDriftSkipBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Keep As-Is</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+
+  const close = () => document.body.removeChild(modal);
+  document.getElementById('tplDriftSkipBtn').addEventListener('click', close);
+  document.getElementById('tplDriftUpdateBtn').addEventListener('click', () => {
+    updateTemplate(tpl.id, { steps: drift.currentSteps });
+    // Update the snapshot on the investigation so we don't re-prompt
+    inv.appliedTemplateSnapshot = drift.currentSteps.map(s => ({ ...s }));
+    setInvestigation(ticket.id, inv);
+    close();
+    showToast(`✓ Updated template — ${tpl.name} (v${(tpl.version||1)+1})`, 'ok');
+  });
+}
+
 // ─── TICKET INVESTIGATION CHAT ────────────────────────────────────
 function buildTicketChatSystemPrompt(ticket, inv, contextBlob) {
   const stepsState = (inv?.steps || []).map((s, i) => {
     const status = s.done ? 'DONE' : 'NOT DONE';
     const noteSnip = s.notes?.trim() ? ` — Notes: ${s.notes.trim().substring(0, 240)}` : '';
+    const verifyLine = s.verification?.trim() ? `\n    Verification criteria: ${s.verification.trim()}` : '';
     const mins = s.minutes ? ` (${s.minutes}m)` : '';
-    return `Step ${i+1} [${status}]${mins}: ${s.text || '(no step text)'}${noteSnip}`;
+    return `Step ${i+1} [${status}]${mins}: ${s.text || '(no step text)'}${verifyLine}${noteSnip}`;
   }).join('\n');
+
+  // If a template is applied, surface that to the AI so it understands the framework
+  let templateBlock = '';
+  if (inv?.appliedTemplateId) {
+    const tpl = state.templates[inv.appliedTemplateId];
+    if (tpl) {
+      templateBlock = `\n──── APPLIED TEMPLATE ────\nTemplate: ${tpl.name}${tpl.description ? '\nDescription: ' + tpl.description : ''}\nThis is a reusable investigation pattern Synobis has used ${tpl.usageCount || 0} times. Each step has verification criteria the tech is checking against. If a step's verification fails, the tech may need to deviate from the standard pattern.\n`;
+    }
+  }
 
   return `You are an expert MSP tier-2/3 engineer at Synobis Network Solutions, helping a technician work through an active ticket investigation.
 
@@ -1562,10 +1928,11 @@ Rules:
 - Do not draft the final resolution — there's a separate button for that.
 - Keep replies under ~150 words unless the tech explicitly asks for detail.
 - If a step is marked DONE but the tech is asking about it, treat the notes on that step as ground truth for what actually happened.
+- When verification criteria exist for a step, treat them as the success definition for that step. If the tech asks "did this work?" reason against the verification criteria using their notes.
 
 ──── TICKET CONTEXT ────
 ${contextBlob}
-
+${templateBlock}
 ──── INVESTIGATION ANALYSIS (what the AI initially concluded) ────
 ${inv?.analysis?.understanding || '(no analysis recorded)'}
 Confidence: ${inv?.analysis?.confidence || 0}%
@@ -2816,14 +3183,34 @@ function renderInvestigationCard(ticket) {
 
   if (!hasInv) {
     const draft = state.notesDrafts['tech-ctx-' + ticket.id] || '';
+    const suggestions = suggestTemplatesForTicket(ticket);
+    const suggestionsHtml = suggestions.length ? `
+      <div class="tpl-suggestions">
+        <div class="tpl-suggestions-label">📋 ${suggestions.length} matching template${suggestions.length!==1?'s':''} found:</div>
+        ${suggestions.map(t => `
+          <div class="tpl-suggestion-row" data-action="apply-template" data-template-id="${esc(t.id)}" data-ticket-id="${ticket.id}">
+            <div class="tpl-suggestion-name">${esc(t.name)}</div>
+            <div class="tpl-suggestion-meta">
+              <span>${t.steps.length} steps</span>
+              ${t.usageCount ? `<span>· used ${t.usageCount}×</span>` : ''}
+              ${t.tags?.length ? `<span>· ${esc(t.tags.slice(0,3).join(', '))}</span>` : ''}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    ` : '';
     return `<div class="detail-card" id="investigationCard">
       ${headerHtml}
       <div style="color:var(--textdim);font-size:12px;margin:8px 0 12px">Pulls ticket detail, Autotask notes, KB articles, client history, and any linked Datto alert. Produces an editable action plan.</div>
+      ${suggestionsHtml}
       <div class="field-group" style="margin-bottom:10px">
         <label style="display:block;font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:4px">TECH CONTEXT <span style="font-weight:400;text-transform:none;letter-spacing:0.02em">(optional — your usual first steps, environment quirks, prior knowledge)</span></label>
         <textarea id="techContextInput" data-ticket-id="${ticket.id}" rows="3" placeholder="e.g. My first step is normally to check if the computer is on. Client runs SQL cluster with AG — don't restart primary without failover. Try cached credentials before AD lookup.">${esc(draft)}</textarea>
       </div>
-      <button class="abtn abtn-ai" data-action="ticket-analyze" data-ticket-id="${ticket.id}">▶ ANALYZE TICKET</button>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="abtn abtn-ai" data-action="ticket-analyze" data-ticket-id="${ticket.id}">▶ ANALYZE TICKET</button>
+        <button class="abtn abtn-ghost" data-action="open-template-picker" data-ticket-id="${ticket.id}">📋 Apply a template</button>
+      </div>
       <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
     </div>`;
   }
@@ -2838,6 +3225,8 @@ function renderInvestigationCard(ticket) {
     <div class="inv-tech-ctx-label">TECH CONTEXT USED</div>
     <div class="inv-tech-ctx-body">${esc(inv.techContext)}</div>
   </div>` : '';
+  const appliedTpl = inv.appliedTemplateId ? state.templates[inv.appliedTemplateId] : null;
+  const tplBadge = appliedTpl ? `<div class="inv-template-badge">📋 Template: ${esc(appliedTpl.name)}</div>` : '';
 
   const stepsHtml = steps.map((s, idx) => `
     <div class="inv-step ${s.done?'inv-step-done':''}" data-step-id="${esc(s.id)}" data-ticket-id="${ticket.id}">
@@ -2850,12 +3239,14 @@ function renderInvestigationCard(ticket) {
         <input type="number" class="inv-step-mins" data-action="inv-step-mins" value="${s.minutes||''}" placeholder="min" min="0" />
         <button class="inv-step-btn inv-step-delete" data-action="inv-step-delete" title="Delete step">×</button>
       </div>
+      ${s.verification ? `<div class="inv-step-verify"><span class="inv-step-verify-label">VERIFY:</span> <input type="text" class="inv-step-verify-input" data-action="inv-step-verification" value="${esc(s.verification)}" placeholder="Success criteria for this step" /></div>` : `<div class="inv-step-verify-empty"><button class="inv-step-add-verify" data-action="inv-step-add-verification">+ Add verification criteria</button></div>`}
       <textarea class="inv-step-notes" data-action="inv-step-notes" placeholder="What did you do / find?" maxlength="${INV_STEP_NOTES_MAX}">${esc(s.notes||'')}</textarea>
     </div>
   `).join('');
 
   return `<div class="detail-card" id="investigationCard">
     ${headerHtml}
+    ${tplBadge}
     <div class="inv-analysis">
       <div class="inv-analysis-row">
         <span class="inv-conf-badge" style="color:${confColor};background:${confColor}22;border:1px solid ${confColor}55">CONFIDENCE ${conf}%</span>
@@ -2872,6 +3263,7 @@ function renderInvestigationCard(ticket) {
     </div>
     <div class="inv-actions-row">
       <button class="abtn abtn-ghost" data-action="ticket-reanalyze" data-ticket-id="${ticket.id}">↺ Re-analyze</button>
+      <button class="abtn abtn-ghost" data-action="save-as-template" data-ticket-id="${ticket.id}">💾 Save as Template</button>
       <button class="abtn abtn-ai" data-action="ticket-draft-resolution" data-ticket-id="${ticket.id}">✓ DRAFT RESOLUTION</button>
     </div>
     <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
@@ -4741,9 +5133,75 @@ function wireEvents() {
     if (action==='inv-step-add') {
       const ticket = findTicketByBtn(); if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
-      inv.steps.push({ id: newStepId(), text: '', done: false, notes: '', minutes: 0 });
+      inv.steps.push({ id: newStepId(), text: '', verification: '', done: false, notes: '', minutes: 0 });
       setInvestigation(ticket.id, inv);
       renderTicketDetail(ticket);
+    }
+
+    if (action==='inv-step-add-verification') {
+      const stepEl = el.closest('.inv-step'); if (!stepEl) return;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
+      if (!ticket) return;
+      const inv = getInvestigation(ticket.id); if (!inv) return;
+      const step = inv.steps.find(s => s.id === stepEl.dataset.stepId); if (!step) return;
+      step.verification = step.verification || ' '; // any non-empty triggers the input rendering
+      setInvestigation(ticket.id, inv);
+      renderTicketDetail(ticket);
+      // Focus the new input
+      setTimeout(() => {
+        const input = document.querySelector(`[data-step-id="${stepEl.dataset.stepId}"] .inv-step-verify-input`);
+        input?.focus();
+        input?.select();
+      }, 50);
+    }
+
+    // ─── TEMPLATE HANDLERS ────────────────────────────────────────
+    if (action==='save-as-template') {
+      const ticketId = el.dataset.ticketId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      const inv = ticket ? getInvestigation(ticket.id) : null;
+      if (!ticket || !inv?.steps?.length) {
+        showToast('Need an investigation with steps to save as template', 'info');
+        return;
+      }
+      showSaveTemplateModal(ticket, inv);
+    }
+
+    if (action==='open-template-picker') {
+      const ticketId = el.dataset.ticketId;
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      if (!ticket) return;
+      showTemplatePickerModal(ticket);
+    }
+
+    if (action==='apply-template') {
+      const tplId = el.dataset.templateId;
+      const ticketId = el.dataset.ticketId;
+      const tpl = state.templates[tplId];
+      const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+      if (!tpl || !ticket) return;
+      const existingInv = getInvestigation(ticket.id);
+      if (existingInv?.steps?.length) {
+        if (!confirm(`Replace the current investigation plan with template "${tpl.name}"? Step notes and progress will be lost.`)) return;
+      }
+      applyTemplateToTicket(tpl, ticket);
+      // Close any open modal
+      const modal = document.querySelector('.tpl-picker-row')?.closest('div[style*="position:fixed"]');
+      if (modal && modal._closeFn) modal._closeFn();
+      else if (modal) document.body.removeChild(modal);
+      renderTicketDetail(ticket);
+      showToast(`✓ Applied template — ${tpl.name}`, 'ok');
+    }
+
+    if (action==='delete-template') {
+      const tplId = el.dataset.templateId;
+      const tpl = state.templates[tplId];
+      if (!tpl) return;
+      if (!confirm(`Delete template "${tpl.name}"? This cannot be undone.`)) return;
+      deleteTemplate(tplId);
+      const row = el.closest('.tpl-picker-row');
+      if (row) row.remove();
+      showToast('✓ Template deleted', 'ok');
     }
 
     if (action==='reports-range') {
@@ -4915,6 +5373,12 @@ function wireEvents() {
         }
         setInvStatus('✓ Draft ready — review and edit above, then POST RESOLUTION');
         showToast('✓ Resolution drafted — review before posting', 'ok');
+        // Check for template drift — if this investigation was based on a template and steps were modified, prompt to update
+        const drift = detectTemplateDrift(inv);
+        if (drift) {
+          // Defer the modal slightly so the toast can show first
+          setTimeout(() => showTemplateDriftModal(drift, inv, ticket), 600);
+        }
       } catch(err) {
         showToast(`Draft failed: ${err.message}`, 'err');
         setInvStatus(`Error: ${err.message}`);
@@ -5019,15 +5483,16 @@ function wireEvents() {
     }
     // Investigation per-step autosave (text / notes / minutes)
     const invField = e.target.dataset?.action;
-    if (invField === 'inv-step-text' || invField === 'inv-step-notes' || invField === 'inv-step-mins') {
+    if (invField === 'inv-step-text' || invField === 'inv-step-notes' || invField === 'inv-step-mins' || invField === 'inv-step-verification') {
       const stepEl = e.target.closest('.inv-step'); if (!stepEl) return;
       const ticket = Object.values(state.tickets).find(t => String(t.id) === stepEl.dataset.ticketId);
       if (!ticket) return;
       const inv = getInvestigation(ticket.id); if (!inv) return;
       const step = inv.steps.find(s => s.id === stepEl.dataset.stepId); if (!step) return;
-      if (invField === 'inv-step-text')  step.text    = e.target.value;
-      if (invField === 'inv-step-notes') step.notes   = e.target.value.slice(0, INV_STEP_NOTES_MAX);
-      if (invField === 'inv-step-mins')  step.minutes = parseInt(e.target.value) || 0;
+      if (invField === 'inv-step-text')         step.text         = e.target.value;
+      if (invField === 'inv-step-notes')        step.notes        = e.target.value.slice(0, INV_STEP_NOTES_MAX);
+      if (invField === 'inv-step-mins')         step.minutes      = parseInt(e.target.value) || 0;
+      if (invField === 'inv-step-verification') step.verification = e.target.value;
       // Debounce LS writes — schedule via a shared timer
       clearTimeout(window._invSaveTimer);
       window._invSaveTimer = setTimeout(() => saveInvestigations(), 400);
@@ -6283,6 +6748,242 @@ function injectAppStyles() {
       white-space: nowrap;
       min-width: 0;
     }
+    /* Templates */
+    .tpl-suggestions {
+      background: rgba(147,51,234,0.06);
+      border: 1px solid rgba(147,51,234,0.25);
+      border-radius: 5px;
+      padding: 10px 12px;
+      margin: 8px 0 12px;
+    }
+    .tpl-suggestions-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .tpl-suggestion-row {
+      padding: 8px 10px;
+      margin-bottom: 4px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      background: var(--bg);
+    }
+    .tpl-suggestion-row:last-child { margin-bottom: 0; }
+    .tpl-suggestion-row:hover {
+      border-color: var(--accent);
+      background: rgba(0,180,216,0.04);
+    }
+    .tpl-suggestion-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .tpl-suggestion-meta {
+      font-size: 11px;
+      color: var(--textdim);
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .inv-template-badge {
+      display: inline-block;
+      font-family: var(--cond);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      color: var(--accent);
+      background: rgba(0,180,216,0.08);
+      border: 1px solid rgba(0,180,216,0.3);
+      padding: 3px 9px;
+      border-radius: 3px;
+      margin-bottom: 10px;
+    }
+    .inv-step-verify {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 4px;
+      font-size: 11px;
+    }
+    .inv-step-verify-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: #2a9d5c;
+      flex-shrink: 0;
+      padding: 2px 6px;
+      background: rgba(42,157,92,0.1);
+      border: 1px solid rgba(42,157,92,0.3);
+      border-radius: 3px;
+    }
+    .inv-step-verify-input {
+      flex: 1;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--textmid);
+      padding: 3px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-family: inherit;
+      font-style: italic;
+      min-width: 0;
+    }
+    .inv-step-verify-input:hover:not(:focus) { border-color: var(--border); }
+    .inv-step-verify-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--bg);
+      font-style: normal;
+    }
+    .inv-step-verify-empty { margin-top: 4px; }
+    .inv-step-add-verify {
+      cursor: pointer;
+      background: transparent;
+      border: 1px dashed var(--border);
+      color: var(--textdim);
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: var(--cond);
+      letter-spacing: 0.05em;
+    }
+    .inv-step-add-verify:hover {
+      border-color: rgba(42,157,92,0.5);
+      border-style: solid;
+      color: #2a9d5c;
+    }
+    /* Template modals */
+    .tpl-modal-label {
+      display: block;
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--textdim);
+      margin: 10px 0 4px;
+    }
+    .tpl-modal-input {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: inherit;
+      box-sizing: border-box;
+    }
+    .tpl-modal-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    /* Template picker rows */
+    .tpl-picker-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: var(--bg);
+    }
+    .tpl-picker-row:hover {
+      border-color: var(--accent);
+    }
+    .tpl-picker-main { flex: 1; min-width: 0; }
+    .tpl-picker-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .tpl-picker-desc {
+      font-size: 12px;
+      color: var(--textmid);
+      margin-bottom: 5px;
+      line-height: 1.4;
+    }
+    .tpl-picker-meta {
+      font-size: 11px;
+      color: var(--textdim);
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .tpl-picker-author { color: var(--textdim); }
+    .tpl-private-pill, .tpl-mine-pill {
+      font-family: var(--cond);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      padding: 1px 6px;
+      border-radius: 3px;
+    }
+    .tpl-private-pill {
+      background: rgba(200,160,0,0.12);
+      color: #c8a000;
+      border: 1px solid rgba(200,160,0,0.4);
+    }
+    .tpl-mine-pill {
+      background: rgba(0,180,216,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(0,180,216,0.4);
+    }
+    .tpl-picker-actions {
+      display: flex;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .tpl-delete-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--textdim);
+      width: 28px;
+      height: 28px;
+      border-radius: 3px;
+      font-size: 14px;
+      line-height: 1;
+      padding: 0;
+    }
+    .tpl-delete-btn:hover {
+      border-color: #c8102e;
+      color: #c8102e;
+    }
+    /* Drift modal */
+    .tpl-drift-section {
+      margin: 10px 0;
+      padding: 8px 12px;
+      background: rgba(0,0,0,0.05);
+      border-radius: 4px;
+    }
+    .tpl-drift-label {
+      font-family: var(--cond);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+    .tpl-drift-section ul {
+      margin: 0;
+      padding-left: 20px;
+      font-size: 12px;
+      color: var(--text);
+    }
+    .tpl-drift-section li { margin: 3px 0; line-height: 1.4; }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
