@@ -4462,6 +4462,92 @@ async function renderClientsView() {
   }
 }
 
+// Cache for client trend data — recomputed when fresh ticket data arrives
+const CLIENT_TREND_CACHE_TTL = 5 * 60 * 1000;
+state._clientTrendCache = null;
+
+async function ensureClientTrendData(days = 30) {
+  // Pull resolved tickets for the window once, cache the entire pool
+  if (state._clientTrendCache && Date.now() - state._clientTrendCache.fetchedAt < CLIENT_TREND_CACHE_TTL) {
+    return state._clientTrendCache;
+  }
+  let resolved = [];
+  try { resolved = await fetchResolvedTicketsForReports(days); }
+  catch(e) { console.warn('Trend resolved fetch failed:', e.message); }
+  state._clientTrendCache = {
+    fetchedAt: Date.now(),
+    resolved,
+    days,
+  };
+  return state._clientTrendCache;
+}
+
+// Build a daily open-ticket count series for one client over the window.
+// Uses currently-open tickets from state.tickets + resolved tickets from the cache.
+function buildClientTicketTrend(client, trendCache) {
+  if (!client?.atId || !trendCache) return null;
+  const days = trendCache.days || 30;
+  const now = Date.now();
+  const today = new Date(); today.setHours(23, 59, 59, 999);
+  // Build day buckets from oldest to newest
+  const buckets = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    buckets.push({ endMs: d.getTime(), count: 0 });
+  }
+  // Combine open + resolved tickets, but only for this client
+  const clientResolved = trendCache.resolved.filter(t => t.companyID === client.atId);
+  const clientOpen = Object.values(state.tickets).filter(t => !t.isDone && t.companyID === client.atId);
+  const allClientTickets = [...clientOpen, ...clientResolved];
+
+  for (const t of allClientTickets) {
+    const createMs = t.createDate ? new Date(t.createDate).getTime() : null;
+    if (!createMs) continue;
+    // Resolved date — for resolved tickets prefer resolvedDateTime, fallback to lastActivityDate
+    const resolvedMs = t.resolvedDateTime ? new Date(t.resolvedDateTime).getTime()
+                     : (clientResolved.includes(t) && t.lastActivityDate) ? new Date(t.lastActivityDate).getTime()
+                     : null;
+    // For each bucket, increment if ticket was open at end-of-day for that bucket
+    for (const b of buckets) {
+      if (createMs > b.endMs) continue; // not created yet at this point
+      if (resolvedMs && resolvedMs <= b.endMs) continue; // already resolved by this point
+      b.count++;
+    }
+  }
+  return buckets;
+}
+
+function svgSparkline(values, opts = {}) {
+  if (!values?.length) return '';
+  const w = opts.width || 80;
+  const h = opts.height || 18;
+  const max = Math.max(1, ...values);
+  const min = 0; // always anchor to 0
+  const range = max - min || 1;
+  const step = values.length > 1 ? (w - 2) / (values.length - 1) : 0;
+  const pts = values.map((v, i) => {
+    const x = 1 + i * step;
+    const y = h - 1 - ((v - min) / range) * (h - 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const color = opts.color || '#00b4d8';
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" preserveAspectRatio="none" style="display:block">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>`;
+}
+
+// Trend delta: compare last 7 days avg vs prior 7 days avg
+function trendDelta(values) {
+  if (!values || values.length < 14) return null;
+  const recent = values.slice(-7).reduce((a, b) => a + b.count, 0) / 7;
+  const prior = values.slice(-14, -7).reduce((a, b) => a + b.count, 0) / 7;
+  if (prior < 0.5 && recent < 0.5) return null; // basically zero, no trend
+  if (prior === 0) return { dir: recent > 0 ? 'up' : 'flat', pct: null };
+  const pct = Math.round(((recent - prior) / prior) * 100);
+  if (Math.abs(pct) < 10) return { dir: 'flat', pct };
+  return { dir: pct > 0 ? 'up' : 'down', pct };
+}
+
 function renderClientsListBody(clients, filter) {
   const body = document.getElementById('clientsListBody');
   if (!body) return;
@@ -4496,6 +4582,7 @@ function renderClientsListBody(clients, filter) {
         ${c.city ? `<span class="client-city">${esc(c.city)}${c.stateAbbr?', '+esc(c.stateAbbr):''}</span>` : ''}
       </div>
       <div class="client-row-right">
+        <span class="client-trend" data-trend-for="${esc(c.name)}"><span class="client-trend-loading">…</span></span>
         ${alertsN ? `<span class="client-stat client-stat-alerts">${alertsN} alerts</span>` : ''}
         ${ticketsN ? `<span class="client-stat client-stat-tickets">${ticketsN} tickets</span>` : ''}
         ${offline ? `<span class="client-stat client-stat-offline">${offline} offline</span>` : ''}
@@ -4504,6 +4591,36 @@ function renderClientsListBody(clients, filter) {
       </div>
     </div>`;
   }).join('');
+
+  // Async: hydrate sparklines once trend data is ready
+  hydrateClientTrends(filtered);
+}
+
+async function hydrateClientTrends(clients) {
+  const trendCache = await ensureClientTrendData(30);
+  if (!trendCache) return;
+  clients.forEach(c => {
+    const slot = document.querySelector(`.client-trend[data-trend-for="${CSS.escape(c.name)}"]`);
+    if (!slot) return;
+    if (!c.atId) { slot.innerHTML = ''; return; }
+    const trend = buildClientTicketTrend(c, trendCache);
+    if (!trend || trend.every(b => b.count === 0)) {
+      slot.innerHTML = '<span class="client-trend-empty">no activity</span>';
+      return;
+    }
+    const values = trend.map(b => b.count);
+    const max = Math.max(...values);
+    // Color by overall scale — more red for higher counts
+    const color = max >= 10 ? '#c8102e' : max >= 5 ? '#e07b00' : max >= 2 ? '#c8a000' : '#2a9d5c';
+    const delta = trendDelta(trend);
+    let deltaIcon = '';
+    if (delta) {
+      if (delta.dir === 'up')   deltaIcon = `<span class="client-trend-delta client-trend-up" title="Worsening: ${delta.pct}% more tickets vs prior 7 days">↑${delta.pct != null ? Math.abs(delta.pct) + '%' : ''}</span>`;
+      else if (delta.dir === 'down') deltaIcon = `<span class="client-trend-delta client-trend-down" title="Improving: ${Math.abs(delta.pct)}% fewer tickets vs prior 7 days">↓${Math.abs(delta.pct)}%</span>`;
+      else                       deltaIcon = `<span class="client-trend-delta client-trend-flat" title="Stable">→</span>`;
+    }
+    slot.innerHTML = svgSparkline(values, { color }) + deltaIcon;
+  });
 }
 
 async function renderClientDetail(client) {
@@ -7764,6 +7881,42 @@ function injectAppStyles() {
       letter-spacing: 0.09em;
       color: var(--textdim);
       margin-bottom: 10px;
+    }
+    /* Client trend sparklines */
+    .client-trend {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin-right: 6px;
+    }
+    .client-trend-loading,
+    .client-trend-empty {
+      font-size: 10px;
+      color: var(--textdim);
+      font-style: italic;
+    }
+    .client-trend-delta {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      padding: 1px 5px;
+      border-radius: 2px;
+    }
+    .client-trend-up {
+      color: #c8102e;
+      background: rgba(200,16,46,0.1);
+      border: 1px solid rgba(200,16,46,0.3);
+    }
+    .client-trend-down {
+      color: #2a9d5c;
+      background: rgba(42,157,92,0.1);
+      border: 1px solid rgba(42,157,92,0.3);
+    }
+    .client-trend-flat {
+      color: var(--textdim);
+      background: rgba(0,0,0,0.05);
+      border: 1px solid var(--border);
     }
     .health-badge {
       font-family: var(--cond);
