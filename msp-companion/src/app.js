@@ -1370,8 +1370,11 @@ function setInvestigation(ticketId, inv) {
 }
 
 // ─── TIME-ON-TICKET TRACKING ──────────────────────────────────────
+const MAX_SESSION_MS = 4 * 3600000; // Auto-stop a session after 4 uninterrupted hours
+
 // state-level — only one timer can be active at a time (the currently-viewed ticket)
-state.activeTimer = null; // { ticketId, startedMs }
+state.activeTimer = null;       // { ticketId, startedMs } — running session
+state.pausedTimer = null;       // { ticketId, accumulatedMs } — paused session, preserves time so far
 
 function getOrInitTimeTracking(inv) {
   if (!inv.timeTracking) {
@@ -1383,52 +1386,132 @@ function getOrInitTimeTracking(inv) {
 
 function startTicketTimer(ticketId) {
   if (!ticketId) return;
-  // If a different ticket has an active timer, stop it first
-  if (state.activeTimer && state.activeTimer.ticketId !== String(ticketId)) {
+  const idStr = String(ticketId);
+  // If a different ticket has an active or paused timer, stop it first
+  if (state.activeTimer && state.activeTimer.ticketId !== idStr) {
     stopTicketTimer();
   }
-  if (state.activeTimer && state.activeTimer.ticketId === String(ticketId)) return; // already running
+  if (state.pausedTimer && state.pausedTimer.ticketId !== idStr) {
+    // Different ticket was paused — commit it as a closed session
+    commitPausedTimer();
+  }
+  if (state.activeTimer && state.activeTimer.ticketId === idStr) return; // already running
   const inv = getInvestigation(ticketId);
   if (!inv) return; // No investigation = no timer
-  state.activeTimer = { ticketId: String(ticketId), startedMs: Date.now() };
+  // Resume from paused state if applicable, otherwise fresh start
+  if (state.pausedTimer && state.pausedTimer.ticketId === idStr) {
+    state.activeTimer = {
+      ticketId: idStr,
+      startedMs: Date.now(),
+      accumulatedMs: state.pausedTimer.accumulatedMs || 0,
+    };
+    state.pausedTimer = null;
+  } else {
+    state.activeTimer = { ticketId: idStr, startedMs: Date.now(), accumulatedMs: 0 };
+  }
   // Tick the display once a minute while running
   if (state._timerTickInterval) clearInterval(state._timerTickInterval);
   state._timerTickInterval = setInterval(() => {
     if (!state.activeTimer) { clearInterval(state._timerTickInterval); state._timerTickInterval = null; return; }
+    // 4-hour session cap — auto-stop and toast the user so they know
+    if (Date.now() - state.activeTimer.startedMs >= MAX_SESSION_MS) {
+      const cappedTicketId = state.activeTimer.ticketId;
+      stopTicketTimer();
+      showToast(`⏱ Auto-stopped timer at 4h on ticket ${cappedTicketId} — assumed forgotten`, 'info');
+      // Re-render the investigation card to update the badge
+      if (state.currentTicket && String(state.currentTicket.id) === cappedTicketId) {
+        renderTicketDetail(state.currentTicket);
+      }
+      return;
+    }
     const display = document.getElementById(`invTimeDisplay-${state.activeTimer.ticketId}`);
     if (display) display.textContent = fmtMsAsDuration(getInvestigationTotalMs(state.activeTimer.ticketId));
   }, 60000);
 }
 
-function stopTicketTimer() {
-  if (state._timerTickInterval) { clearInterval(state._timerTickInterval); state._timerTickInterval = null; }
+function pauseTicketTimer() {
   if (!state.activeTimer) return;
-  const { ticketId, startedMs } = state.activeTimer;
-  const endedMs = Date.now();
-  const durationMs = endedMs - startedMs;
+  const { ticketId, startedMs, accumulatedMs } = state.activeTimer;
+  const sessionMs = Date.now() - startedMs;
+  const total = (accumulatedMs || 0) + sessionMs;
+  state.pausedTimer = { ticketId, accumulatedMs: total };
   state.activeTimer = null;
-  if (durationMs < 5000) return; // ignore sub-5-second sessions (tab switches, accidental clicks)
+  if (state._timerTickInterval) { clearInterval(state._timerTickInterval); state._timerTickInterval = null; }
+  // Re-render to swap badge to paused state
+  if (state.currentTicket && String(state.currentTicket.id) === ticketId) {
+    renderTicketDetail(state.currentTicket);
+  }
+}
+
+// Commit a paused timer's accumulated time as a session (called when leaving the ticket without resuming)
+function commitPausedTimer() {
+  if (!state.pausedTimer) return;
+  const { ticketId, accumulatedMs } = state.pausedTimer;
+  state.pausedTimer = null;
+  if (accumulatedMs < 5000) return;
   const inv = getInvestigation(ticketId);
   if (!inv) return;
   const tt = getOrInitTimeTracking(inv);
   const techName = getMyResourceName();
-  tt.sessions.push({ startMs: startedMs, endMs: endedMs, durationMs, tech: techName });
-  tt.totalMs = (tt.totalMs || 0) + durationMs;
-  tt.technicians[techName] = (tt.technicians[techName] || 0) + durationMs;
+  const endedMs = Date.now();
+  tt.sessions.push({ startMs: endedMs - accumulatedMs, endMs: endedMs, durationMs: accumulatedMs, tech: techName });
+  tt.totalMs = (tt.totalMs || 0) + accumulatedMs;
+  tt.technicians[techName] = (tt.technicians[techName] || 0) + accumulatedMs;
+  setInvestigation(ticketId, inv);
+}
+
+function stopTicketTimer() {
+  if (state._timerTickInterval) { clearInterval(state._timerTickInterval); state._timerTickInterval = null; }
+  // If paused, commit and clear
+  if (state.pausedTimer) {
+    commitPausedTimer();
+    return;
+  }
+  if (!state.activeTimer) return;
+  const { ticketId, startedMs, accumulatedMs } = state.activeTimer;
+  const endedMs = Date.now();
+  const sessionMs = endedMs - startedMs;
+  const totalDuration = (accumulatedMs || 0) + sessionMs;
+  state.activeTimer = null;
+  if (totalDuration < 5000) return; // ignore sub-5-second sessions
+  const inv = getInvestigation(ticketId);
+  if (!inv) return;
+  const tt = getOrInitTimeTracking(inv);
+  const techName = getMyResourceName();
+  tt.sessions.push({ startMs: endedMs - totalDuration, endMs: endedMs, durationMs: totalDuration, tech: techName });
+  tt.totalMs = (tt.totalMs || 0) + totalDuration;
+  tt.technicians[techName] = (tt.technicians[techName] || 0) + totalDuration;
   setInvestigation(ticketId, inv);
 }
 
 function getCurrentSessionMs() {
-  if (!state.activeTimer) return 0;
-  return Date.now() - state.activeTimer.startedMs;
+  if (state.activeTimer) {
+    return (state.activeTimer.accumulatedMs || 0) + (Date.now() - state.activeTimer.startedMs);
+  }
+  if (state.pausedTimer) return state.pausedTimer.accumulatedMs || 0;
+  return 0;
+}
+
+function isTimerActiveFor(ticketId) {
+  return state.activeTimer?.ticketId === String(ticketId);
+}
+
+function isTimerPausedFor(ticketId) {
+  return state.pausedTimer?.ticketId === String(ticketId);
 }
 
 function getInvestigationTotalMs(ticketId) {
   const inv = getInvestigation(ticketId);
-  if (!inv?.timeTracking) return 0;
+  if (!inv?.timeTracking) {
+    // No saved sessions yet — but live timer might be running on this ticket
+    if (isTimerActiveFor(ticketId) || isTimerPausedFor(ticketId)) {
+      return getCurrentSessionMs();
+    }
+    return 0;
+  }
   let total = inv.timeTracking.totalMs || 0;
-  // Add live session time if this ticket has the active timer
-  if (state.activeTimer?.ticketId === String(ticketId)) {
+  // Add live session time if this ticket has the active or paused timer
+  if (isTimerActiveFor(ticketId) || isTimerPausedFor(ticketId)) {
     total += getCurrentSessionMs();
   }
   return total;
@@ -3667,10 +3750,18 @@ function renderInvestigationCard(ticket) {
   const inv = getInvestigation(ticket.id);
   const hasInv = !!(inv && inv.steps?.length);
   const totalMs = hasInv ? getInvestigationTotalMs(ticket.id) : 0;
-  const isActive = state.activeTimer?.ticketId === String(ticket.id);
-  const timeBadge = hasInv && (totalMs > 0 || isActive)
-    ? `<span class="inv-time-badge ${isActive?'inv-time-active':''}" title="${isActive ? 'Timer running' : 'Total tracked time'}">⏱ <span id="invTimeDisplay-${ticket.id}">${esc(fmtMsAsDuration(totalMs))}</span></span>`
-    : '';
+  const isActive = isTimerActiveFor(ticket.id);
+  const isPaused = isTimerPausedFor(ticket.id);
+  let timeBadge = '';
+  if (hasInv && (totalMs > 0 || isActive || isPaused)) {
+    if (isActive) {
+      timeBadge = `<button class="inv-time-badge inv-time-active" data-action="timer-pause" data-ticket-id="${ticket.id}" title="Click to pause — phone call, lunch, etc.">⏱ <span id="invTimeDisplay-${ticket.id}">${esc(fmtMsAsDuration(totalMs))}</span> <span class="inv-time-action">⏸ pause</span></button>`;
+    } else if (isPaused) {
+      timeBadge = `<button class="inv-time-badge inv-time-paused" data-action="timer-resume" data-ticket-id="${ticket.id}" title="Click to resume timer">⏸ <span id="invTimeDisplay-${ticket.id}">${esc(fmtMsAsDuration(totalMs))}</span> <span class="inv-time-action">▶ resume</span></button>`;
+    } else {
+      timeBadge = `<span class="inv-time-badge" title="Total tracked time across sessions">⏱ <span id="invTimeDisplay-${ticket.id}">${esc(fmtMsAsDuration(totalMs))}</span></span>`;
+    }
+  }
   const headerHtml = `<div class="card-label" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
     <span>★ AI INVESTIGATION</span>
     <span style="display:flex;align-items:center;gap:8px">
@@ -6009,6 +6100,19 @@ function wireEvents() {
       renderTicketDetail(ticket);
     }
 
+    if (action==='timer-pause') {
+      pauseTicketTimer();
+      // Card re-renders inside pauseTicketTimer
+    }
+
+    if (action==='timer-resume') {
+      const tid = el.dataset.ticketId;
+      const ticket = findTicketById(tid);
+      if (!ticket) return;
+      startTicketTimer(ticket.id);
+      renderTicketDetail(ticket);
+    }
+
     if (action==='inv-step-add-verification') {
       const stepEl = el.closest('.inv-step'); if (!stepEl) return;
       const ticket = findTicketById(stepEl.dataset.ticketId);
@@ -7963,6 +8067,7 @@ function injectAppStyles() {
     }
     .excluded-chip button:hover { color: #c8102e; }
     /* Investigation time tracker badge */
+    button.inv-time-badge,
     .inv-time-badge {
       font-family: var(--cond, 'Bebas Neue', sans-serif);
       font-size: 11px;
@@ -7974,12 +8079,41 @@ function injectAppStyles() {
       background: rgba(0,180,216,0.08);
       border: 1px solid rgba(0,180,216,0.3);
       text-transform: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: default;
+    }
+    button.inv-time-badge {
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
     }
     .inv-time-badge.inv-time-active {
       color: #2a9d5c;
       background: rgba(42,157,92,0.1);
       border-color: rgba(42,157,92,0.4);
       animation: time-pulse 2s ease-in-out infinite;
+    }
+    button.inv-time-badge.inv-time-active:hover {
+      background: rgba(42,157,92,0.18);
+      border-color: rgba(42,157,92,0.6);
+    }
+    .inv-time-badge.inv-time-paused {
+      color: #c8a000;
+      background: rgba(200,160,0,0.1);
+      border-color: rgba(200,160,0,0.4);
+      animation: none;
+    }
+    button.inv-time-badge.inv-time-paused:hover {
+      background: rgba(200,160,0,0.18);
+      border-color: rgba(200,160,0,0.6);
+    }
+    .inv-time-action {
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      opacity: 0.75;
+      padding-left: 4px;
+      border-left: 1px solid currentColor;
     }
     @keyframes time-pulse {
       0%, 100% { box-shadow: 0 0 0 0 rgba(42,157,92,0.3); }
@@ -8889,19 +9023,7 @@ async function boot() {
 }
 
 // Stop timer cleanly when user closes tab or navigates away
+// Save any in-progress timer cleanly when user closes tab or navigates away
 window.addEventListener('beforeunload', () => stopTicketTimer());
-
-// Pause/resume on tab visibility — if user is on another tab, don't count that time
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    // Save any in-progress session, stop the timer
-    stopTicketTimer();
-  } else {
-    // Tab is visible again — resume timer if currently looking at a ticket with an investigation
-    if (state.currentView === 'tickets' && state.currentTicket && getInvestigation(state.currentTicket.id)) {
-      startTicketTimer(state.currentTicket.id);
-    }
-  }
-});
 
 boot();
