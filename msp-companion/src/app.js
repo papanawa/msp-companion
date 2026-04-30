@@ -381,6 +381,25 @@ window.forceResolveAlerts = async (uids) => {
   }
 };
 
+// Console: backupNow() — downloads a JSON of all Companion data
+window.backupNow = () => {
+  const count = exportBackup();
+  console.log(`✓ Backup downloaded — ${count} keys saved`);
+};
+
+// Console: backupInspect() — print sizes of each backed-up key
+window.backupInspect = () => {
+  let total = 0;
+  console.log('=== Companion localStorage breakdown ===');
+  BACKUP_KEYS.forEach(key => {
+    const v = localStorage.getItem(key);
+    const size = v ? v.length : 0;
+    total += size;
+    if (v) console.log(`  ${key}: ${(size/1024).toFixed(1)} KB`);
+  });
+  console.log(`Total: ${(total/1024).toFixed(1)} KB`);
+};
+
 window.debugAlert = () => {
   const a = window._lastAlert;
   if (!a) { console.log('No alert selected yet'); return; }
@@ -7458,6 +7477,181 @@ function injectAlertGroupingToggle() {
   });
 }
 
+// ─── BACKUP / RESTORE ─────────────────────────────────────────────
+// Keys that represent persistent user data — not transient caches that can rebuild from API
+const BACKUP_KEYS = [
+  'msp_settings',
+  'msp_tickets',
+  'msp_alerts',
+  'msp_resolved',
+  'msp_at_companies',
+  'msp_at_picklist',
+  'msp_at_priority_picklist',
+  'msp_at_ticket_picklists',
+  'msp_notes',
+  'msp_ai',
+  'msp_chats',
+  'msp_ticket_chats',
+  'msp_kb_context_cache',
+  'msp_history_context_cache',
+  'msp_investigations',
+  'msp_templates',
+  'msp_kb',
+  'msp_psa_excluded',
+  'msp_hidden_clients',
+  'msp_incidents',
+  'msp_view',
+  'msp_lightmode',
+];
+
+function exportBackup() {
+  const data = { schemaVersion: 1, exportedAt: new Date().toISOString(), keys: {} };
+  BACKUP_KEYS.forEach(key => {
+    const v = localStorage.getItem(key);
+    if (v != null) data.keys[key] = v;
+  });
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const today = new Date().toISOString().substring(0, 10);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `msp-companion-backup-${today}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  // Stamp a "last backup" marker so we know when this happened
+  localStorage.setItem('msp_last_backup', new Date().toISOString());
+  return Object.keys(data.keys).length;
+}
+
+function importBackup(jsonText) {
+  let data;
+  try { data = JSON.parse(jsonText); }
+  catch(e) { throw new Error('File is not valid JSON'); }
+  if (!data || typeof data !== 'object' || !data.keys) {
+    throw new Error('File does not look like a Companion backup');
+  }
+  if (data.schemaVersion && data.schemaVersion > 1) {
+    throw new Error(`Backup is from a newer version of Companion (schema ${data.schemaVersion}). Update Companion before restoring.`);
+  }
+  const keys = data.keys || {};
+  const restoredKeys = [];
+  Object.entries(keys).forEach(([key, value]) => {
+    if (!BACKUP_KEYS.includes(key)) return; // ignore unexpected keys defensively
+    if (typeof value !== 'string') return;
+    localStorage.setItem(key, value);
+    restoredKeys.push(key);
+  });
+  return { restoredKeys, exportedAt: data.exportedAt };
+}
+
+function showRestoreConfirmModal(file) {
+  return new Promise((resolve) => {
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+    modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:520px">
+      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px;color:#e07b00">⚠ Restore from Backup</div>
+      <div style="font-size:13px;color:var(--text);margin-bottom:14px;line-height:1.5">Restoring will <strong>replace</strong> your current Companion data — settings, templates, investigations, KB entries, exclusions — with what's in <code style="background:rgba(0,0,0,0.15);padding:2px 6px;border-radius:3px">${esc(file.name)}</code>.</div>
+      <div style="font-size:12px;color:var(--textdim);margin-bottom:16px;padding:10px;background:rgba(224,123,0,0.08);border-left:3px solid #e07b00;border-radius:3px">After restore, the page will reload. Anything in your current Companion that isn't in the backup will be lost. Make a fresh backup first if you have new work since this file was created.</div>
+      <div style="display:flex;gap:8px">
+        <button id="restoreConfirmBtn" style="flex:2;cursor:pointer;background:#e07b00;border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">⚠ Replace All Data & Restore</button>
+        <button id="restoreCancelBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Cancel</button>
+      </div>
+    </div>`;
+    document.body.appendChild(modal);
+    document.getElementById('restoreCancelBtn').addEventListener('click', () => {
+      document.body.removeChild(modal); resolve(false);
+    });
+    document.getElementById('restoreConfirmBtn').addEventListener('click', () => {
+      document.body.removeChild(modal); resolve(true);
+    });
+  });
+}
+
+function injectBackupRestore() {
+  if (document.getElementById('backupRestoreBlock')) return;
+  const saveBtn = document.getElementById('savePrefsBtn');
+  if (!saveBtn) return;
+  const container = saveBtn.parentElement;
+  if (!container) return;
+
+  const lastBackupISO = localStorage.getItem('msp_last_backup');
+  const lastBackupDisplay = lastBackupISO ? new Date(lastBackupISO).toLocaleString() : 'never';
+  const daysSince = lastBackupISO
+    ? Math.floor((Date.now() - new Date(lastBackupISO).getTime()) / 86400000)
+    : null;
+  const stale = daysSince === null || daysSince > 7;
+
+  const block = document.createElement('div');
+  block.id = 'backupRestoreBlock';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(42,157,92,0.04)';
+  block.innerHTML = `
+    <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">💾 BACKUP & RESTORE</div>
+    <div style="font-size:11px;color:var(--textdim);margin-bottom:10px;line-height:1.5">
+      Companion stores your settings, templates, investigations, and KB entries in your browser's local storage. Clearing browser data wipes this. <strong>Back up regularly.</strong>
+    </div>
+    <div style="font-size:11px;color:${stale?'#e07b00':'var(--textmid)'};margin-bottom:10px">
+      Last backup: <strong>${lastBackupDisplay}</strong>${daysSince !== null && daysSince > 0 ? ` (${daysSince} day${daysSince!==1?'s':''} ago)` : ''}
+      ${stale ? ' — recommend a fresh backup' : ''}
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button id="exportBackupBtn" style="cursor:pointer;background:rgba(42,157,92,0.18);border:1px solid rgba(42,157,92,0.5);color:#2a9d5c;padding:8px 14px;border-radius:4px;font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:0.07em">⬇ Download Backup</button>
+      <button id="importBackupBtn" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:8px 14px;border-radius:4px;font-family:var(--cond);font-size:12px;font-weight:600;letter-spacing:0.07em">⬆ Restore from File</button>
+      <input type="file" id="importBackupFile" accept=".json,application/json" style="display:none" />
+    </div>
+    <div id="backupStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:8px;color:var(--textdim)"></div>
+  `;
+  container.insertBefore(block, saveBtn);
+
+  const statusEl = document.getElementById('backupStatus');
+  const flash = (msg, color) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.style.color = color || 'var(--textdim)';
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+  };
+
+  document.getElementById('exportBackupBtn')?.addEventListener('click', () => {
+    try {
+      const count = exportBackup();
+      flash(`✓ Backup downloaded — ${count} keys saved`, '#2a9d5c');
+      // Refresh the "last backup" display
+      setTimeout(() => {
+        const block = document.getElementById('backupRestoreBlock');
+        if (block) { block.remove(); injectBackupRestore(); }
+      }, 1500);
+    } catch(err) {
+      flash(`Export failed: ${err.message}`, '#c8102e');
+    }
+  });
+
+  document.getElementById('importBackupBtn')?.addEventListener('click', () => {
+    document.getElementById('importBackupFile')?.click();
+  });
+
+  document.getElementById('importBackupFile')?.addEventListener('change', async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = ''; // reset so same file can be picked again
+    try {
+      const text = await file.text();
+      // Quick pre-validate before showing the confirm
+      const data = JSON.parse(text);
+      if (!data?.keys) { flash('Not a Companion backup file', '#c8102e'); return; }
+      const confirmed = await showRestoreConfirmModal(file);
+      if (!confirmed) return;
+      const result = importBackup(text);
+      flash(`✓ Restored ${result.restoredKeys.length} keys — reloading...`, '#2a9d5c');
+      setTimeout(() => location.reload(), 1200);
+    } catch(err) {
+      flash(`Restore failed: ${err.message}`, '#c8102e');
+    }
+  });
+}
+
 function injectAiContextToggles() {
   if (document.getElementById('aiCtxToggleBlock')) return;
   // Anchor on the Save Preferences button — it's a reliable marker for the prefs card
@@ -7522,6 +7716,7 @@ async function boot() {
   loadSettings();
   injectAiContextToggles();
   injectAlertGroupingToggle();
+  injectBackupRestore();
   injectClientsViewAndNav();
   injectVerifyButton();
   injectVerifyAutotaskButton();
