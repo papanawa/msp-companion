@@ -20,6 +20,7 @@ const state = {
   criticalPromptSnoozes: {},          // alertUid → snoozedUntilMs
   criticalPromptDismissed: new Set(), // alertUids permanently dismissed for this session
   criticalScanTimer: null,
+  lastHandoff: null,                  // { generatedAtMs, generatedBy, hours, content, techNotes }
   clients: null,                      // unified client list (AT companies + Datto sites)
   hiddenClients: new Set(),           // client names hidden from the list
   showHiddenClients: false,           // toggle to reveal hidden clients
@@ -82,6 +83,7 @@ function loadSettings() {
   state.historyContextCache = LS.get('msp_history_context_cache', {});
   state.investigations      = LS.get('msp_investigations', {});
   state.criticalPromptSnoozes = LS.get('msp_critical_snoozes', {});
+  state.lastHandoff = LS.get('msp_last_handoff', null);
   state.templates           = LS.get('msp_templates', {});
   const s = state.settings;
   setVal('set-apiKey',          s.apiKey || '');
@@ -2377,6 +2379,263 @@ function startCriticalScanner() {
   // Run once immediately
   pruneCriticalSnoozes();
   renderCriticalPromptBanner();
+}
+
+// ─── SHIFT HANDOFF REPORT ─────────────────────────────────────────
+function getHandoffWindowHours() {
+  const h = parseInt(state.settings.handoffWindowHours);
+  return (!h || h < 1 || h > 168) ? 12 : h;
+}
+
+// Gather everything that happened in the last N hours into a structured payload for the AI.
+async function buildHandoffData(hours) {
+  const cutoffMs = Date.now() - hours * 3600000;
+
+  // Currently open critical/high alerts
+  const openCritical = (state.alerts || []).filter(a => a.priority === 'Critical');
+  const openHigh = (state.alerts || []).filter(a => a.priority === 'High');
+
+  // Active investigations — anything with steps and recent activity
+  const activeInvestigations = [];
+  Object.entries(state.investigations || {}).forEach(([ticketId, inv]) => {
+    if (!inv?.steps?.length) return;
+    const lastSession = inv.timeTracking?.sessions?.slice(-1)[0];
+    const lastActivityMs = lastSession?.endMs || inv.lastAnalyzedAt || 0;
+    if (lastActivityMs < cutoffMs) return;
+    const ticket = Object.values(state.tickets).find(t => String(t.id) === ticketId);
+    if (!ticket || ticket.isDone) return;
+    const completedSteps = inv.steps.filter(s => s.done).length;
+    const recentNotes = inv.steps
+      .filter(s => s.notes?.trim())
+      .map(s => `Step ${inv.steps.indexOf(s)+1}: ${s.notes.trim()}`)
+      .join('\n');
+    activeInvestigations.push({
+      ticketNumber: ticket.ticketNumber,
+      title: ticket.title,
+      client: ticket.companyName,
+      assignee: ticket.assignedResourceName || 'Unassigned',
+      progress: `${completedSteps}/${inv.steps.length} steps complete`,
+      timeSpent: fmtMsAsDuration(inv.timeTracking?.totalMs || 0),
+      recentNotes: recentNotes || '(no notes captured)',
+    });
+  });
+
+  // Tickets resolved in window — try to fetch from AT
+  let resolvedTickets = [];
+  try {
+    const days = Math.max(1, Math.ceil(hours / 24));
+    const all = await fetchResolvedTicketsForReports(days);
+    resolvedTickets = all.filter(t => {
+      const resolvedMs = t.resolvedDateTime ? new Date(t.resolvedDateTime).getTime()
+                       : t.lastActivityDate ? new Date(t.lastActivityDate).getTime()
+                       : 0;
+      return resolvedMs >= cutoffMs;
+    });
+  } catch(e) { console.warn('Resolved tickets fetch for handoff failed:', e.message); }
+
+  // Aging tickets (open > 14 days)
+  const agingTickets = Object.values(state.tickets || []).filter(t => {
+    if (t.isDone) return false;
+    if (!t.createDate) return false;
+    return Date.now() - new Date(t.createDate).getTime() > 14 * 86400000;
+  }).slice(0, 10);
+
+  // Mismatches — ticket closed but Datto alert still open
+  const mismatches = (state.alerts || []).filter(a => {
+    if (!a.ticketNumber) return false;
+    const t = state.tickets[a.ticketNumber];
+    return t?.isDone;
+  });
+
+  // Critical clients — clients with multiple criticals or unhandled criticals
+  const criticalClients = {};
+  openCritical.forEach(a => {
+    if (!criticalClients[a.siteName]) criticalClients[a.siteName] = 0;
+    criticalClients[a.siteName]++;
+  });
+
+  return {
+    windowHours: hours,
+    generatedAt: new Date().toISOString(),
+    openCritical: openCritical.map(a => ({
+      hostname: a.hostname,
+      client: a.siteName,
+      message: a.alertMessage,
+      ageMin: Math.floor((Date.now() - a.timestampMs) / 60000),
+      ticketNumber: a.ticketNumber,
+    })),
+    openHighCount: openHigh.length,
+    activeInvestigations,
+    resolvedTickets: resolvedTickets.map(t => ({
+      ticketNumber: t.ticketNumber,
+      title: t.title,
+      tech: state.atResources.find(r => r.id === t.assignedResourceID)?.name || 'Unknown',
+    })),
+    agingTickets: agingTickets.map(t => ({
+      ticketNumber: t.ticketNumber,
+      title: t.title,
+      client: t.companyName,
+      ageDays: Math.floor((Date.now() - new Date(t.createDate).getTime()) / 86400000),
+      assignee: t.assignedResourceName || 'Unassigned',
+    })),
+    mismatchCount: mismatches.length,
+    criticalClients: Object.entries(criticalClients).map(([client, count]) => ({ client, count })),
+  };
+}
+
+function buildHandoffSystemPrompt() {
+  return `You are an MSP shift supervisor writing a concise hand-off report. The outgoing tech is wrapping their shift; the incoming tech needs to be operational in 60 seconds of reading.
+
+You'll receive structured data about the shift period: open Criticals, active investigations, resolved tickets, aging tickets, and any free-text notes the outgoing tech wanted to pass along.
+
+Output a clean Markdown-style hand-off using these EXACT section headers, in this order. Skip any section if its data is empty (don't write "none" — just omit the section entirely):
+
+🚨 NEEDS ATTENTION FIRST
+Critical alerts open right now, prioritized by client impact and age. One line each, format: "T-XXXX [if exists] — Client — Hostname — issue (Xm old)".
+
+🔧 ACTIVE WORK IN PROGRESS
+Investigations the outgoing tech was working that are not done. Format: "T-XXXX — Client — title — status (X/Y steps, time spent: Xh) — assignee". Add 1 sentence on what the incoming tech needs to know to pick up where it was left off, drawn from the recent step notes.
+
+⚠ WATCH LIST
+Aging tickets (>14 days), recurring criticals at the same client, mismatches.
+
+✅ RESOLVED THIS SHIFT
+Brief list of completed tickets. One line each.
+
+📌 OUTGOING TECH NOTES
+If the outgoing tech provided free-text handoff notes, surface them prominently here. Quote them faithfully. If no notes, omit this section entirely.
+
+Rules:
+- Be terse. Each bullet is one line. Two if absolutely necessary.
+- Use ticket numbers always. Use client names always. Hostname when relevant.
+- No fluff, no greetings, no sign-off, no "have a great shift!"
+- Don't editorialize or add commentary. Just the facts in handoff-ready form.
+- If outgoing notes contradict the data (e.g. "ignore Wallquest disk alerts tonight, scheduled maintenance"), trust the notes and flag the conflict for the incoming tech.
+- Total length: aim for under 300 words.`;
+}
+
+async function generateHandoffReport(hours, techNotes) {
+  const data = await buildHandoffData(hours);
+  const system = buildHandoffSystemPrompt();
+  const techNotesBlock = (techNotes || '').trim()
+    ? `\n\n── OUTGOING TECH HANDOFF NOTES ──\n${techNotes.trim()}`
+    : '';
+  const userMsg = `SHIFT HANDOFF — last ${hours} hours.\n\n` +
+    JSON.stringify(data, null, 2) +
+    techNotesBlock;
+  const content = await callAI(system, [{ role: 'user', content: userMsg }]);
+  const handoff = {
+    generatedAtMs: Date.now(),
+    generatedBy: getMyResourceName(),
+    hours,
+    content: (content || '').trim(),
+    techNotes: (techNotes || '').trim(),
+  };
+  state.lastHandoff = handoff;
+  LS.set('msp_last_handoff', handoff);
+  return handoff;
+}
+
+function fmtHandoffContent(text) {
+  // Light markdown rendering — bold the section headers, preserve newlines
+  return esc(text)
+    .replace(/^(🚨|🔧|⚠|✅|📌)\s*([A-Z][A-Z\s]+)$/gm, '<div class="handoff-section">$1 $2</div>')
+    .replace(/\n/g, '<br>');
+}
+
+function showHandoffModal() {
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+
+  const last = state.lastHandoff;
+  const lastDisplay = last
+    ? `Last generated: <strong>${new Date(last.generatedAtMs).toLocaleString()}</strong> by ${esc(last.generatedBy || 'unknown')} (${last.hours}h window)`
+    : 'No prior handoff on file';
+  const defaultHours = getHandoffWindowHours();
+  const myName = getMyResourceName();
+
+  modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:760px;margin:auto">
+    <div style="font-family:var(--cond);font-size:18px;font-weight:700;letter-spacing:0.07em;margin-bottom:6px">📋 Shift Handoff</div>
+    <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">${lastDisplay}</div>
+
+    ${last ? `<div class="handoff-saved">
+      <div class="handoff-saved-label">SAVED HANDOFF (read-only)</div>
+      <div class="handoff-content">${fmtHandoffContent(last.content)}</div>
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <button id="handoffCopyBtn" class="abtn abtn-ghost" style="font-size:11px;padding:6px 12px">📋 Copy</button>
+      </div>
+    </div>` : ''}
+
+    <div class="handoff-generate-block">
+      <div class="handoff-generate-label">${last ? 'GENERATE NEW HANDOFF' : 'GENERATE HANDOFF'}</div>
+
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+        <label style="font-size:12px;color:var(--textmid)">Look back</label>
+        <input id="handoffHours" type="number" min="1" max="168" value="${defaultHours}" style="width:60px;padding:5px 8px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:3px;font-size:13px" />
+        <label style="font-size:12px;color:var(--textmid)">hours</label>
+      </div>
+
+      <label style="display:block;font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:4px">YOUR HANDOFF NOTES (optional, surfaced verbatim in report)</label>
+      <textarea id="handoffNotes" rows="3" placeholder="e.g. Wallquest has scheduled SQL maintenance 2-4am, ignore disk alerts. Erik is taking over the M365 ticket."
+        style="width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box"></textarea>
+
+      <div id="handoffStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:6px;color:var(--textdim)"></div>
+
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button id="handoffGenerateBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">✨ Generate Handoff</button>
+        <button id="handoffCloseBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Close</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+
+  const close = () => { if (document.body.contains(modal)) document.body.removeChild(modal); };
+  document.getElementById('handoffCloseBtn').addEventListener('click', close);
+
+  document.getElementById('handoffCopyBtn')?.addEventListener('click', () => {
+    if (!last?.content) return;
+    navigator.clipboard.writeText(last.content).then(() => {
+      const btn = document.getElementById('handoffCopyBtn');
+      if (btn) { btn.textContent = '✓ Copied'; setTimeout(() => btn.textContent = '📋 Copy', 1500); }
+    });
+  });
+
+  document.getElementById('handoffGenerateBtn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('handoffGenerateBtn');
+    const status = document.getElementById('handoffStatus');
+    const hoursInput = document.getElementById('handoffHours');
+    const notesInput = document.getElementById('handoffNotes');
+    const hours = parseInt(hoursInput?.value) || 12;
+    const techNotes = (notesInput?.value || '').trim();
+    btn.disabled = true; btn.textContent = '✨ Generating...';
+    if (status) { status.textContent = 'Gathering shift data and asking AI...'; status.style.color = 'var(--textdim)'; }
+    try {
+      await generateHandoffReport(hours, techNotes);
+      if (status) { status.textContent = '✓ Handoff generated and saved'; status.style.color = '#2a9d5c'; }
+      // Persist also as default for next time
+      saveSettings({ handoffWindowHours: hours });
+      // Close and reopen so the saved-handoff section appears
+      close();
+      setTimeout(showHandoffModal, 200);
+    } catch(err) {
+      if (status) { status.textContent = `Error: ${err.message}`; status.style.color = '#c8102e'; }
+      btn.disabled = false; btn.textContent = '✨ Generate Handoff';
+    }
+  });
+}
+
+function injectHandoffButton() {
+  if (document.getElementById('handoffBtn')) return;
+  const refresh = document.getElementById('dashRefreshBtn');
+  if (!refresh) return;
+  const btn = document.createElement('button');
+  btn.id = 'handoffBtn';
+  btn.className = refresh.className; // mirror styling
+  btn.title = 'Generate a shift handoff report for the next tech';
+  btn.innerHTML = '📋 Shift Handoff';
+  btn.style.marginRight = '6px';
+  btn.addEventListener('click', showHandoffModal);
+  refresh.parentNode.insertBefore(btn, refresh);
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────────────
@@ -7459,6 +7718,53 @@ function injectAppStyles() {
       0%, 100% { box-shadow: 0 0 0 0 rgba(42,157,92,0.3); }
       50%      { box-shadow: 0 0 0 4px rgba(42,157,92,0); }
     }
+    /* Handoff modal */
+    .handoff-saved {
+      background: rgba(0,180,216,0.04);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 4px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+    }
+    .handoff-saved-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .handoff-content {
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.6;
+      max-height: 360px;
+      overflow-y: auto;
+      padding-right: 8px;
+    }
+    .handoff-section {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      margin: 10px 0 4px;
+      color: var(--text);
+    }
+    .handoff-generate-block {
+      background: rgba(0,0,0,0.05);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 14px;
+    }
+    .handoff-generate-label {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      color: var(--textdim);
+      margin-bottom: 10px;
+    }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
@@ -7909,6 +8215,7 @@ const BACKUP_KEYS = [
   'msp_hidden_clients',
   'msp_incidents',
   'msp_critical_snoozes',
+  'msp_last_handoff',
   'msp_view',
   'msp_lightmode',
 ];
@@ -8205,6 +8512,7 @@ async function boot() {
   injectAlertGroupingToggle();
   injectCriticalPromptSettings();
   injectBackupRestore();
+  injectHandoffButton();
   injectClientsViewAndNav();
   injectVerifyButton();
   injectVerifyAutotaskButton();
