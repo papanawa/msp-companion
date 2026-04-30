@@ -1,6 +1,6 @@
 # MSP Companion — Roadmap
 
-Last updated: end of work session, prior to next planned session.
+Last updated: end of "five features in one day" session.
 
 ---
 
@@ -14,98 +14,100 @@ Last updated: end of work session, prior to next planned session.
 - Ticket list grouped by resource, default to active statuses, "show waiting/hold" toggle
 
 ### Ticket detail
-- Inline status / priority / queue / resource editing with batch save
+- Inline status / priority / queue / resource / **work type** editing with batch save
 - Accept and Complete buttons with resolution guard
 - Datto Device panel (online/offline, storage, AV/patch)
 - Activity feed of recent AT notes
-- Ticket metadata panel (issue type, sub-issue, source, work type, due/SLA, contract)
+- Ticket metadata panel (issue type, sub-issue, source, due/SLA, contract)
 - Open in Datto / Open in Autotask deep-links
+- `findTicketById` helper with fallback to currentTicket
 
 ### AI features
 - Alert quick triage with KB context + client ticket history auto-injection
 - Ticket investigation flow (analyze → editable checklist → step notes → draft resolution)
 - Tech context input
-- Mid-investigation chat with full plan + step notes context
+- Mid-investigation chat with full plan + step notes context (template-aware)
 - AI-formatted Save to KB (Symptom / Diagnosis / Fix)
 - AI incident clustering for related alerts
+- ⭐ **Investigation Templates** — auto-suggestion, verification criteria per step, drift detection, AI chat awareness
+- ⭐ **Auto-create tickets for Critical** — configurable threshold + excluded clients + snooze/dismiss banner
+- ⭐ **Shift handoff report** — AI summary modal with persistent saved handoff for next tech
+- ⭐ **Time-on-ticket tracking** — auto-timer with explicit pause/resume button + 4h session cap
 
 ### Knowledge base, Reports, Clients
 - KB save from alerts and tickets with AI-formatted entries
 - Reports view: alert trend, MTTR with trend arrows, tech workload, top clients, aging tickets
+- ⭐ **Reports trend visuals** — sparklines + delta badges on all top stat cards
+- ⭐ **Tracked Labor widget** in Reports + per-tech labor breakdown
 - Client Health Dashboard with drill-down slide-in panel
+- ⭐ **Client trend sparklines** — 30-day open-ticket trend per client with delta badge
 - Per-client hide toggle
 
 ### Reliability
-- Verify with Datto button (cache vs API drift detection)
+- Verify with Datto button (alert cache vs API drift detection)
+- **Verify with Autotask button** (ticket cache vs API drift detection)
+- Ghost ticket auto-cleanup (syncTicketStatuses drops tickets AT no longer returns)
+- **Refresh All on dashboard now pulls full ticket list** (was only syncing alert-linked)
 - Smart alert grouping (rule-based auto + AI on-demand + manual)
 - Auto-resolve linked alerts on ticket complete (extends to incident siblings)
 - Resource role auto-fill on assignment
-- Cleanup pass — debug noise removed, sections renamed for clarity
+- ⭐ **Backup & Restore** — download/upload all Companion data as JSON (Settings → Preferences)
+- Audit pass — added msp_excluded, msp_snoozed to backup keys (were silently lost on restore)
+
+### Polish
+- Cleanup pass — debug noise removed, sections renamed
+- Favicon + apple-touch-icon + mobile-web-app-capable meta (deprecation warning fixed)
+- Settings panels render full-width (no more text squish on injected blocks)
+- Timer badge starts before render (immediate visibility on Apply Template)
 
 ---
 
 ## 🎯 Next Session Queue (in order)
 
-### 1. ⭐ Investigation Templates (PRIORITY)
-Save a successful investigation plan as a reusable template.
-- Save current investigation as template (button on the investigation card)
-- Library view of saved templates
-- Apply template to a new ticket with one click — populates plan steps
-- Tag templates (by monitor type, client, etc.) for findability
-- Templates are MSP-wide knowledge accumulation — every fixed problem becomes a starting point for the next one
+### 1. Bulk actions on alerts (UNFINISHED — partially built)
+**Current state:** the ☐ Selecting toggle already activates checkboxes on alert rows, and the "+ Group N" button works for creating manual incidents from the selected set. But there's no other action you can take with the selection.
 
-### 2. Auto-create tickets for Critical (manual, not automatic)
-- Setting in Preferences (default OFF)
-- Configurable threshold (default 15min after Critical alert appears with no ticket)
-- Excluded clients list
-- When a Critical alert hits the age threshold, a "Create ticket" prompt surfaces — not automatic submission
+**What to add:**
+- **Bulk resolve** — resolve all selected alerts in Datto in one go
+- **Bulk create-ticket-each** — open the create-ticket flow for each selected alert sequentially
+- **Bulk save-to-KB** — open the AI-formatted Save to KB modal pre-loaded with all selected alerts as context
+- **Bulk snooze** — snooze all selected for N hours
+- These join the existing "+ Group N" button when selecting mode is active. Buttons appear/disappear based on whether selection is empty or not.
 
-### 3. Shift handoff report
-End-of-shift AI summary for the next tech.
-- "What's new, what's open, what to watch"
-- Pulls from today's alerts, ticket activity, open criticals, aging tickets
-- One button → modal → copy or save
-- Lower urgency for Synobis (small team) but valuable if Companion ever ships to others
-
-### 4. Time-on-ticket tracking
-- Auto-timer starts when investigation card opens
-- Stops on Draft Resolution click
-- Logs labor time per ticket
-- Reports view: actual labor vs AT-logged (surfaces under-billed hours)
-
-### 5. Trends in Client Health Dashboard
-- Sparklines on each client row showing 30-day open ticket and alert counts
-- Spot trending-worse clients without clicking through
-- Builds on existing client list
-
-### 6. "What changed since I last looked" pill
-- Track last-viewed timestamp per view
-- On return, highlight new alerts/tickets that arrived since
-- Subtle "new since 2pm" pills
-- Helps re-entry after lunch / next morning
-
-### 7. KB tagging upgrade + Push to Autotask KB
-- Tag autocomplete from existing tags
-- Click-to-filter by tag, tag cloud on KB view
-- **NEW: Push Companion KB entries up to Autotask KB**
-  - Sync direction: Companion → AT (one-way, opt-in per entry)
-  - Maps Companion KB schema → AT KB schema
-  - Avoids duplicates by tracking which Companion entries have been pushed
-  - Useful when AT KB is the team's "source of truth" — Companion drafts, AT publishes
-
-### 8. Ticket merge
+### 2. Ticket merge
 When two tickets are about the same issue (often: alert→ticket creation races against tech manual creation).
 - Select two tickets, click Merge
 - Combined notes, resolution, time entries
 - One ticket survives; other becomes "merged into T-XXX" reference
 - Linked alerts re-point to the surviving ticket
 
-### 9. Bulk actions on alerts
-Multi-select already exists for incident grouping. Extend to:
-- Bulk resolve
-- Bulk create-ticket-each
-- Bulk save-to-KB
-- Bulk snooze
+### 3. Ticket lookup + completed investigation visibility
+Solves the "I have no way to pull up that old ticket" gap.
+- **Search box at top of Tickets list** — by ticket number or partial title
+  - If ticket is in cache, jump straight to it
+  - If not, hit AT API directly to fetch that single ticket → load into state → open
+- **Investigation card renders for any ticket with stored investigation**
+  - Same edit capabilities as live investigations
+  - "Save as Template" stays available — enables retroactive templating
+
+### 4. "What changed since I last looked" pill
+- Track last-viewed timestamp per view
+- On return, highlight new alerts/tickets that arrived since
+- Subtle "new since 2pm" pills
+
+### 5. KB tagging upgrade + Push to Autotask KB
+- Tag autocomplete from existing tags
+- Click-to-filter by tag, tag cloud on KB view
+- **Push Companion KB entries up to Autotask KB**
+  - Sync direction: Companion → AT (one-way, opt-in per entry)
+  - Maps Companion KB schema → AT KB schema
+  - Avoids duplicates by tracking which Companion entries have been pushed
+
+### 6. Dashboard stat-card drill-downs
+The big stat cards on the dashboard (Open Alerts, Critical, High, Open Tickets, Mismatches, No Ticket) should be clickable.
+- Click "11 Open Tickets" → see those 11 tickets in a slide-in panel
+- Click "1 Critical" → see the 1 critical alert
+- Reuses the drill-down panel pattern from Client Health Dashboard
 
 ---
 
@@ -115,6 +117,7 @@ Multi-select already exists for incident grouping. Extend to:
 - **Desktop notifications** for new Criticals
 - **On-call awareness** — Companion knows who's on call, routes Criticals
 - **Saved searches / filter presets**
+- **Auto-backup reminder** — banner if last backup > 7 days
 
 ---
 
@@ -139,11 +142,12 @@ Multi-select already exists for incident grouping. Extend to:
 
 ## 🛠 Architecture / Tech Debt
 
-- **File splitting** — At ~6,700 lines, app.js is approaching upper limit. Consider splitting into `api.js`, `ai.js`, `views.js`, `app.js` (orchestrator) once it crosses ~8,000.
+- **File splitting** ⚠ — At ~9,000 lines, app.js is well past comfortable single-file. Consider splitting into `api.js`, `ai.js`, `views.js`, `app.js` (orchestrator). Bumped up — schedule within next 2-3 sessions before next big feature.
+- **localStorage growth** — Investigations grow indefinitely. ~3 MB/year at current rate. Cleanup routine for tickets completed > 1 year ago.
 - **Pagination on long lists** — Tickets/clients/aging render everything. Fine today; needed at 1000+.
-- **Schema migrations** — localStorage schema has grown organically. Add a "schema version" + migration runner before any breaking change.
-- **EVENT WIRING section is 949 lines** — could split per-feature. Punt until it actively hurts.
-- **Test coverage** — none today. For a solo internal tool, cost likely exceeds value. Revisit if Companion grows beyond Synobis.
+- **Schema migrations** — Add a "schema version" + migration runner before any breaking change. Backup file already includes `schemaVersion: 1`.
+- **EVENT WIRING section is over 1000 lines** — would split per-feature once file splitting happens.
+- **Test coverage** — none today. Cost likely exceeds value for a solo internal tool.
 
 ---
 
