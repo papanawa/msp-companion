@@ -17,6 +17,9 @@ const state = {
   alertSelected: new Set(),           // alertUids currently selected
   ticketShowStale: false,
   reportsRange: 30, reportsResolvedTickets: null, reportsResolvedAlerts: null,
+  criticalPromptSnoozes: {},          // alertUid → snoozedUntilMs
+  criticalPromptDismissed: new Set(), // alertUids permanently dismissed for this session
+  criticalScanTimer: null,
   clients: null,                      // unified client list (AT companies + Datto sites)
   hiddenClients: new Set(),           // client names hidden from the list
   showHiddenClients: false,           // toggle to reveal hidden clients
@@ -78,6 +81,7 @@ function loadSettings() {
   state.kbContextCache      = LS.get('msp_kb_context_cache', {});
   state.historyContextCache = LS.get('msp_history_context_cache', {});
   state.investigations      = LS.get('msp_investigations', {});
+  state.criticalPromptSnoozes = LS.get('msp_critical_snoozes', {});
   state.templates           = LS.get('msp_templates', {});
   const s = state.settings;
   setVal('set-apiKey',          s.apiKey || '');
@@ -2192,6 +2196,113 @@ function renderResolutionFlow(alert) {
       <div class="flow-step-icon">${s.icon}</div>
       <div class="flow-step-label">${s.label}</div>
     </div>`).join('')}</div>`;
+}
+
+// ─── CRITICAL ALERT PROMPT (Auto-suggest ticket creation for old Criticals) ─
+const CRITICAL_SCAN_INTERVAL_MS = 60 * 1000; // scan once per minute
+
+function getCriticalPromptThresholdMs() {
+  const min = parseInt(state.settings.autoCreatePromptThresholdMin) || 15;
+  return min * 60 * 1000;
+}
+
+function getCriticalPromptExcludedSites() {
+  return new Set(state.settings.autoCreatePromptExcluded || []);
+}
+
+function findCriticalsNeedingPrompt() {
+  if (state.settings.autoCreatePromptCritical !== true) return [];
+  const threshold = getCriticalPromptThresholdMs();
+  const excluded = getCriticalPromptExcludedSites();
+  const now = Date.now();
+  return (state.alerts || []).filter(a => {
+    if (a.priority !== 'Critical') return false;
+    if (a.ticketNumber) return false; // already has a ticket
+    if (excluded.has(a.siteName)) return false;
+    if (state.criticalPromptDismissed.has(a.alertUid)) return false;
+    const snoozeUntil = state.criticalPromptSnoozes[a.alertUid];
+    if (snoozeUntil && snoozeUntil > now) return false;
+    const age = now - (a.timestampMs || 0);
+    return age >= threshold;
+  });
+}
+
+function snoozeCriticalPrompt(alertUid, hours = 1) {
+  state.criticalPromptSnoozes[alertUid] = Date.now() + hours * 3600000;
+  LS.set('msp_critical_snoozes', state.criticalPromptSnoozes);
+}
+
+function dismissCriticalPrompt(alertUid) {
+  state.criticalPromptDismissed.add(alertUid);
+  // Persist as a long-lived snooze (30 days) so dismiss survives page reload
+  snoozeCriticalPrompt(alertUid, 30 * 24);
+}
+
+function pruneCriticalSnoozes() {
+  const now = Date.now();
+  let changed = false;
+  Object.entries(state.criticalPromptSnoozes).forEach(([uid, until]) => {
+    if (until < now - 7 * 86400000) {
+      delete state.criticalPromptSnoozes[uid];
+      changed = true;
+    }
+  });
+  // Also drop snoozes/dismisses for alerts that no longer exist
+  const liveUids = new Set(state.alerts.map(a => a.alertUid));
+  Object.keys(state.criticalPromptSnoozes).forEach(uid => {
+    if (!liveUids.has(uid)) { delete state.criticalPromptSnoozes[uid]; changed = true; }
+  });
+  if (changed) LS.set('msp_critical_snoozes', state.criticalPromptSnoozes);
+}
+
+function renderCriticalPromptBanner() {
+  const container = document.getElementById('criticalPromptContainer') || (() => {
+    const dash = document.getElementById('view-dashboard');
+    const alertsView = document.getElementById('view-alerts');
+    if (!dash && !alertsView) return null;
+    const c = document.createElement('div');
+    c.id = 'criticalPromptContainer';
+    c.className = 'critical-prompt-container';
+    // Insert at the top of whichever view is active — but both contain it. Easier: append to body, fixed pos.
+    document.body.appendChild(c);
+    return c;
+  })();
+  if (!container) return;
+  const candidates = findCriticalsNeedingPrompt();
+  if (!candidates.length) {
+    container.innerHTML = '';
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = 'block';
+  container.innerHTML = candidates.slice(0, 3).map(a => {
+    const ageMin = Math.floor((Date.now() - a.timestampMs) / 60000);
+    return `<div class="critical-prompt-banner" data-alert-uid="${esc(a.alertUid)}">
+      <div class="critical-prompt-msg">
+        <span class="critical-prompt-icon">⚠</span>
+        <strong>Critical at ${esc(a.siteName)}</strong> · ${esc(a.hostname)} · open ${ageMin}m, no ticket
+        <div class="critical-prompt-detail">${esc((a.alertMessage || '').substring(0, 110))}</div>
+      </div>
+      <div class="critical-prompt-actions">
+        <button class="abtn abtn-create" data-action="critical-prompt-jump" data-alert-uid="${esc(a.alertUid)}">View Alert</button>
+        <button class="abtn abtn-ghost" data-action="critical-prompt-snooze" data-alert-uid="${esc(a.alertUid)}" title="Hide for 1 hour">Snooze 1h</button>
+        <button class="abtn abtn-ghost" data-action="critical-prompt-dismiss" data-alert-uid="${esc(a.alertUid)}" title="Don't prompt again for this alert">Dismiss</button>
+      </div>
+    </div>`;
+  }).join('') + (candidates.length > 3
+    ? `<div class="critical-prompt-more">+ ${candidates.length - 3} more Critical${candidates.length-3!==1?'s':''} pending</div>`
+    : '');
+}
+
+function startCriticalScanner() {
+  if (state.criticalScanTimer) clearInterval(state.criticalScanTimer);
+  state.criticalScanTimer = setInterval(() => {
+    pruneCriticalSnoozes();
+    renderCriticalPromptBanner();
+  }, CRITICAL_SCAN_INTERVAL_MS);
+  // Run once immediately
+  pruneCriticalSnoozes();
+  renderCriticalPromptBanner();
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────────────
@@ -5408,6 +5519,38 @@ function wireEvents() {
       renderTicketList();
     }
 
+    if (action==='critical-prompt-jump') {
+      const uid = el.dataset.alertUid;
+      const alert = state.alerts.find(a => a.alertUid === uid);
+      if (!alert) return;
+      state.currentAlert = alert;
+      setView('alerts');
+      renderAlertDetail(alert);
+    }
+
+    if (action==='critical-prompt-snooze') {
+      const uid = el.dataset.alertUid;
+      snoozeCriticalPrompt(uid, 1);
+      renderCriticalPromptBanner();
+      showToast('Snoozed for 1 hour', 'info');
+    }
+
+    if (action==='critical-prompt-dismiss') {
+      const uid = el.dataset.alertUid;
+      dismissCriticalPrompt(uid);
+      renderCriticalPromptBanner();
+      showToast('Dismissed — won\'t prompt again', 'info');
+    }
+
+    if (action==='remove-crit-excluded') {
+      const name = el.dataset.client;
+      const current = state.settings.autoCreatePromptExcluded || [];
+      saveSettings({ autoCreatePromptExcluded: current.filter(s => s !== name) });
+      document.getElementById('criticalPromptBlock')?.remove();
+      injectCriticalPromptSettings();
+      renderCriticalPromptBanner();
+    }
+
     if (action==='open-in-datto') {
       const deviceUid = el.dataset.deviceUid;
       await openDattoDeviceForAlert(deviceUid, el);
@@ -7085,6 +7228,79 @@ function injectAppStyles() {
       color: var(--text);
     }
     .tpl-drift-section li { margin: 3px 0; line-height: 1.4; }
+    /* Critical alert prompt banner */
+    .critical-prompt-container {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 800;
+      max-width: 460px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .critical-prompt-banner {
+      pointer-events: auto;
+      background: linear-gradient(135deg, rgba(200,16,46,0.16), rgba(200,16,46,0.08));
+      border: 1px solid rgba(200,16,46,0.5);
+      border-left: 4px solid #c8102e;
+      border-radius: 5px;
+      padding: 10px 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+      backdrop-filter: blur(8px);
+      animation: critical-slide 0.25s ease-out;
+    }
+    @keyframes critical-slide {
+      from { opacity: 0; transform: translateX(20px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+    .critical-prompt-msg { font-size: 13px; color: var(--text); line-height: 1.5; margin-bottom: 8px; }
+    .critical-prompt-icon { color: #c8102e; font-size: 14px; margin-right: 6px; }
+    .critical-prompt-detail {
+      font-size: 11px;
+      color: var(--textmid);
+      margin-top: 4px;
+      padding-left: 24px;
+    }
+    .critical-prompt-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .critical-prompt-actions .abtn { font-size: 11px; padding: 5px 10px; }
+    .critical-prompt-more {
+      pointer-events: auto;
+      font-family: var(--cond);
+      font-size: 11px;
+      color: var(--textdim);
+      padding: 6px 12px;
+      text-align: center;
+      background: rgba(0,0,0,0.4);
+      border-radius: 4px;
+    }
+    /* Excluded clients chip */
+    .excluded-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      padding: 3px 4px 3px 8px;
+      background: rgba(0,0,0,0.15);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--textmid);
+    }
+    .excluded-chip button {
+      background: transparent;
+      border: none;
+      color: var(--textdim);
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+      padding: 0 4px;
+    }
+    .excluded-chip button:hover { color: #c8102e; }
     .health-badge {
       font-family: var(--cond);
       font-size: 11px;
@@ -7534,6 +7750,7 @@ const BACKUP_KEYS = [
   'msp_psa_excluded',
   'msp_hidden_clients',
   'msp_incidents',
+  'msp_critical_snoozes',
   'msp_view',
   'msp_lightmode',
 ];
@@ -7601,6 +7818,84 @@ function showRestoreConfirmModal(file) {
     document.getElementById('restoreConfirmBtn').addEventListener('click', () => {
       document.body.removeChild(modal); resolve(true);
     });
+  });
+}
+
+function injectCriticalPromptSettings() {
+  if (document.getElementById('criticalPromptBlock')) return;
+  const saveBtn = document.getElementById('savePrefsBtn');
+  if (!saveBtn) return;
+  const container = saveBtn.parentElement;
+  if (!container) return;
+
+  const enabled = state.settings.autoCreatePromptCritical === true;
+  const threshold = parseInt(state.settings.autoCreatePromptThresholdMin) || 15;
+  const excluded = state.settings.autoCreatePromptExcluded || [];
+
+  const block = document.createElement('div');
+  block.id = 'criticalPromptBlock';
+  block.style.cssText = 'margin:14px 0;padding:12px;border:1px solid var(--border);border-radius:6px;background:rgba(200,16,46,0.04)';
+  block.innerHTML = `
+    <div style="font-family:var(--cond);font-size:11px;font-weight:700;letter-spacing:0.09em;color:var(--textdim);margin-bottom:10px">⚠ CRITICAL ALERT PROMPTS</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;font-size:13px">
+      <input type="checkbox" id="set-autoCreatePromptCritical" ${enabled?'checked':''} style="cursor:pointer" />
+      <span>Prompt to create ticket for unticketed Critical alerts</span>
+    </label>
+    <div style="font-size:11px;color:var(--textdim);margin:4px 0 10px;line-height:1.5">When ON: Companion shows a banner suggesting ticket creation for any Critical alert that's been open without a ticket past the threshold below. You stay in control — no automatic ticket submission.</div>
+
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+      <label style="font-size:12px;color:var(--textmid)">Prompt after</label>
+      <input type="number" id="set-autoCreatePromptThresholdMin" min="1" max="240" value="${threshold}" style="width:60px;padding:5px 8px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:3px;font-size:13px" />
+      <label style="font-size:12px;color:var(--textmid)">minutes without a ticket</label>
+    </div>
+
+    <div style="font-family:var(--cond);font-size:10px;font-weight:700;letter-spacing:0.08em;color:var(--textdim);margin-bottom:6px">EXCLUDED CLIENTS (never prompt)</div>
+    <div id="critPromptExcludedList" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
+      ${excluded.length ? excluded.map(s => `<span class="excluded-chip" data-client="${esc(s)}">${esc(s)} <button data-action="remove-crit-excluded" data-client="${esc(s)}">×</button></span>`).join('') : '<span style="color:var(--textdim);font-size:11px">None</span>'}
+    </div>
+    <div style="display:flex;gap:6px">
+      <input type="text" id="critExcludeInput" placeholder="Datto site name to exclude..." style="flex:1;padding:6px 8px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:3px;font-size:12px" />
+      <button id="critExcludeAddBtn" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:6px 12px;border-radius:3px;font-family:var(--cond);font-size:11px;font-weight:600;letter-spacing:0.07em">+ Add</button>
+    </div>
+    <div id="critPromptStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:6px;color:var(--textdim)"></div>
+  `;
+  container.insertBefore(block, saveBtn);
+
+  const statusEl = document.getElementById('critPromptStatus');
+  const flash = (msg, color) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.style.color = color || 'var(--textdim)';
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2500);
+  };
+
+  document.getElementById('set-autoCreatePromptCritical')?.addEventListener('change', e => {
+    saveSettings({ autoCreatePromptCritical: !!e.target.checked });
+    flash(e.target.checked ? '✓ Critical prompts ON' : '✓ Critical prompts OFF');
+    if (e.target.checked) startCriticalScanner();
+    renderCriticalPromptBanner();
+  });
+  document.getElementById('set-autoCreatePromptThresholdMin')?.addEventListener('change', e => {
+    const v = parseInt(e.target.value);
+    if (!v || v < 1 || v > 240) { e.target.value = state.settings.autoCreatePromptThresholdMin || 15; return; }
+    saveSettings({ autoCreatePromptThresholdMin: v });
+    flash(`✓ Threshold set to ${v} minutes`);
+    renderCriticalPromptBanner();
+  });
+  document.getElementById('critExcludeAddBtn')?.addEventListener('click', () => {
+    const input = document.getElementById('critExcludeInput');
+    const name = (input?.value || '').trim();
+    if (!name) return;
+    const current = state.settings.autoCreatePromptExcluded || [];
+    if (current.includes(name)) { flash('Already excluded', '#e07b00'); return; }
+    saveSettings({ autoCreatePromptExcluded: [...current, name] });
+    if (input) input.value = '';
+    // Re-inject to refresh chip list
+    document.getElementById('criticalPromptBlock')?.remove();
+    injectCriticalPromptSettings();
+    flash(`✓ Excluded ${name}`);
+    renderCriticalPromptBanner();
   });
 }
 
@@ -7750,6 +8045,7 @@ async function boot() {
   loadSettings();
   injectAiContextToggles();
   injectAlertGroupingToggle();
+  injectCriticalPromptSettings();
   injectBackupRestore();
   injectClientsViewAndNav();
   injectVerifyButton();
@@ -7780,6 +8076,7 @@ async function boot() {
   wireEvents();
   populateKnownClients();
   startAutoRefresh();
+  startCriticalScanner();
 
   if (state.settings.apiKey && state.settings.secretKey) {
     await refreshAll();
