@@ -5037,6 +5037,98 @@ async function buildReportsData(days) {
     });
   });
 
+  // ─── TREND SERIES & PRIOR-PERIOD COUNTS FOR STAT CARDS ───
+  const trendCutoffMs = Date.now() - days * 86400000;
+  const priorWindowStartMs = Date.now() - 2 * days * 86400000;
+
+  // Per-day buckets for current window
+  const today = new Date(); today.setHours(23, 59, 59, 999);
+  const dayBuckets = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    dayBuckets.push({
+      endMs: d.getTime(),
+      startMs: d.getTime() - 86400000,
+      ticketsResolved: 0,
+      alertsResolved: 0,
+      ticketMttrSamples: [],
+      alertMttrSamples: [],
+      laborMs: 0,
+    });
+  }
+
+  const bucketForMs = (ms) => dayBuckets.find(b => ms > b.startMs && ms <= b.endMs);
+
+  // Tickets resolved per day + ticket MTTR per day
+  resolvedTickets.forEach(t => {
+    const resolvedMs = (t.resolvedDateTime || t.lastActivityDate)
+      ? new Date(t.resolvedDateTime || t.lastActivityDate).getTime() : null;
+    if (!resolvedMs) return;
+    const b = bucketForMs(resolvedMs);
+    if (!b) return;
+    b.ticketsResolved++;
+    if (t.createDate) {
+      const dur = resolvedMs - new Date(t.createDate).getTime();
+      if (dur > 0) b.ticketMttrSamples.push(dur);
+    }
+  });
+
+  // Alerts resolved per day + alert MTTR per day
+  resolvedAlerts.forEach(a => {
+    if (!a.resolvedMs) return;
+    const b = bucketForMs(a.resolvedMs);
+    if (!b) return;
+    b.alertsResolved++;
+    if (a.timestampMs) {
+      const dur = a.resolvedMs - a.timestampMs;
+      if (dur > 0) b.alertMttrSamples.push(dur);
+    }
+  });
+
+  // Labor per day from investigations
+  Object.values(state.investigations || {}).forEach(inv => {
+    inv.timeTracking?.sessions?.forEach(s => {
+      const ms = s.endMs || s.startMs;
+      if (!ms) return;
+      const b = bucketForMs(ms);
+      if (b) b.laborMs += s.durationMs || 0;
+    });
+  });
+
+  // Compute MTTR per day as rolling 7-day average for smoother sparkline
+  const ticketMttrSeries = dayBuckets.map((_, i) => {
+    const window = dayBuckets.slice(Math.max(0, i - 6), i + 1);
+    const samples = window.flatMap(b => b.ticketMttrSamples);
+    return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
+  });
+  const alertMttrSeries = dayBuckets.map((_, i) => {
+    const window = dayBuckets.slice(Math.max(0, i - 6), i + 1);
+    const samples = window.flatMap(b => b.alertMttrSamples);
+    return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
+  });
+
+  // Prior-period counts (for delta calculation, not for sparkline)
+  const priorTicketsResolved = priorTickets.filter(t => {
+    const r = (t.resolvedDateTime || t.lastActivityDate)
+      ? new Date(t.resolvedDateTime || t.lastActivityDate).getTime() : 0;
+    return r >= priorWindowStartMs && r < trendCutoffMs;
+  }).length;
+
+  let priorAlertsResolved = 0;
+  try {
+    const priorAlerts = await fetchResolvedAlertsForReports(days * 2);
+    priorAlertsResolved = priorAlerts.filter(a => a.resolvedMs >= priorWindowStartMs && a.resolvedMs < trendCutoffMs).length;
+  } catch(e) { /* leave at 0 */ }
+
+  // Prior labor — sessions in prior window
+  let priorLaborMs = 0;
+  Object.values(state.investigations || {}).forEach(inv => {
+    inv.timeTracking?.sessions?.forEach(s => {
+      const ms = s.endMs || s.startMs;
+      if (ms >= priorWindowStartMs && ms < trendCutoffMs) priorLaborMs += s.durationMs || 0;
+    });
+  });
+
   return {
     days,
     ticketsResolvedCount: resolvedTickets.length,
@@ -5047,6 +5139,19 @@ async function buildReportsData(days) {
     agingTickets,
     laborTotals,
     alertTrendBuckets: await buildAlertTrendData(days),
+    // Trend data for stat cards
+    trendSeries: {
+      ticketsResolved: dayBuckets.map(b => b.ticketsResolved),
+      alertsResolved: dayBuckets.map(b => b.alertsResolved),
+      ticketMttr: ticketMttrSeries,
+      alertMttr: alertMttrSeries,
+      labor: dayBuckets.map(b => b.laborMs),
+    },
+    priorPeriodCounts: {
+      ticketsResolved: priorTicketsResolved,
+      alertsResolved: priorAlertsResolved,
+      laborMs: priorLaborMs,
+    },
   };
 }
 
@@ -5055,6 +5160,38 @@ function trendArrow(current, prior) {
   if (Math.abs(current - prior) / prior < 0.05) return '<span style="color:var(--textdim)">→ flat</span>';
   if (current < prior) return `<span style="color:#2a9d5c">↓ ${Math.round((1-current/prior)*100)}% better</span>`;
   return `<span style="color:#c8102e">↑ ${Math.round((current/prior-1)*100)}% slower</span>`;
+}
+
+// Trend badge for Reports stat cards. lowerIsBetter: false (default) = up arrow is bad (e.g. tickets opened);
+// lowerIsBetter: true (e.g. MTTR) = up arrow is bad (slower is bad), down arrow is good.
+// Actually for both meanings: ↑ on a count metric = "worse" if higher; ↓ on a duration metric = "better".
+// We use a single rule: caller picks color via lowerIsBetter flag.
+function reportsTrendBadge(current, prior, opts = {}) {
+  if (current == null || prior == null || (current === 0 && prior === 0)) return '';
+  if (prior === 0) {
+    // No prior data — just show direction without %
+    return current > 0
+      ? `<span class="rpt-trend rpt-trend-flat" title="No prior period to compare">new</span>`
+      : '';
+  }
+  const pct = Math.round(((current - prior) / prior) * 100);
+  if (Math.abs(pct) < 10) {
+    return `<span class="rpt-trend rpt-trend-flat" title="Within 10% of prior period">→ flat</span>`;
+  }
+  // For MTTR (lowerIsBetter=true), going up is bad. For counts (lowerIsBetter=false default), depends.
+  // For "more tickets resolved" the user generally wants UP = good. So flip color logic via 'upIsGood'.
+  const upIsGood = opts.upIsGood === true;
+  const goingUp = pct > 0;
+  const isGood = goingUp === upIsGood;
+  const cls = isGood ? 'rpt-trend-good' : 'rpt-trend-bad';
+  const arrow = goingUp ? '↑' : '↓';
+  return `<span class="rpt-trend ${cls}" title="${goingUp?'Up':'Down'} ${Math.abs(pct)}% vs prior ${opts.windowLabel||'period'}">${arrow} ${Math.abs(pct)}%</span>`;
+}
+
+// Tiny sparkline — same look as the client-trend one but configurable color
+function reportsSparkline(values, opts = {}) {
+  if (!values?.length) return '';
+  return svgSparkline(values, { width: opts.width || 90, height: opts.height || 20, color: opts.color || '#00b4d8' });
 }
 
 async function renderReportsView() {
@@ -5089,33 +5226,46 @@ function renderReportsBody(data) {
   if (!body) return;
   const ticketTrend = trendArrow(data.ticketMttr, data.priorMttr);
 
+  // Trend visuals — sparkline + delta badge per metric
+  const tr = data.trendSeries || {};
+  const pp = data.priorPeriodCounts || {};
+  // For MTTR series, we want a sparkline of the rolling avg in *minutes* for chart scaling
+  const ticketMttrSeriesMin = (tr.ticketMttr || []).map(ms => ms / 60000);
+  const alertMttrSeriesMin = (tr.alertMttr || []).map(ms => ms / 60000);
+  const laborSeriesMin = (tr.labor || []).map(ms => ms / 60000);
+
   body.innerHTML = `
     <!-- Top stats row -->
     <div class="reports-stats">
       <div class="reports-stat-card">
         <div class="reports-stat-label">TICKETS RESOLVED</div>
         <div class="reports-stat-value">${data.ticketsResolvedCount}</div>
-        <div class="reports-stat-sub">last ${data.days} days</div>
+        <div class="reports-stat-spark">${reportsSparkline(tr.ticketsResolved, { color: '#2a9d5c' })}</div>
+        <div class="reports-stat-sub">${reportsTrendBadge(data.ticketsResolvedCount, pp.ticketsResolved, { upIsGood: true, windowLabel: data.days+'d' })} <span class="reports-stat-window">last ${data.days} days</span></div>
       </div>
       <div class="reports-stat-card">
         <div class="reports-stat-label">ALERTS RESOLVED</div>
         <div class="reports-stat-value">${data.alertsResolvedCount}</div>
-        <div class="reports-stat-sub">last ${data.days} days</div>
+        <div class="reports-stat-spark">${reportsSparkline(tr.alertsResolved, { color: '#2a9d5c' })}</div>
+        <div class="reports-stat-sub">${reportsTrendBadge(data.alertsResolvedCount, pp.alertsResolved, { upIsGood: true, windowLabel: data.days+'d' })} <span class="reports-stat-window">last ${data.days} days</span></div>
       </div>
       <div class="reports-stat-card">
         <div class="reports-stat-label">MTTR — TICKETS</div>
         <div class="reports-stat-value">${fmtDuration(data.ticketMttr)}</div>
-        <div class="reports-stat-sub">${ticketTrend || 'no prior period'}</div>
+        <div class="reports-stat-spark">${reportsSparkline(ticketMttrSeriesMin, { color: '#c8a000' })}</div>
+        <div class="reports-stat-sub">${ticketTrend || '<span class="reports-stat-window">no prior period</span>'}</div>
       </div>
       <div class="reports-stat-card">
         <div class="reports-stat-label">MTTR — ALERTS</div>
         <div class="reports-stat-value">${fmtDuration(data.alertMttr)}</div>
-        <div class="reports-stat-sub">last ${data.days} days</div>
+        <div class="reports-stat-spark">${reportsSparkline(alertMttrSeriesMin, { color: '#c8a000' })}</div>
+        <div class="reports-stat-sub"><span class="reports-stat-window">last ${data.days} days</span></div>
       </div>
       <div class="reports-stat-card">
         <div class="reports-stat-label">TRACKED LABOR</div>
         <div class="reports-stat-value">${esc(fmtMsAsDuration(data.laborTotals.totalMs))}</div>
-        <div class="reports-stat-sub">${data.laborTotals.ticketCount} ticket${data.laborTotals.ticketCount!==1?'s':''} worked</div>
+        <div class="reports-stat-spark">${reportsSparkline(laborSeriesMin, { color: '#00b4d8' })}</div>
+        <div class="reports-stat-sub">${reportsTrendBadge(data.laborTotals.totalMs, pp.laborMs, { upIsGood: true, windowLabel: data.days+'d' })} <span class="reports-stat-window">${data.laborTotals.ticketCount} ticket${data.laborTotals.ticketCount!==1?'s':''}</span></div>
       </div>
     </div>
 
@@ -7914,6 +8064,39 @@ function injectAppStyles() {
       border: 1px solid rgba(42,157,92,0.3);
     }
     .client-trend-flat {
+      color: var(--textdim);
+      background: rgba(0,0,0,0.05);
+      border: 1px solid var(--border);
+    }
+    /* Reports stat trend visuals */
+    .reports-stat-spark {
+      margin: 4px 0 6px;
+      opacity: 0.85;
+    }
+    .reports-stat-window {
+      color: var(--textdim);
+    }
+    .rpt-trend {
+      display: inline-block;
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 1px 6px;
+      border-radius: 2px;
+      margin-right: 4px;
+    }
+    .rpt-trend-good {
+      color: #2a9d5c;
+      background: rgba(42,157,92,0.1);
+      border: 1px solid rgba(42,157,92,0.3);
+    }
+    .rpt-trend-bad {
+      color: #c8102e;
+      background: rgba(200,16,46,0.1);
+      border: 1px solid rgba(200,16,46,0.3);
+    }
+    .rpt-trend-flat {
       color: var(--textdim);
       background: rgba(0,0,0,0.05);
       border: 1px solid var(--border);
