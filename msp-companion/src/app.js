@@ -1,6 +1,9 @@
 // MSP Companion — Main app
 import { injectAppStyles } from './styles.js';
 import { $, esc, greeting, LS, fmtMsAsDuration, fmtDuration, fmtRelativeTime, fmtBytes, fmtSlaClock, fmtHandoffContent } from './utils.js';
+import { init as initDatto, resetDattoToken, clearDeviceCacheEntry, dattoAuth, dattoFetch, fetchDattoDevice, normalizeAlert, fetchAlerts, fetchSites, resolveAlert, fetchAllDattoSites } from './api/datto.js';
+import { init as initAt, atFetch } from './api/autotask.js';
+import { init as initAI, callAI } from './api/anthropic.js';
 
 'use strict';
 
@@ -116,437 +119,16 @@ function applyMode(isLight) {
   LS.set('msp_lightmode', isLight);
 }
 
-// ─── DATTO RMM API ────────────────────────────────────────────────
-let dattoToken = null, dattoTokenExpiry = 0;
 
-async function dattoAuth() {
-  if (dattoToken && Date.now() < dattoTokenExpiry) return dattoToken;
-  const s = state.settings;
-  if (!s.apiKey || !s.secretKey) throw new Error('Datto credentials not configured. Go to Settings.');
-  const platformUrl = (s.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
-  const creds = btoa('public-client:public');
-  const authBody = `grant_type=password&username=${encodeURIComponent(s.apiKey)}&password=${encodeURIComponent(s.secretKey)}`;
-  const res = await fetch('/api/datto?path=%2Fauth%2Foauth%2Ftoken&method=POST', {
-    method: 'POST',
-    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded', 'x-platform-url': platformUrl },
-    body: authBody,
-  });
-  if (!res.ok) throw new Error(`Datto auth failed: HTTP ${res.status}`);
-  const data = await res.json();
-  dattoToken = data.access_token;
-  dattoTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-  return dattoToken;
-}
+// ─── DATTO RMM API — moved to api/datto.js ──────────────────────
+// dattoAuth, dattoFetch, fetchDattoDevice, normalizeAlert,
+// fetchAlerts, fetchSites, resolveAlert, fetchAllDattoSites
 
-async function dattoFetch(path) {
-  const token = await dattoAuth();
-  const platformUrl = (state.settings.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
-  const res = await fetch(`/api/datto?path=${encodeURIComponent(path)}&method=GET`, {
-    headers: { 'Authorization': `Bearer ${token}`, 'x-platform-url': platformUrl }
-  });
-  if (!res.ok) throw new Error(`Datto API error: HTTP ${res.status}`);
-  return res.json();
-}
+// ─── AUTOTASK API — moved to api/autotask.js ─────────────────────
+// atHeaders, atFetch
 
-// ─── Datto Device Cache ──────────────────────────────────────────
-const DEVICE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 minutes
-state.deviceCache = state.deviceCache || {};
-
-async function fetchDattoDevice(deviceUid) {
-  if (!deviceUid) return null;
-  const cached = state.deviceCache[deviceUid];
-  if (cached && (Date.now() - cached.fetchedAt) < DEVICE_CACHE_TTL_MS) return cached.data;
-  try {
-    const [device, openAlerts] = await Promise.all([
-      dattoFetch(`/device/${deviceUid}`),
-      dattoFetch(`/device/${deviceUid}/alerts/open?max=50`).catch(() => ({ alerts: [] })),
-    ]);
-    const data = { device, openAlertCount: (openAlerts?.alerts || openAlerts?.items || []).length };
-    state.deviceCache[deviceUid] = { data, fetchedAt: Date.now() };
-    return data;
-  } catch(e) { console.warn('Device fetch failed:', e.message); return null; }
-}
-
-function normalizeAlert(raw) {
-  const src = raw.alertSourceInfo || {};
-  const ctx = raw.alertContext || {};
-  const src2 = raw.alertSourceInfo || {};
-
-  // Priority order for alert message:
-  // 1. alertMessage on the raw object (Datto usually puts the full message here)
-  // 2. alertSourceInfo message fields
-  // 3. Parse from alertContext
-  let alertMessage = raw.alertMessage
-    || src2.alertMessage
-    || src2.message
-    || ctx.alertMessage
-    || ctx.message
-    || ctx.description
-    || '';
-
-  const cls = (ctx['@class'] || '').toLowerCase();
-  const monitorType = (raw.alertMonitorType || raw.monitorType || '').toLowerCase();
-
-  // Only try to parse context if we still don't have a meaningful message
-  if (!alertMessage || alertMessage === 'Alert triggered') {
-
-    // ── Disk Usage ────────────────────────────────────────────────
-    if (cls.includes('disk') || monitorType.includes('disk')) {
-      const drive = ctx.diskName || ctx.driveLetter || ctx.volume || ctx.drive || 'C:';
-      // Datto sends freeSpace and totalVolume in MB (not bytes)
-      const freeMB  = ctx.freeSpace ?? ctx.freeSpaceBytes ?? ctx.free;
-      const totalMB = ctx.totalVolume ?? ctx.driveCapacity ?? ctx.totalSpaceBytes ?? ctx.total;
-      const pct     = ctx.usagePercent ?? ctx.percentUsed ?? ctx.percent;
-      if (freeMB !== undefined && totalMB !== undefined) {
-        // Determine if values are in bytes or MB based on magnitude
-        const isBytes = totalMB > 1e9;
-        const freeGB  = isBytes ? freeMB/1e9  : freeMB/1024;
-        const totalGB = isBytes ? totalMB/1e9 : totalMB/1024;
-        const pctUsed = totalMB > 0 ? Math.round((1 - freeMB/totalMB)*100) : (pct || 0);
-        const freeStr  = freeGB  >= 1 ? freeGB.toFixed(1)+' GB'  : Math.round(freeGB*1024)+' MB';
-        const totalStr = totalGB >= 1 ? totalGB.toFixed(1)+' GB' : Math.round(totalGB*1024)+' MB';
-        alertMessage = `Disk Usage: ${drive} — ${freeStr} free of ${totalStr} (${pctUsed}% used)`;
-      } else if (pct !== undefined) {
-        alertMessage = `Disk Usage: ${drive} — ${pct}% used`;
-      } else if (ctx.threshold) {
-        alertMessage = `Disk Usage: ${drive} — exceeded ${ctx.threshold}% threshold`;
-      }
-    }
-
-    // ── CPU ───────────────────────────────────────────────────────
-    else if (cls.includes('cpu') || monitorType.includes('cpu')) {
-      const usage = ctx.cpuUsage ?? ctx.usage ?? ctx.percent ?? ctx.value;
-      const threshold = ctx.threshold ?? ctx.alertThreshold;
-      if (usage !== undefined) alertMessage = `CPU Usage: ${Math.round(usage)}%${threshold ? ` (threshold: ${threshold}%)` : ''}`;
-      else if (threshold) alertMessage = `CPU Usage exceeded ${threshold}% threshold`;
-    }
-
-    // ── Memory / RAM ──────────────────────────────────────────────
-    else if (cls.includes('memory') || cls.includes('ram') || monitorType.includes('memory')) {
-      const usage = ctx.memoryUsage ?? ctx.usage ?? ctx.percent ?? ctx.value;
-      const free  = ctx.freeMemory ?? ctx.free;
-      const total = ctx.totalMemory ?? ctx.total;
-      if (free !== undefined && total !== undefined) {
-        const freeStr  = free  > 1e9 ? (free/1e9).toFixed(1)+' GB'  : (free/1e6).toFixed(0)+' MB';
-        const totalStr = total > 1e9 ? (total/1e9).toFixed(1)+' GB' : (total/1e6).toFixed(0)+' MB';
-        alertMessage = `Memory: ${freeStr} free of ${totalStr} (${Math.round((1-free/total)*100)}% used)`;
-      } else if (usage !== undefined) {
-        alertMessage = `Memory Usage: ${Math.round(usage)}%`;
-      }
-    }
-
-    // ── Network / Connectivity ────────────────────────────────────
-    else if (cls.includes('network') || cls.includes('connectivity') || monitorType.includes('network') || monitorType.includes('ping')) {
-      const iface = ctx.interface || ctx.networkInterface || ctx.adapter || '';
-      const latency = ctx.latency ?? ctx.responseTime ?? ctx.pingTime;
-      const loss = ctx.packetLoss ?? ctx.loss;
-      if (loss !== undefined) alertMessage = `Network: ${iface ? iface+' — ' : ''}${loss}% packet loss${latency ? `, ${latency}ms latency` : ''}`;
-      else if (latency !== undefined) alertMessage = `Network: ${iface ? iface+' — ' : ''}${latency}ms response time`;
-      else alertMessage = `Network connectivity issue${iface ? ': '+iface : ''}`;
-    }
-
-    // ── Service / Process ─────────────────────────────────────────
-    else if (cls.includes('srvc') || cls.includes('service') || cls.includes('process') || monitorType.includes('service')) {
-      const service = ctx.serviceName || ctx.processName || ctx.name || ctx.service || '';
-      const status  = (ctx.status || ctx.state || '').toUpperCase();
-      if (service && status) alertMessage = `Service '${service}' is ${status.toLowerCase()}`;
-      else if (service) alertMessage = `Service alert: ${service}`;
-      else alertMessage = `Service/process alert${status ? ': '+status : ''}`;
-    }
-
-    // ── Backup ────────────────────────────────────────────────────
-    else if (cls.includes('backup') || monitorType.includes('backup')) {
-      const job    = ctx.jobName || ctx.backupJob || ctx.name || '';
-      const status = ctx.status || ctx.result || ctx.state || '';
-      const size   = ctx.backupSize ?? ctx.size;
-      const sizeStr = size ? (size > 1e9 ? (size/1e9).toFixed(1)+' GB' : (size/1e6).toFixed(0)+' MB') : '';
-      alertMessage = `Backup ${status || 'alert'}${job ? ': '+job : ''}${sizeStr ? ' ('+sizeStr+')' : ''}`;
-    }
-
-    // ── Temperature ───────────────────────────────────────────────
-    else if (cls.includes('temp') || monitorType.includes('temp')) {
-      const temp  = ctx.temperature ?? ctx.temp ?? ctx.value;
-      const unit  = ctx.unit || 'C';
-      const comp  = ctx.component || ctx.sensor || '';
-      if (temp !== undefined) alertMessage = `Temperature: ${temp}°${unit}${comp ? ' ('+comp+')' : ''}`;
-    }
-
-    // ── Event Log ─────────────────────────────────────────────────
-    else if (cls.includes('event') || monitorType.includes('event')) {
-      const source = ctx.source || ctx.eventSource || '';
-      const id     = ctx.eventId || ctx.id || '';
-      const msg    = ctx.eventMessage || ctx.logMessage || '';
-      if (msg) alertMessage = `Event Log: ${msg.substring(0, 100)}`;
-      else alertMessage = `Event Log alert${source ? ': '+source : ''}${id ? ' (ID: '+id+')' : ''}`;
-    }
-
-    // ── SNMP ──────────────────────────────────────────────────────
-    else if (cls.includes('snmp') || monitorType.includes('snmp')) {
-      const oid = ctx.oid || ctx.objectId || '';
-      const val = ctx.value ?? ctx.currentValue;
-      alertMessage = `SNMP alert${oid ? ': '+oid : ''}${val !== undefined ? ' — value: '+val : ''}`;
-    }
-
-    // ── Generic fallback — scrape anything useful from context ────
-    else {
-      const candidates = [
-        ctx.message, ctx.description, ctx.details, ctx.summary,
-        ctx.alertMessage, ctx.text, ctx.info,
-        ctx.errorMessage, ctx.error,
-      ].filter(Boolean);
-      if (candidates.length) {
-        alertMessage = String(candidates[0]).substring(0, 200);
-      } else {
-        // Last resort — show monitor type and any numeric values
-        const vals = Object.entries(ctx)
-          .filter(([k,v]) => typeof v === 'number' && !k.startsWith('@'))
-          .map(([k,v]) => `${k}: ${v}`)
-          .slice(0, 3)
-          .join(', ');
-        const rawType = raw.alertMonitorType || cls.split('.').pop() || '';
-        alertMessage = rawType
-          ? `${rawType.replace(/_/g,' ').replace(/ctx$/i,'').trim()} alert${vals ? ' — '+vals : ''}`
-          : (vals || 'Alert triggered — check Datto RMM for details');
-      }
-    }
-  }
-
-  return {
-    alertUid:    raw.alertUid || raw.id,
-    hostname:    src.deviceName || raw.deviceName || 'Unknown Device',
-    deviceUid:   src.deviceUid  || raw.deviceUid  || null,
-    siteName:    src.siteName   || raw.siteName   || 'Unknown Client',
-    siteUid:     src.siteUid   || raw.siteUid,
-    priority:    raw.priority   || 'Information',
-    monitorType: (raw.alertMonitorType || cls.split('.').pop() || 'Unknown')
-      .replace(/Context$/i,'').replace(/_/g,' ').replace(/([A-Z])/g,' $1').trim(),
-    alertMessage: alertMessage || 'Alert triggered — check Datto RMM for details',
-    ticketNumber: raw.ticketNumber || null,
-    timestampMs:  raw.createdAt ? new Date(raw.createdAt).getTime() : Date.now(),
-    alertContext: ctx,
-    _raw: raw,
-  };
-}
-
-// Debug helper — paste in console: debugAlert()
-// Also expose state itself on window so you can poke at it from the console.
-window.state = state;
-
-// Expose Datto/AT helpers for console diagnostics
-window.dattoAuth = dattoAuth;
-window.fetchAlerts = fetchAlerts;
-window.resolveAlert = resolveAlert;
-window.atFetch = atFetch;
-
-// Diagnostic: compare cached alerts vs fresh fetch from Datto API.
-// Usage: await debugAlertSync('HyperVHost01')   // optional hostname filter
-window.debugAlertSync = async (hostname) => {
-  console.log('=== CACHED in state.alerts ===');
-  const cached = hostname
-    ? state.alerts.filter(a => a.hostname === hostname)
-    : state.alerts;
-  console.log(`Cache total: ${state.alerts.length} | filtered: ${cached.length}`);
-  console.table(cached.map(a => ({
-    uid: a.alertUid?.substring(0, 8),
-    host: a.hostname,
-    msg: (a.alertMessage || '').substring(0, 50),
-    age_min: Math.round((Date.now() - a.timestampMs) / 60000),
-  })));
-
-  console.log('\n=== FRESH from Datto API ===');
-  const fresh = await fetchAlerts();
-  const freshFiltered = hostname ? fresh.filter(a => a.hostname === hostname) : fresh;
-  console.log(`Fresh total: ${fresh.length} | filtered: ${freshFiltered.length}`);
-  console.table(freshFiltered.map(a => ({
-    uid: a.alertUid?.substring(0, 8),
-    host: a.hostname,
-    msg: (a.alertMessage || '').substring(0, 50),
-    age_min: Math.round((Date.now() - a.timestampMs) / 60000),
-  })));
-
-  console.log('\n=== DIFF ===');
-  const cachedUids = new Set(cached.map(a => a.alertUid));
-  const freshUids = new Set(freshFiltered.map(a => a.alertUid));
-  const ghosts = [...cachedUids].filter(u => !freshUids.has(u));
-  const newOnes = [...freshUids].filter(u => !cachedUids.has(u));
-  console.log(`Ghosts (in cache but not in Datto): ${ghosts.length}`, ghosts);
-  console.log(`New (in Datto but not in cache): ${newOnes.length}`, newOnes);
-  return { cached: cached.length, fresh: freshFiltered.length, ghosts, newOnes };
-};
-
-// Force-resolve a list of alert UIDs (e.g. ghosts found by debugAlertSync)
-window.forceResolveAlerts = async (uids) => {
-  for (const uid of uids) {
-    try { await resolveAlert(uid); console.log('✓', uid.substring(0, 8)); }
-    catch(e) { console.log('✗', uid.substring(0, 8), e.message); }
-  }
-};
-
-// Console: backupNow() — downloads a JSON of all Companion data
-window.backupNow = () => {
-  const count = exportBackup();
-  console.log(`✓ Backup downloaded — ${count} keys saved`);
-};
-
-// Console: backupInspect() — print sizes of each backed-up key
-window.backupInspect = () => {
-  let total = 0;
-  console.log('=== Companion localStorage breakdown ===');
-  BACKUP_KEYS.forEach(key => {
-    const v = localStorage.getItem(key);
-    const size = v ? v.length : 0;
-    total += size;
-    if (v) console.log(`  ${key}: ${(size/1024).toFixed(1)} KB`);
-  });
-  console.log(`Total: ${(total/1024).toFixed(1)} KB`);
-};
-
-window.debugAlert = () => {
-  const a = window._lastAlert;
-  if (!a) { console.log('No alert selected yet'); return; }
-  console.log('=== RAW ALERT DATA ===');
-  console.log('alertMessage:', a._raw?.alertMessage);
-  console.log('alertMonitorType:', a._raw?.alertMonitorType);
-  console.log('alertSourceInfo:', JSON.stringify(a._raw?.alertSourceInfo, null, 2));
-  console.log('alertContext:', JSON.stringify(a._raw?.alertContext, null, 2));
-  console.log('=== NORMALIZED ===');
-  console.log('message:', a.alertMessage);
-  console.log('monitorType:', a.monitorType);
-};
-
-// Debug: compare cached ticket data vs live Autotask for one ticket.
-// Usage: await debugTicket('T20260416.0044')
-window.debugTicket = async (ticketNumber) => {
-  const cached = state.tickets[ticketNumber];
-  console.log('=== CACHED IN COMPANION ===');
-  console.log(cached || '(not in cache)');
-  if (!cached?.id) { console.log('No id to query AT with'); return; }
-  try {
-    const fresh = await atFetch(`/Tickets/${cached.id}`);
-    const t = fresh?.item || fresh;
-    console.log('=== LIVE FROM AUTOTASK ===');
-    console.log({
-      id: t.id,
-      ticketNumber: t.ticketNumber,
-      status: t.status,
-      assignedResourceID: t.assignedResourceID,
-      queueID: t.queueID,
-      priority: t.priority,
-      title: t.title,
-      companyID: t.companyID,
-    });
-    const resourceName = t.assignedResourceID
-      ? (state.atResources.find(r => r.id === t.assignedResourceID)?.name || `(ID ${t.assignedResourceID} not in loaded resources)`)
-      : '(unassigned)';
-    console.log('Live resource name:', resourceName);
-    console.log('Cached resource name:', cached.assignedResourceName);
-    if (cached.assignedResourceID !== t.assignedResourceID) {
-      console.log('⚠️ MISMATCH — cached has assignedResourceID=' + cached.assignedResourceID + ' but AT has =' + t.assignedResourceID);
-    }
-  } catch(e) {
-    console.log('AT fetch failed:', e.message);
-  }
-};
-
-// Nuke cached tickets and force a clean resync. Console: await resetTickets()
-window.resetTickets = async () => {
-  console.log('Clearing msp_tickets cache...');
-  state.tickets = {};
-  LS.set('msp_tickets', {});
-  console.log('Cache cleared. Clicking Refresh now...');
-  document.getElementById('ticketRefreshBtn')?.click();
-};
-
-// Direct AT query to see what's really coming back. Console: await debugTicketQuery()
-window.debugTicketQuery = async () => {
-  console.log('=== STATUS PICKLIST ===');
-  const pl = await loadAtStatusPicklist();
-  Object.entries(pl).forEach(([v, i]) => console.log(`  ${v}: ${i.label}${i.done ? ' [DONE]' : ''}`));
-
-  console.log('\n=== TRY 1: Only exclude status=5 (standard "Complete") ===');
-  try {
-    const r1 = await atFetch('/Tickets/query', 'POST', {
-      MaxRecords: 500,
-      filter: [{ op: 'noteq', field: 'status', value: 5 }],
-      IncludeFields: ['id', 'ticketNumber', 'status', 'assignedResourceID'],
-    });
-    console.log(`  Got ${r1?.items?.length || 0} tickets`);
-    console.log('  Status distribution:', (r1?.items || []).reduce((a, t) => { a[t.status] = (a[t.status]||0)+1; return a; }, {}));
-    console.log('  Assigned breakdown:', (r1?.items || []).reduce((a, t) => {
-      const k = t.assignedResourceID || 'unassigned';
-      a[k] = (a[k]||0)+1;
-      return a;
-    }, {}));
-  } catch(e) { console.error('  Failed:', e.message); }
-
-  console.log('\n=== TRY 2: What Companion actually uses ===');
-  try {
-    const items = await fetchAtTicketQueue();
-    console.log(`  Got ${items.length} tickets`);
-  } catch(e) { console.error('  Failed:', e.message); }
-
-  console.log('\n=== RESOURCES ===');
-  await loadAtResources();
-  console.log(`  ${state.atResources.length} resources loaded`);
-  state.atResources.forEach(r => console.log(`    ${r.id}: ${r.name}`));
-};
-
-async function fetchAlerts() {
-  const pages = []; let page = 0;
-  while (true) {
-    const data = await dattoFetch(`/account/alerts/open?max=250&page=${page}`);
-    const items = data.alerts || data.items || [];
-    pages.push(...items);
-    if (!data.pageDetails?.nextPage) break;
-    if (++page > 20) break;
-  }
-  return pages.map(normalizeAlert);
-}
-
-async function fetchSites() {
-  const pages = []; let page = 0;
-  while (true) {
-    const data = await dattoFetch(`/account/sites?max=250&page=${page}`);
-    const items = data.sites || data.items || [];
-    pages.push(...items);
-    if (!data.pageDetails?.nextPage) break;
-    if (++page > 10) break;
-  }
-  return pages;
-}
-
-async function resolveAlert(alertUid) {
-  const token = await dattoAuth();
-  const platformUrl = (state.settings.platformUrl || 'https://concord-api.centrastage.net').replace(/\/$/, '');
-  const res = await fetch(`/api/datto?path=${encodeURIComponent('/alert/'+alertUid+'/resolve')}&method=POST`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'x-platform-url': platformUrl }
-  });
-  if (!res.ok && res.status !== 204) throw new Error(`Resolve failed: HTTP ${res.status}`);
-}
-
-// ─── AUTOTASK API ─────────────────────────────────────────────────
-function atHeaders() {
-  const s = state.settings;
-  return { 'Content-Type':'application/json', 'UserName':s.atUser||'', 'Secret':s.atSecret||'', 'ApiIntegrationCode':s.atIntCode||'' };
-}
-
-async function atFetch(path, method='GET', body=null) {
-  const zone = state.settings.atZone || '14';
-  const h = atHeaders();
-  const opts = {
-    method,
-    headers: { 'Content-Type':'application/json', 'username':h.UserName, 'secret':h.Secret, 'apiintegrationcode':h.ApiIntegrationCode, 'x-at-zone':zone }
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`/api/autotask?path=${encodeURIComponent(path)}&method=${method}`, opts);
-  if (!res.ok) {
-    const txt = await res.text();
-    let err = {}; try { err = JSON.parse(txt); } catch {}
-    throw new Error(`AT API ${res.status}: ${err?.errors?.[0] || txt.substring(0,120)}`);
-  }
-  return res.json();
-}
+// ─── ANTHROPIC AI — moved to api/anthropic.js ────────────────────
+// callAI
 
 async function loadAtStatusPicklist() {
   if (state.atStatusPicklist) return state.atStatusPicklist;
@@ -1140,20 +722,6 @@ async function ensureMyResource() {
       resolve(parseInt(v));
     });
   });
-}
-
-// ─── ANTHROPIC AI ─────────────────────────────────────────────────
-async function callAI(systemPrompt, messages) {
-  const key = state.settings.anthropicKey;
-  if (!key) throw new Error('Anthropic API key not configured. Go to Settings.');
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', 'x-api-key':key, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
-    body: JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:1024, system:systemPrompt, messages }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`AI API ${res.status}: ${data?.error?.message||'Unknown error'}`);
-  return data.content?.find(b=>b.type==='text')?.text || 'No response received.';
 }
 
 // ─── AI CONTEXT ENRICHMENT ────────────────────────────────────────
@@ -4592,22 +4160,6 @@ async function fetchAllAtCompanies() {
   } catch(e) { console.warn('Companies fetch failed:', e.message); return []; }
 }
 
-async function fetchAllDattoSites() {
-  // Datto's /account/sites returns every site
-  try {
-    const data = await dattoFetch('/account/sites');
-    return (data?.sites || data?.items || []).map(s => ({
-      siteUid: s.uid || s.id,
-      name: s.name,
-      numberOfOpenAlerts: s.numberOfOpenAlerts,
-      numberOfOpenCriticalAlerts: s.numberOfOpenCriticalAlerts,
-      numberOfDevices: s.numberOfDevices,
-      numberOfOnlineDevices: s.numberOfOnlineDevices,
-      numberOfOfflineDevices: s.numberOfOfflineDevices,
-    }));
-  } catch(e) { console.warn('Datto sites fetch failed:', e.message); return []; }
-}
-
 function buildUnifiedClientList(atCompanies, dattoSites) {
   // Match Datto sites to AT companies by name (case-insensitive). Unmatched ones still appear.
   const byName = {};
@@ -6751,7 +6303,7 @@ ${alertsBlob}`;
     if (action==='device-refresh') {
       const deviceUid = el.dataset.deviceUid;
       if (!deviceUid) return;
-      delete state.deviceCache[deviceUid];
+      clearDeviceCacheEntry(deviceUid);
       const body = document.getElementById('devicePanelBody');
       if (body) body.innerHTML = '<div style="color:var(--textdim);font-size:12px;padding:10px 0">Refreshing...</div>';
       const data = await fetchDattoDevice(deviceUid);
@@ -6949,7 +6501,7 @@ ${alertsBlob}`;
   $('testDattoBtn')?.addEventListener('click', async () => {
     saveSettings({apiKey:$('set-apiKey')?.value.trim(),secretKey:$('set-secretKey')?.value.trim(),platformUrl:$('set-platformUrl')?.value.trim()});
     showSettingsStatus('dattoStatus','Testing...','info');
-    dattoToken=null; dattoTokenExpiry=0;
+    resetDattoToken();
     try { await dattoAuth(); showSettingsStatus('dattoStatus','✓ Connected to Datto RMM','ok'); }
     catch(e){showSettingsStatus('dattoStatus',`✗ ${e.message}`,'err');}
   });
@@ -7679,6 +7231,10 @@ function injectAiContextToggles() {
 // ─── BOOT ─────────────────────────────────────────────────────────
 async function boot() {
   injectAppStyles();
+  // Init API modules with settings accessor
+  initDatto(() => state.settings);
+  initAt(() => state.settings);
+  initAI(() => state.settings);
   registerSW();
   loadSettings();
   injectAiContextToggles();
