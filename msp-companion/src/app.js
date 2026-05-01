@@ -2168,10 +2168,9 @@ function getHandoffWindowHours() {
 async function buildHandoffData(hours) {
   const cutoffMs = Date.now() - hours * 3600000;
 
-  // Currently open critical/high alerts — respect excluded clients list
-  const handoffVisible = (state.alerts || []).filter(a => !state.excludedClients.has(a.siteName));
-  const openCritical = handoffVisible.filter(a => a.priority === 'Critical');
-  const openHigh = handoffVisible.filter(a => a.priority === 'High');
+  // Currently open critical/high alerts
+  const openCritical = (state.alerts || []).filter(a => a.priority === 'Critical');
+  const openHigh = (state.alerts || []).filter(a => a.priority === 'High');
 
   // Active investigations — anything with steps and recent activity
   const activeInvestigations = [];
@@ -2218,8 +2217,8 @@ async function buildHandoffData(hours) {
     return Date.now() - new Date(t.createDate).getTime() > 14 * 86400000;
   }).slice(0, 10);
 
-  // Mismatches — ticket closed but Datto alert still open (exclude excluded clients)
-  const mismatches = handoffVisible.filter(a => {
+  // Mismatches — ticket closed but Datto alert still open
+  const mismatches = (state.alerts || []).filter(a => {
     if (!a.ticketNumber) return false;
     const t = state.tickets[a.ticketNumber];
     return t?.isDone;
@@ -6617,9 +6616,7 @@ function showVerifyResultModal({ ghosts, newOnes, freshTotal, fresh }) {
 
 function injectAlertGroupingToggle() {
   if (document.getElementById('alertGroupToggleBlock')) return;
-  const saveBtn = document.getElementById('savePrefsBtn');
-  if (!saveBtn) return;
-  const container = saveBtn.parentElement;
+  const container = document.getElementById('settingsExtras');
   if (!container) return;
 
   const groupOn = state.settings.groupAlerts === true;
@@ -6635,7 +6632,7 @@ function injectAlertGroupingToggle() {
     </label>
     <div style="font-size:11px;color:var(--textdim);margin-top:4px;line-height:1.5">When enabled, alerts at the same site with the same monitor type firing within 5 minutes are clustered into incidents. You can also manually group alerts or use AI detection. Off by default.</div>
   `;
-  container.insertBefore(block, saveBtn);
+  container.appendChild(block);
 
   document.getElementById('set-groupAlerts')?.addEventListener('change', e => {
     const on = !!e.target.checked;
@@ -6752,9 +6749,7 @@ function showRestoreConfirmModal(file) {
 
 function injectCriticalPromptSettings() {
   if (document.getElementById('criticalPromptBlock')) return;
-  const saveBtn = document.getElementById('savePrefsBtn');
-  if (!saveBtn) return;
-  const container = saveBtn.parentElement;
+  const container = document.getElementById('settingsExtras');
   if (!container) return;
 
   const enabled = state.settings.autoCreatePromptCritical === true;
@@ -6788,7 +6783,7 @@ function injectCriticalPromptSettings() {
     </div>
     <div id="critPromptStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:6px;color:var(--textdim)"></div>
   `;
-  container.insertBefore(block, saveBtn);
+  container.appendChild(block);
 
   const statusEl = document.getElementById('critPromptStatus');
   const flash = (msg, color) => {
@@ -6830,9 +6825,7 @@ function injectCriticalPromptSettings() {
 
 function injectBackupRestore() {
   if (document.getElementById('backupRestoreBlock')) return;
-  const saveBtn = document.getElementById('savePrefsBtn');
-  if (!saveBtn) return;
-  const container = saveBtn.parentElement;
+  const container = document.getElementById('settingsExtras');
   if (!container) return;
 
   const lastBackupISO = localStorage.getItem('msp_last_backup');
@@ -6861,7 +6854,7 @@ function injectBackupRestore() {
     </div>
     <div id="backupStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:8px;color:var(--textdim)"></div>
   `;
-  container.insertBefore(block, saveBtn);
+  container.appendChild(block);
 
   const statusEl = document.getElementById('backupStatus');
   const flash = (msg, color) => {
@@ -6912,10 +6905,7 @@ function injectBackupRestore() {
 
 function injectAiContextToggles() {
   if (document.getElementById('aiCtxToggleBlock')) return;
-  // Anchor on the Save Preferences button — it's a reliable marker for the prefs card
-  const saveBtn = document.getElementById('savePrefsBtn');
-  if (!saveBtn) return; // Settings view HTML not present yet — caller will retry later
-  const container = saveBtn.parentElement;
+  const container = document.getElementById('settingsExtras');
   if (!container) return;
 
   const kbDefault = state.settings.includeKbContext !== false;
@@ -6939,7 +6929,7 @@ function injectAiContextToggles() {
     </div>
     <div id="aiCtxToggleStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:6px;color:var(--textdim)"></div>
   `;
-  container.insertBefore(block, saveBtn);
+  container.appendChild(block);
 
   const statusEl = document.getElementById('aiCtxToggleStatus');
   const flash = (msg) => {
