@@ -2010,17 +2010,28 @@ function showTemplatePickerModal(ticket) {
   if (!templates.length) {
     modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:480px;margin:auto">
       <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Apply a Template</div>
-      <div style="font-size:13px;color:var(--textmid);margin-bottom:14px">No templates saved yet. Templates are created by clicking "💾 Save as Template" after working through an investigation.</div>
-      <button id="tplPickerCloseBtn" style="cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">OK</button>
+      <div style="font-size:13px;color:var(--textmid);margin-bottom:14px">No templates saved yet. You can either save one from a worked investigation, or author one from scratch right now.</div>
+      <div style="display:flex;gap:8px">
+        <button id="tplPickerCreateNewBtn" style="cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">+ Create Template</button>
+        <button id="tplPickerCloseBtn" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Close</button>
+      </div>
     </div>`;
     document.body.appendChild(modal);
-    document.getElementById('tplPickerCloseBtn').addEventListener('click', () => document.body.removeChild(modal));
+    const close = () => document.body.removeChild(modal);
+    document.getElementById('tplPickerCloseBtn').addEventListener('click', close);
+    document.getElementById('tplPickerCreateNewBtn').addEventListener('click', () => {
+      close();
+      showTemplateEditorModal(null, ticket);
+    });
     return;
   }
 
   const myName = getMyResourceName();
   modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:680px;margin:auto">
-    <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Apply a Template</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
+      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em">📋 Apply a Template</div>
+      <button id="tplPickerCreateNewBtn" class="abtn abtn-post" style="font-size:11px;padding:6px 12px">+ Create New Template</button>
+    </div>
     <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">${templates.length} template${templates.length!==1?'s':''} available. Applying populates the investigation plan — you can still edit before starting work.</div>
     <input id="tplPickerSearch" type="text" class="tpl-modal-input" placeholder="Filter templates..." style="margin-bottom:12px" />
     <div id="tplPickerList" style="max-height:60vh;overflow-y:auto;margin-bottom:14px">
@@ -2042,6 +2053,7 @@ function showTemplatePickerModal(ticket) {
           </div>
           <div class="tpl-picker-actions">
             <button class="abtn abtn-ai" data-action="apply-template" data-template-id="${esc(t.id)}" data-ticket-id="${ticket.id}">Apply</button>
+            <button class="abtn abtn-ghost" data-action="edit-template" data-template-id="${esc(t.id)}" title="Edit this template" style="font-size:11px;padding:5px 10px">Edit</button>
             <button class="tpl-delete-btn" data-action="delete-template" data-template-id="${esc(t.id)}" title="Delete template">×</button>
           </div>
         </div>
@@ -2055,6 +2067,12 @@ function showTemplatePickerModal(ticket) {
   const closeFn = () => { if (document.body.contains(modal)) document.body.removeChild(modal); };
   document.getElementById('tplPickerCloseBtn').addEventListener('click', closeFn);
   modal._closeFn = closeFn;
+
+  // Wire Create New
+  document.getElementById('tplPickerCreateNewBtn').addEventListener('click', () => {
+    closeFn();
+    showTemplateEditorModal(null, ticket);
+  });
 
   // Filter
   document.getElementById('tplPickerSearch').addEventListener('input', e => {
@@ -2107,6 +2125,329 @@ function showTemplateDriftModal(drift, inv, ticket) {
     close();
     showToast(`✓ Updated template — ${tpl.name} (v${(tpl.version||1)+1})`, 'ok');
   });
+}
+
+// ─── TEMPLATE EDITOR (create from scratch / edit existing) ─────────
+// AI scaffolding: generates a starter checklist from a description.
+function buildTemplateScaffoldSystemPrompt() {
+  return `You are an expert MSP engineer. The technician will describe a procedure they want to capture as a reusable template (e.g. "Windows Server graceful reboot", "M365 license assignment", "VPN troubleshooting basics").
+
+Generate a clean, ordered checklist for that procedure. Each step has concrete text and a verification criterion (how the tech knows the step succeeded).
+
+Respond ONLY with valid JSON in this EXACT shape, no markdown fences, no preamble:
+
+{
+  "name": "Short, searchable template name (~6-12 words). Lead with the action, not the client.",
+  "description": "1-2 sentences describing when to use this template.",
+  "tags": ["short", "lowercase", "tags"],
+  "steps": [
+    { "text": "Concrete actionable step.", "verification": "Measurable success check." },
+    ...
+  ]
+}
+
+Rules:
+- 4-9 steps, ordered: prep/verify → execute → verify-after → document.
+- Each step text is concrete. Prefer exact commands, paths, UI navigation, or specific thresholds.
+- Each verification is short and measurable ("Service status returns 'Running'", "Disk free > 20GB"). Empty string if a step is purely investigatory.
+- Strip client-specific identifiers — templates are generalizable patterns.
+- Tags: short, lowercase, searchable. Examples: "reboot", "windows", "m365", "vpn".
+- Do not include markdown formatting in any field.`;
+}
+
+async function scaffoldTemplateFromDescription(description) {
+  if (!description?.trim()) throw new Error('Description is required');
+  const system = buildTemplateScaffoldSystemPrompt();
+  const userMsg = `Generate a template for this procedure:\n\n${description.trim()}`;
+  const raw = await callAI(system, [{ role: 'user', content: userMsg }]);
+  const cleaned = (raw || '').replace(/```json|```/g, '').trim();
+  let parsed;
+  try { parsed = JSON.parse(cleaned); }
+  catch(e) { throw new Error('AI returned non-JSON. Raw: ' + cleaned.substring(0, 200)); }
+  return {
+    name: String(parsed.name || '').substring(0, 100).trim(),
+    description: String(parsed.description || '').trim(),
+    tags: Array.isArray(parsed.tags) ? parsed.tags.map(t => String(t).trim().toLowerCase()).filter(Boolean) : [],
+    steps: Array.isArray(parsed.steps) ? parsed.steps.map(s => ({
+      text: String(s.text || '').trim(),
+      verification: String(s.verification || '').trim(),
+    })).filter(s => s.text) : [],
+  };
+}
+
+// Editor modal — used for both Create New (existingTemplate=null) and Edit Existing.
+// Returns nothing; side effect is saving/updating template + closing modal.
+// `ticket` is optional context (used for tag suggestions and back-navigation).
+function showTemplateEditorModal(existingTemplate, ticket) {
+  const isEdit = !!existingTemplate;
+  // Working state — kept on the modal closure, not in app state, so cancellation is clean
+  let working = isEdit
+    ? {
+        name: existingTemplate.name || '',
+        description: existingTemplate.description || '',
+        tags: [...(existingTemplate.tags || [])],
+        isPublic: existingTemplate.isPublic !== false,
+        steps: (existingTemplate.steps || []).map(s => ({
+          id: 's-' + Math.random().toString(36).slice(2, 8),
+          text: s.text || '',
+          verification: s.verification || '',
+        })),
+      }
+    : {
+        name: '',
+        description: '',
+        tags: [],
+        isPublic: true,
+        steps: [{ id: 's-' + Math.random().toString(36).slice(2, 8), text: '', verification: '' }],
+      };
+
+  const modal = document.createElement('div');
+  modal.className = 'tpl-editor-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  document.body.appendChild(modal);
+
+  const render = () => {
+    modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:760px;margin:auto">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
+        <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em">${isEdit ? '📝 Edit Template' : '＋ Create Template'}</div>
+        ${!isEdit ? `<button id="tplEdAiScaffoldBtn" class="abtn abtn-ai" style="font-size:11px;padding:6px 12px" title="Describe what the template does and have AI scaffold the steps">✨ AI Scaffold from Description</button>` : ''}
+      </div>
+      <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">${isEdit ? `Editing v${existingTemplate.version || 1}. Saving creates a new version. Existing investigations using this template will keep their snapshot until they re-apply or get drift updates.` : 'Author a reusable investigation pattern. Each step has text + an optional verification criterion (the success check the next tech will run).'}</div>
+
+      <label class="tpl-modal-label">NAME</label>
+      <input id="tplEdName" type="text" class="tpl-modal-input" maxlength="120" placeholder="e.g. Windows Server Graceful Reboot" />
+
+      <label class="tpl-modal-label">DESCRIPTION (optional)</label>
+      <textarea id="tplEdDesc" class="tpl-modal-input" rows="2" placeholder="When to use this template — what symptoms or conditions it applies to."></textarea>
+
+      <label class="tpl-modal-label">TAGS (comma-separated, used for search and auto-suggestion)</label>
+      <input id="tplEdTags" type="text" class="tpl-modal-input" placeholder="reboot, windows, server" />
+
+      <div style="display:flex;align-items:center;gap:8px;margin:14px 0 4px">
+        <input type="checkbox" id="tplEdPublic" style="cursor:pointer" />
+        <label for="tplEdPublic" style="cursor:pointer;font-size:13px">Public — visible to all techs</label>
+      </div>
+      <div style="font-size:11px;color:var(--textdim);margin-bottom:14px">Uncheck to keep this template private to you.</div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin:16px 0 8px">
+        <label class="tpl-modal-label" style="margin:0">STEPS (${working.steps.length})</label>
+        <button id="tplEdAddStepBtn" class="abtn abtn-ghost" style="font-size:11px;padding:5px 10px">+ Add Step</button>
+      </div>
+
+      <div id="tplEdStepsList" style="max-height:50vh;overflow-y:auto;padding-right:4px">
+        ${working.steps.map((s, i) => `
+          <div class="tpl-ed-step" data-step-id="${esc(s.id)}">
+            <div class="tpl-ed-step-head">
+              <span class="tpl-ed-step-num">${i+1}</span>
+              <input type="text" class="tpl-ed-step-text" data-field="text" placeholder="Step description (e.g. 'Run cleanmgr /sageset:65535')" value="${esc(s.text)}" />
+              <button class="inv-step-btn" data-action="tpl-ed-step-up" ${i===0?'disabled':''} title="Move up">↑</button>
+              <button class="inv-step-btn" data-action="tpl-ed-step-down" ${i===working.steps.length-1?'disabled':''} title="Move down">↓</button>
+              <button class="inv-step-btn inv-step-delete" data-action="tpl-ed-step-delete" title="Delete step">×</button>
+            </div>
+            <div class="tpl-ed-step-verify">
+              <span class="inv-step-verify-label">VERIFY:</span>
+              <input type="text" class="tpl-ed-step-verify-input" data-field="verification" placeholder="Success criterion (optional, e.g. 'Disk free > 20GB')" value="${esc(s.verification)}" />
+            </div>
+          </div>
+        `).join('')}
+      </div>
+
+      <div id="tplEdStatus" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-top:10px;color:var(--textdim)"></div>
+
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button id="tplEdSaveBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">${isEdit ? '✓ SAVE CHANGES' : '✓ CREATE TEMPLATE'}</button>
+        <button id="tplEdCancelBtn" style="flex:1;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--textmid);padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:600">Cancel</button>
+      </div>
+    </div>`;
+
+    // Populate with current working state
+    document.getElementById('tplEdName').value = working.name;
+    document.getElementById('tplEdDesc').value = working.description;
+    document.getElementById('tplEdTags').value = working.tags.join(', ');
+    document.getElementById('tplEdPublic').checked = working.isPublic;
+    wireRenderedHandlers();
+  };
+
+  const status = (msg, color) => {
+    const el = document.getElementById('tplEdStatus');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = color || 'var(--textdim)';
+    clearTimeout(status._t);
+    status._t = setTimeout(() => { if (el) el.textContent = ''; }, 4000);
+  };
+
+  // Sync DOM input values into `working` (called before save / before re-render of steps section)
+  const syncFromDom = () => {
+    working.name = document.getElementById('tplEdName')?.value || '';
+    working.description = document.getElementById('tplEdDesc')?.value || '';
+    working.tags = (document.getElementById('tplEdTags')?.value || '')
+      .split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+    working.isPublic = !!document.getElementById('tplEdPublic')?.checked;
+    // Per-step values
+    document.querySelectorAll('#tplEdStepsList .tpl-ed-step').forEach(stepEl => {
+      const id = stepEl.dataset.stepId;
+      const step = working.steps.find(s => s.id === id);
+      if (!step) return;
+      step.text = stepEl.querySelector('[data-field="text"]')?.value || '';
+      step.verification = stepEl.querySelector('[data-field="verification"]')?.value || '';
+    });
+  };
+
+  const close = () => { if (document.body.contains(modal)) document.body.removeChild(modal); };
+
+  const wireRenderedHandlers = () => {
+    document.getElementById('tplEdCancelBtn').addEventListener('click', () => {
+      // Confirm if there are meaningful changes to discard
+      const hasContent = working.name.trim() || working.description.trim() || working.steps.some(s => s.text.trim());
+      if (hasContent && !isEdit && !confirm('Discard this template? Your work will be lost.')) return;
+      close();
+    });
+
+    document.getElementById('tplEdSaveBtn').addEventListener('click', () => {
+      syncFromDom();
+      // Validation
+      if (!working.name.trim()) {
+        status('Template needs a name', '#c8102e');
+        document.getElementById('tplEdName').focus();
+        return;
+      }
+      const cleanSteps = working.steps
+        .map(s => ({ text: s.text.trim(), verification: s.verification.trim() }))
+        .filter(s => s.text);
+      if (!cleanSteps.length) {
+        status('Template needs at least one step with text', '#c8102e');
+        return;
+      }
+      try {
+        if (isEdit) {
+          updateTemplate(existingTemplate.id, {
+            name: working.name.trim(),
+            description: working.description.trim(),
+            tags: working.tags,
+            isPublic: working.isPublic,
+            steps: cleanSteps,
+          });
+          showToast(`✓ Updated template — ${working.name} (v${(existingTemplate.version || 1) + 1})`, 'ok');
+        } else {
+          const tpl = {
+            id: newTemplateId(),
+            name: working.name.trim(),
+            description: working.description.trim(),
+            steps: cleanSteps,
+            tags: working.tags,
+            isPublic: working.isPublic,
+            createdBy: getMyResourceName(),
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sourceTicketId: null,
+            usageCount: 0,
+            version: 1,
+          };
+          saveTemplate(tpl);
+          showToast(`✓ Created template — ${tpl.name}`, 'ok');
+        }
+        close();
+        // Reopen the picker so user sees their new/updated template in context
+        if (ticket) showTemplatePickerModal(ticket);
+      } catch(err) {
+        status(`Save failed: ${err.message}`, '#c8102e');
+      }
+    });
+
+    document.getElementById('tplEdAddStepBtn').addEventListener('click', () => {
+      syncFromDom();
+      working.steps.push({ id: 's-' + Math.random().toString(36).slice(2, 8), text: '', verification: '' });
+      render();
+      // Focus the new step's text field
+      setTimeout(() => {
+        const last = document.querySelector('#tplEdStepsList .tpl-ed-step:last-child .tpl-ed-step-text');
+        last?.focus();
+      }, 50);
+    });
+
+    // Step actions (delegated within the modal)
+    modal.querySelectorAll('[data-action="tpl-ed-step-up"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const stepEl = btn.closest('.tpl-ed-step');
+        const id = stepEl.dataset.stepId;
+        const idx = working.steps.findIndex(s => s.id === id);
+        if (idx <= 0) return;
+        syncFromDom();
+        [working.steps[idx-1], working.steps[idx]] = [working.steps[idx], working.steps[idx-1]];
+        render();
+      });
+    });
+    modal.querySelectorAll('[data-action="tpl-ed-step-down"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const stepEl = btn.closest('.tpl-ed-step');
+        const id = stepEl.dataset.stepId;
+        const idx = working.steps.findIndex(s => s.id === id);
+        if (idx < 0 || idx >= working.steps.length - 1) return;
+        syncFromDom();
+        [working.steps[idx], working.steps[idx+1]] = [working.steps[idx+1], working.steps[idx]];
+        render();
+      });
+    });
+    modal.querySelectorAll('[data-action="tpl-ed-step-delete"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const stepEl = btn.closest('.tpl-ed-step');
+        const id = stepEl.dataset.stepId;
+        if (working.steps.length <= 1) {
+          status('Template needs at least one step', '#e07b00');
+          return;
+        }
+        syncFromDom();
+        working.steps = working.steps.filter(s => s.id !== id);
+        render();
+      });
+    });
+
+    // AI Scaffold (only present in create mode)
+    const scaffoldBtn = document.getElementById('tplEdAiScaffoldBtn');
+    if (scaffoldBtn) {
+      scaffoldBtn.addEventListener('click', async () => {
+        const description = prompt('Describe the procedure to generate steps for:\n\nExamples:\n- "Windows Server graceful reboot procedure"\n- "M365 license assignment for new hire"\n- "VPN client troubleshooting basics"\n\nThe AI will draft a starter checklist you can edit before saving.');
+        if (!description?.trim()) return;
+        scaffoldBtn.disabled = true;
+        const origLabel = scaffoldBtn.textContent;
+        scaffoldBtn.textContent = '✨ Scaffolding...';
+        status('Asking AI to draft steps...', 'var(--textdim)');
+        try {
+          const drafted = await scaffoldTemplateFromDescription(description);
+          // Merge into working state — AI-drafted fields replace empty fields,
+          // but if user already typed something, AI doesn't overwrite it.
+          if (!working.name.trim() && drafted.name) working.name = drafted.name;
+          if (!working.description.trim() && drafted.description) working.description = drafted.description;
+          if (!working.tags.length && drafted.tags?.length) working.tags = drafted.tags;
+          // For steps: if user has only the empty default step, replace with drafted; otherwise append
+          const allEmpty = working.steps.every(s => !s.text.trim());
+          if (allEmpty) {
+            working.steps = drafted.steps.map(s => ({
+              id: 's-' + Math.random().toString(36).slice(2, 8),
+              text: s.text,
+              verification: s.verification,
+            }));
+          } else {
+            // Append drafted steps to existing
+            drafted.steps.forEach(s => working.steps.push({
+              id: 's-' + Math.random().toString(36).slice(2, 8),
+              text: s.text,
+              verification: s.verification,
+            }));
+          }
+          render();
+          status(`✓ Scaffolded ${drafted.steps.length} steps — review and edit before saving`, '#2a9d5c');
+        } catch(err) {
+          status(`Scaffold failed: ${err.message}`, '#c8102e');
+          scaffoldBtn.disabled = false;
+          scaffoldBtn.textContent = origLabel;
+        }
+      });
+    }
+  };
+
+  render();
 }
 
 // ─── TICKET INVESTIGATION CHAT ────────────────────────────────────
@@ -6306,6 +6647,19 @@ ${alertsBlob}`;
       showToast(`✓ Applied template — ${tpl.name}`, 'ok');
     }
 
+    if (action==='edit-template') {
+      const tplId = el.dataset.templateId;
+      const tpl = state.templates[tplId];
+      if (!tpl) return;
+      // Close picker modal if open, then open editor
+      const pickerModal = el.closest('.tpl-editor-modal') || document.querySelector('div[style*="z-index:9999"]');
+      const picker = pickerModal?._closeFn;
+      if (typeof picker === 'function') picker();
+      // Try to grab a ticket context from the modal we just closed (for back-navigation)
+      const ticket = state.currentTicket || null;
+      showTemplateEditorModal(tpl, ticket);
+    }
+
     if (action==='delete-template') {
       const tplId = el.dataset.templateId;
       const tpl = state.templates[tplId];
@@ -8030,6 +8384,70 @@ function injectAppStyles() {
     .tpl-modal-input:focus {
       outline: none;
       border-color: var(--accent);
+    }
+    /* Template editor step rows */
+    .tpl-ed-step {
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      background: var(--bg);
+    }
+    .tpl-ed-step-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .tpl-ed-step-num {
+      font-family: var(--cond, 'Bebas Neue', sans-serif);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--textdim);
+      min-width: 18px;
+      text-align: center;
+    }
+    .tpl-ed-step-text {
+      flex: 1;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text);
+      padding: 4px 6px;
+      border-radius: 3px;
+      font-size: 13px;
+      font-family: inherit;
+      min-width: 0;
+    }
+    .tpl-ed-step-text:hover:not(:focus) { border-color: var(--border); }
+    .tpl-ed-step-text:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--bg);
+    }
+    .tpl-ed-step-verify {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 5px;
+      padding-left: 24px;
+    }
+    .tpl-ed-step-verify-input {
+      flex: 1;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--textmid);
+      padding: 3px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-family: inherit;
+      font-style: italic;
+      min-width: 0;
+    }
+    .tpl-ed-step-verify-input:hover:not(:focus) { border-color: var(--border); }
+    .tpl-ed-step-verify-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--bg);
+      font-style: normal;
     }
     /* Template picker rows */
     .tpl-picker-row {
