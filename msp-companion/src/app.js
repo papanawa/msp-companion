@@ -3133,10 +3133,16 @@ function renderAlertList() {
     </div>`;
   };
 
-  // Toolbar above the list — multi-select toggles + AI button + "Create incident from selected"
+  // Toolbar above the list — multi-select + bulk actions + grouping
+  // Select toggle and bulk actions are always available; grouping-specific buttons only show when grouping is on.
+  const selN = state.alertSelected.size;
   const toolbarHtml = `<div class="alert-list-toolbar">
-    ${groupingOn ? `<button class="abtn abtn-ghost" data-action="toggle-alert-select" title="Multi-select alerts to manually group">${state.alertSelectMode ? '✓ Selecting' : '☐ Select'}</button>` : ''}
-    ${groupingOn && state.alertSelectMode && state.alertSelected.size >= 2 ? `<button class="abtn abtn-post" data-action="create-manual-incident">+ Group ${state.alertSelected.size}</button>` : ''}
+    <button class="abtn abtn-ghost" data-action="toggle-alert-select" title="Multi-select alerts for bulk actions">${state.alertSelectMode ? '✓ Selecting' : '☐ Select'}</button>
+    ${state.alertSelectMode && selN >= 2 && groupingOn ? `<button class="abtn abtn-post" data-action="create-manual-incident" title="Group selected alerts into one incident">+ Group ${selN}</button>` : ''}
+    ${state.alertSelectMode && selN >= 1 ? `<button class="abtn abtn-resolve" data-action="bulk-resolve" title="Resolve all selected alerts in Datto">✓ Resolve ${selN}</button>` : ''}
+    ${state.alertSelectMode && selN >= 1 ? `<button class="abtn abtn-create" data-action="bulk-create-tickets" title="Create a ticket for each selected alert (one at a time)">🎫 Ticket ${selN}</button>` : ''}
+    ${state.alertSelectMode && selN >= 2 ? `<button class="abtn abtn-kb" data-action="bulk-save-kb" title="AI-format selected alerts as one KB entry">📚 Save ${selN} to KB</button>` : ''}
+    ${state.alertSelectMode && selN >= 1 ? `<button class="abtn abtn-snooze" data-action="bulk-snooze" title="Snooze all selected alerts">⏸ Snooze ${selN}</button>` : ''}
     ${groupingOn ? `<button class="abtn abtn-ai" data-action="ai-cluster-alerts" title="Use AI to detect related alerts">✨ AI Detect</button>` : ''}
   </div>`;
 
@@ -5849,6 +5855,133 @@ function wireEvents() {
       } catch(err) {
         showToast(`Group failed: ${err.message}`, 'err');
       }
+    }
+
+    if (action==='bulk-resolve') {
+      const uids = [...state.alertSelected];
+      if (!uids.length) return;
+      if (!confirm(`Resolve ${uids.length} alert${uids.length!==1?'s':''} in Datto? This cannot be undone.`)) return;
+      let ok = 0, fail = 0;
+      for (const uid of uids) {
+        try { await resolveAlert(uid); ok++; }
+        catch(e) { console.warn('Bulk resolve failed for', uid, e.message); fail++; }
+      }
+      // Drop resolved alerts from local state
+      const resolvedSet = new Set(uids);
+      state.alerts = state.alerts.filter(a => !resolvedSet.has(a.alertUid));
+      LS.set('msp_alerts', state.alerts);
+      state.alertSelected.clear();
+      state.alertSelectMode = false;
+      renderAlertList();
+      if (fail === 0) showToast(`✓ Resolved ${ok} alert${ok!==1?'s':''}`, 'ok');
+      else if (ok === 0) showToast(`Failed to resolve ${fail} alert${fail!==1?'s':''}`, 'err');
+      else showToast(`✓ Resolved ${ok}, ${fail} failed (see console)`, 'info');
+    }
+
+    if (action==='bulk-create-tickets') {
+      const uids = [...state.alertSelected];
+      if (!uids.length) return;
+      if (!confirm(`Walk through creating ${uids.length} ticket${uids.length!==1?'s':''}? You'll review each one before submission.`)) return;
+      // Walk through each alert, creating ticket sequentially
+      let created = 0, skipped = 0, failed = 0;
+      for (const uid of uids) {
+        const alert = state.alerts.find(a => a.alertUid === uid);
+        if (!alert) { skipped++; continue; }
+        if (alert.ticketNumber) {
+          // Already has a ticket; skip silently
+          skipped++;
+          continue;
+        }
+        try {
+          if (!confirm(`Create ticket for: ${alert.hostname} — ${(alert.alertMessage || '').substring(0, 80)}?\n\nClick Cancel to skip this one.`)) {
+            skipped++;
+            continue;
+          }
+          await createTicketForAlert(alert);
+          created++;
+        } catch(e) {
+          console.warn('Bulk ticket creation failed for', uid, e.message);
+          failed++;
+        }
+      }
+      state.alertSelected.clear();
+      state.alertSelectMode = false;
+      renderAlertList();
+      const parts = [];
+      if (created) parts.push(`${created} created`);
+      if (skipped) parts.push(`${skipped} skipped`);
+      if (failed) parts.push(`${failed} failed`);
+      showToast('✓ ' + parts.join(' · '), failed ? 'info' : 'ok');
+    }
+
+    if (action==='bulk-save-kb') {
+      const uids = [...state.alertSelected];
+      if (uids.length < 2) {
+        showToast('Pick at least 2 alerts to consolidate into a KB entry', 'info');
+        return;
+      }
+      const alerts = uids.map(u => state.alerts.find(a => a.alertUid === u)).filter(Boolean);
+      if (!alerts.length) return;
+      const origLabel = el.textContent;
+      el.disabled = true; el.textContent = '✨ Drafting...';
+      try {
+        // Build a context blob from all selected alerts
+        const alertsBlob = alerts.map((a, i) => `
+ALERT ${i+1}:
+  Device: ${a.hostname}
+  Client: ${a.siteName}
+  Priority: ${a.priority}
+  Monitor: ${a.monitorType}
+  Message: ${a.alertMessage || ''}
+  Timestamp: ${new Date(a.timestampMs).toISOString()}
+`).join('\n');
+        const system = buildKbDraftSystemPrompt();
+        const userMsg = `${alerts.length} RELATED ALERTS (consolidated into one KB entry):
+
+These alerts represent a recurring pattern. Build a single KB entry covering the common issue and remediation, not separate entries per alert. Strip client-specific identifiers as usual — the goal is a generalizable pattern.
+
+${alertsBlob}`;
+        const raw = await callAI(system, [{ role: 'user', content: userMsg }]);
+        const cleaned = (raw || '').replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(cleaned);
+        const draft = {
+          title: String(parsed.title || '').substring(0, 100).trim(),
+          symptoms: String(parsed.symptoms || '').trim(),
+          diagnosis: String(parsed.diagnosis || '').trim(),
+          fix: String(parsed.fix || '').trim(),
+          tags: Array.isArray(parsed.tags) ? parsed.tags.map(t => String(t).trim().toLowerCase()).filter(Boolean) : [],
+        };
+        const resolutionCombined = [
+          draft.diagnosis ? `DIAGNOSIS:\n${draft.diagnosis}` : '',
+          draft.fix ? `FIX:\n${draft.fix}` : '',
+        ].filter(Boolean).join('\n\n');
+        showKBModal({
+          title: draft.title,
+          symptoms: draft.symptoms,
+          resolution: resolutionCombined,
+          tags: (draft.tags || []).join(', '),
+        });
+        state.alertSelected.clear();
+        state.alertSelectMode = false;
+        renderAlertList();
+      } catch(err) {
+        showToast(`Bulk KB draft failed: ${err.message}`, 'err');
+      } finally {
+        el.disabled = false; el.textContent = origLabel;
+      }
+    }
+
+    if (action==='bulk-snooze') {
+      const uids = [...state.alertSelected];
+      if (!uids.length) return;
+      uids.forEach(u => state.snoozedIds.add(u));
+      LS.set('msp_snoozed', [...state.snoozedIds]);
+      const n = uids.length;
+      state.alertSelected.clear();
+      state.alertSelectMode = false;
+      renderAlertList();
+      render();
+      showToast(`⏸ Snoozed ${n} alert${n!==1?'s':''}`, 'info');
     }
 
     if (action==='incident-toggle') {
