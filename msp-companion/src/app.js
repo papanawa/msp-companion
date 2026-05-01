@@ -3788,8 +3788,10 @@ async function refreshAll() {
         try { await resolveAlert(a.alertUid); state.resolvedIds.add(a.alertUid); } catch {}
       }
       LS.set('msp_resolved',[...state.resolvedIds]);
+      // Strip auto-resolved Information alerts from state so counts stay consistent
+      // with what Datto RMM shows after the resolve calls land.
     }
-    state.alerts = alerts;
+    state.alerts = alerts.filter(a => !state.resolvedIds.has(a.alertUid));
     LS.set('msp_alerts', alerts);
     // Prune incidents whose alerts are gone, then run rule-based clustering on fresh data
     pruneEmptyIncidents();
@@ -3943,7 +3945,9 @@ async function loadClients(force = false) {
 
 function getClientOpenAlerts(client) {
   if (!client?.name) return [];
-  return state.alerts.filter(a => (a.siteName || '').toLowerCase() === client.name.toLowerCase());
+  // Use getVisibleAlerts() so this stays consistent with the dashboard badge —
+  // resolved, snoozed, and excluded-client alerts are all filtered out.
+  return getVisibleAlerts().filter(a => (a.siteName || '').toLowerCase() === client.name.toLowerCase());
 }
 
 function getClientOpenTickets(client) {
