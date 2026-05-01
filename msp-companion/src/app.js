@@ -3443,6 +3443,7 @@ function renderInvestigationCard(ticket) {
     </div>
     <div class="inv-actions-row">
       <button class="abtn abtn-ghost" data-action="ticket-reanalyze" data-ticket-id="${ticket.id}">↺ Re-analyze</button>
+      <button class="abtn abtn-ghost" data-action="open-template-picker" data-ticket-id="${ticket.id}" title="Apply a template to overwrite the current plan">📋 Templates</button>
       <button class="abtn abtn-ghost" data-action="save-as-template" data-ticket-id="${ticket.id}">💾 Save as Template</button>
       <button class="abtn abtn-ai" data-action="ticket-draft-resolution" data-ticket-id="${ticket.id}">✓ DRAFT RESOLUTION</button>
     </div>
