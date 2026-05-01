@@ -2168,9 +2168,10 @@ function getHandoffWindowHours() {
 async function buildHandoffData(hours) {
   const cutoffMs = Date.now() - hours * 3600000;
 
-  // Currently open critical/high alerts
-  const openCritical = (state.alerts || []).filter(a => a.priority === 'Critical');
-  const openHigh = (state.alerts || []).filter(a => a.priority === 'High');
+  // Currently open critical/high alerts — respect excluded clients list
+  const handoffVisible = (state.alerts || []).filter(a => !state.excludedClients.has(a.siteName));
+  const openCritical = handoffVisible.filter(a => a.priority === 'Critical');
+  const openHigh = handoffVisible.filter(a => a.priority === 'High');
 
   // Active investigations — anything with steps and recent activity
   const activeInvestigations = [];
@@ -2217,8 +2218,8 @@ async function buildHandoffData(hours) {
     return Date.now() - new Date(t.createDate).getTime() > 14 * 86400000;
   }).slice(0, 10);
 
-  // Mismatches — ticket closed but Datto alert still open
-  const mismatches = (state.alerts || []).filter(a => {
+  // Mismatches — ticket closed but Datto alert still open (exclude excluded clients)
+  const mismatches = handoffVisible.filter(a => {
     if (!a.ticketNumber) return false;
     const t = state.tickets[a.ticketNumber];
     return t?.isDone;
