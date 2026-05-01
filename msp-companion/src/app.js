@@ -3115,7 +3115,7 @@ function renderAlertList() {
       ? `<button class="incident-eject-btn" data-action="incident-eject" data-uid="${esc(a.alertUid)}" title="Remove from incident">×</button>`
       : '';
     const selectBox = selectable
-      ? `<input type="checkbox" class="alert-select-cb" data-action="alert-select" data-uid="${esc(a.alertUid)}" ${checked?'checked':''} onclick="event.stopPropagation()" />`
+      ? `<input type="checkbox" class="alert-select-cb" data-action="alert-select" data-uid="${esc(a.alertUid)}" ${checked?'checked':''} />`
       : '';
     return `<div class="list-row ${isActive?'active':''} ${isLocked?'list-row-locked':''} ${opts.isChild?'list-row-child':''}" data-uid="${esc(a.alertUid)}">
       <div class="row-top">
@@ -5532,6 +5532,8 @@ function wireEvents() {
 
   // Alert list
   $('alertList')?.addEventListener('click', e => {
+    // Don't navigate when clicking interactive elements inside the row (checkboxes, buttons, action triggers)
+    if (e.target.closest('input, button, [data-action]')) return;
     const row=e.target.closest('.list-row'); if(!row?.dataset.uid) return;
     const alert=state.alerts.find(a=>a.alertUid===row.dataset.uid);
     if(alert) renderAlertDetail(alert);
