@@ -4086,6 +4086,25 @@ function drillAlertRows(alerts) {
   }).join('');
 }
 
+function drillMismatchRows(alerts) {
+  if (!alerts.length) return '<div class="drill-empty">No mismatches to show.</div>';
+  return alerts.map(a => {
+    const t = state.tickets[a.ticketNumber];
+    const sv = SEV[a.priority] || SEV.Information;
+    return `<div class="drill-row" data-action="drill-open-alert" data-alert-uid="${esc(a.alertUid)}">
+      <div class="drill-row-main">
+        <span class="drill-tn">${esc(a.hostname)}</span>
+        <span class="drill-title">${esc(a.alertMessage || '')}</span>
+      </div>
+      <div class="drill-row-meta">
+        <span class="drill-pill" style="color:${sv.color};border-color:${sv.color}55">${esc(a.priority)}</span>
+        <span class="drill-tech">${esc(a.ticketNumber || '')}</span>
+        <span class="drill-age" style="color:#c8960c" title="Ticket is closed but alert still open">⚠ closed ticket</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
 function drillDeviceRows(devices) {
   if (!devices.length) return '<div class="drill-empty">No devices to show.</div>';
   return devices.map(d => {
@@ -5953,6 +5972,21 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='stat-drill') {
+      const stat = el.dataset.stat;
+      const visible    = getVisibleAlerts();
+      const crit       = visible.filter(a => a.priority === 'Critical');
+      const high       = visible.filter(a => a.priority === 'High');
+      const noTicket   = visible.filter(a => !a.ticketNumber);
+      const mismatch   = visible.filter(a => a.ticketNumber && state.tickets[a.ticketNumber]?.isDone);
+      const openTickets = getOpenTickets();
+      if (stat === 'open-alerts')  openDrillPanel(`Open Alerts (${visible.length})`,    drillAlertRows(visible));
+      if (stat === 'critical')     openDrillPanel(`Critical Alerts (${crit.length})`,   drillAlertRows(crit));
+      if (stat === 'high')         openDrillPanel(`High Alerts (${high.length})`,       drillAlertRows(high));
+      if (stat === 'open-tickets') openDrillPanel(`Open Tickets (${openTickets.length})`, drillTicketRows(openTickets));
+      if (stat === 'mismatch')     openDrillPanel(`Mismatches (${mismatch.length})`,    drillMismatchRows(mismatch));
+      if (stat === 'no-ticket')    openDrillPanel(`Alerts Without a Ticket (${noTicket.length})`, drillAlertRows(noTicket));
     }
     if (action==='drill') {
       const drill = el.dataset.drill;

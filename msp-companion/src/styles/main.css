@@ -314,6 +314,16 @@ body.light .mode-toggle-track::after { transform: translateX(16px); }
   text-align: center;
   transition: background 0.2s, border-color 0.2s;
 }
+.stat-card.stat-clickable {
+  cursor: pointer;
+}
+.stat-card.stat-clickable:hover {
+  border-color: var(--accent);
+  background: rgba(0,180,216,0.06);
+}
+.stat-card.stat-clickable:hover .stat-lbl {
+  color: var(--accent);
+}
 .stat-val {
   font-family: var(--cond);
   font-size: 30px;
