@@ -221,10 +221,11 @@ async function fetchAtContractName(contractId) {
 
 async function fetchAtTicketActivityNotes(ticketId) {
   // Expanded version of fetchAtTicketNotes — pulls 10 notes with noteType + resource for activity feed
+  // AT REST v1.0: use top-level /TicketNotes/query with ticketID filter.
   try {
-    const data = await atFetch(`/Tickets/${ticketId}/Notes/query`, 'POST', {
+    const data = await atFetch('/TicketNotes/query', 'POST', {
       MaxRecords: 10,
-      filter: [{ op: 'gte', field: 'id', value: 0 }],
+      filter: [{ op: 'eq', field: 'ticketID', value: parseInt(ticketId) }],
       IncludeFields: ['id','title','description','noteType','publish','createDateTime','lastActivityDate','creatorResourceID'],
     });
     const items = data?.items || [];
@@ -1045,11 +1046,12 @@ async function fetchAtTicketFull(ticketId) {
 }
 
 async function fetchAtTicketNotes(ticketId) {
-  // Uses the standard AT REST child-collection query pattern
+  // AT REST v1.0 does not support child-collection POST query (/Tickets/{id}/Notes/query).
+  // Correct pattern: top-level /TicketNotes/query with a ticketID filter.
   try {
-    const data = await atFetch(`/Tickets/${ticketId}/Notes/query`, 'POST', {
+    const data = await atFetch('/TicketNotes/query', 'POST', {
       MaxRecords: 10,
-      filter: [{ op: 'gte', field: 'id', value: 0 }],
+      filter: [{ op: 'eq', field: 'ticketID', value: parseInt(ticketId) }],
       IncludeFields: ['id','title','description','noteType','createDateTime','lastActivityDate'],
     });
     const items = data?.items || [];
