@@ -1,5 +1,6 @@
 // MSP Companion — Main app
 import { injectAppStyles } from './styles.js';
+import { $, esc, greeting, LS, fmtMsAsDuration, fmtDuration, fmtRelativeTime, fmtBytes, fmtSlaClock, fmtHandoffContent } from './utils.js';
 
 'use strict';
 
@@ -46,8 +47,7 @@ const SEV = {
 const DONE_LABELS = new Set(['complete','completed','closed','resolved','denied','cancelled','canceled']);
 
 // ─── UTILS ────────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Pure helpers ($, esc, greeting, LS, formatters) live in utils.js — imported above.
 
 function showToast(msg, type='info') {
   const t = $('toast'); if (!t) return;
@@ -58,16 +58,8 @@ function showToast(msg, type='info') {
   t._timer = setTimeout(() => t.classList.remove('show'), 3000);
 }
 
-function greeting() {
-  const h = new Date().getHours();
-  return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
-}
-
 // ─── LOCAL STORAGE ────────────────────────────────────────────────
-const LS = {
-  get: (k, def=null) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } },
-  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
-};
+// LS.get / LS.set are imported from utils.js
 
 // ─── SETTINGS ─────────────────────────────────────────────────────
 function loadSettings() {
@@ -1520,15 +1512,6 @@ function getInvestigationTotalMs(ticketId) {
   return total;
 }
 
-function fmtMsAsDuration(ms) {
-  if (!ms || ms < 1000) return '0m';
-  const totalMin = Math.floor(ms / 60000);
-  if (totalMin < 60) return `${totalMin}m`;
-  const hrs = Math.floor(totalMin / 60);
-  const mins = totalMin % 60;
-  return mins ? `${hrs}h ${mins}m` : `${hrs}h`;
-}
-
 function newStepId() { return 's-' + Math.random().toString(36).slice(2, 10); }
 
 async function fetchAtTicketFull(ticketId) {
@@ -2963,13 +2946,6 @@ async function generateHandoffReport(hours, techNotes) {
   return handoff;
 }
 
-function fmtHandoffContent(text) {
-  // Light markdown rendering — bold the section headers, preserve newlines
-  return esc(text)
-    .replace(/^(🚨|🔧|⚠|✅|📌)\s*([A-Z][A-Z\s]+)$/gm, '<div class="handoff-section">$1 $2</div>')
-    .replace(/\n/g, '<br>');
-}
-
 function showHandoffModal() {
   const modal = document.createElement('div');
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
@@ -3799,43 +3775,7 @@ function renderTicketList() {
 }
 
 // ─── TICKET DETAIL PANELS: DEVICE / ACTIVITY / METADATA ─────────
-function fmtBytes(mb) {
-  if (mb == null || isNaN(mb)) return '';
-  if (mb > 1024*1024) return (mb/1024/1024).toFixed(1) + ' TB';
-  if (mb > 1024)      return (mb/1024).toFixed(1) + ' GB';
-  return Math.round(mb) + ' MB';
-}
-
-function fmtRelativeTime(ts) {
-  if (!ts) return 'unknown';
-  const d = new Date(ts);
-  if (isNaN(d)) return 'unknown';
-  const diff = Date.now() - d.getTime();
-  const mins = Math.floor(diff/60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins/60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs/24);
-  if (days < 30) return `${days}d ago`;
-  return d.toLocaleDateString();
-}
-
-function fmtSlaClock(dueDateStr) {
-  if (!dueDateStr) return { text: '—', color: 'var(--textdim)' };
-  const d = new Date(dueDateStr);
-  if (isNaN(d)) return { text: '—', color: 'var(--textdim)' };
-  const diff = d.getTime() - Date.now();
-  const absH = Math.floor(Math.abs(diff) / 3600000);
-  const absD = Math.floor(absH / 24);
-  if (diff < 0) {
-    const t = absD >= 1 ? `Overdue ${absD}d` : `Overdue ${absH}h`;
-    return { text: t, color: '#c8102e' };
-  }
-  if (absH < 4) return { text: `Due in ${absH}h`, color: '#e07b00' };
-  if (absD < 1) return { text: `Due in ${absH}h`, color: '#c8a000' };
-  return { text: `Due in ${absD}d`, color: 'var(--textmid)' };
-}
+// fmtBytes, fmtRelativeTime, fmtSlaClock imported from utils.js
 
 function getDattoUiBaseUrl() {
   // Convert the API URL (e.g. https://concord-api.centrastage.net) to the actual UI URL (e.g. https://concord.rmm.datto.com)
@@ -5366,13 +5306,7 @@ function calcMTTR(items, getStartMs, getEndMs) {
   return avg;
 }
 
-function fmtDuration(ms) {
-  if (ms == null) return '—';
-  const hrs = ms / 3600000;
-  if (hrs < 24) return hrs.toFixed(1) + 'h';
-  const days = hrs / 24;
-  return days.toFixed(1) + 'd';
-}
+// fmtDuration imported from utils.js
 
 async function buildReportsData(days) {
   const [resolvedTickets, resolvedAlerts] = await Promise.all([
