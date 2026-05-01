@@ -2009,7 +2009,7 @@ function showTemplatePickerModal(ticket) {
 
   if (!templates.length) {
     modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:480px;margin:auto">
-      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Apply a Template</div>
+      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em;margin-bottom:6px">📋 Templates</div>
       <div style="font-size:13px;color:var(--textmid);margin-bottom:14px">No templates saved yet. You can either save one from a worked investigation, or author one from scratch right now.</div>
       <div style="display:flex;gap:8px">
         <button id="tplPickerCreateNewBtn" style="cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px 18px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">+ Create Template</button>
@@ -2029,7 +2029,7 @@ function showTemplatePickerModal(ticket) {
   const myName = getMyResourceName();
   modal.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:680px;margin:auto">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
-      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em">📋 Apply a Template</div>
+      <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.08em">📋 Templates</div>
       <button id="tplPickerCreateNewBtn" class="abtn abtn-post" style="font-size:11px;padding:6px 12px">+ Create New Template</button>
     </div>
     <div style="font-size:12px;color:var(--textdim);margin-bottom:14px">${templates.length} template${templates.length!==1?'s':''} available. Applying populates the investigation plan — you can still edit before starting work.</div>
@@ -4145,7 +4145,7 @@ function renderInvestigationCard(ticket) {
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="abtn abtn-ai" data-action="ticket-analyze" data-ticket-id="${ticket.id}">▶ ANALYZE TICKET</button>
-        <button class="abtn abtn-ghost" data-action="open-template-picker" data-ticket-id="${ticket.id}">📋 Apply a template</button>
+        <button class="abtn abtn-ghost" data-action="open-template-picker" data-ticket-id="${ticket.id}" title="Apply an existing template or create a new one">📋 Templates</button>
       </div>
       <div id="investigationStatus" style="font-family:var(--cond);font-size:12px;color:var(--textdim);margin-top:8px;min-height:14px"></div>
     </div>`;
