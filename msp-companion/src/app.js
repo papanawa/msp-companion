@@ -5326,8 +5326,8 @@ function buildReportHTML(clients, devices, mode) {
 </head>
 <body>
   <!-- Header -->
-  <div style="background:#1e2a3a;padding:16px 28px;display:flex;justify-content:space-between;align-items:center">
-    <img src="${SYNOBIS_LOGO_B64}" style="height:44px;mix-blend-mode:lighten" />
+  <div style="background:#111820;padding:16px 28px;display:flex;justify-content:space-between;align-items:center">
+    <img src="${SYNOBIS_LOGO_B64}" style="height:44px" />
     <div style="text-align:right;color:#a0b4c8;font-size:12px;line-height:1.6">
       <div>${reportTitle} | ${monthYear}</div>
       <div>Synobis Network Solutions</div>
@@ -5433,20 +5433,20 @@ async function generateCompliancePDF(selectedClients, mode) {
     const pageW = pdf.internal.pageSize.getWidth();
     const pageH = pdf.internal.pageSize.getHeight();
     const imgW = pageW;
-    const imgH = (canvas.height * imgW) / canvas.width;
-    let yPos = 0;
-    let pageCount = 0;
 
-    while (yPos < imgH) {
+    const pageHeightPx = (pageH / imgW) * canvas.width;
+    let yPx = 0;
+    let pageCount = 0;
+    while (yPx < canvas.height) {
       if (pageCount > 0) pdf.addPage();
-      const sourceY = (yPos / imgH) * canvas.height;
-      const sourceH = Math.min((pageH / imgH) * canvas.height, canvas.height - sourceY);
+      const sliceH = Math.min(pageHeightPx, canvas.height - yPx);
       const sliceCanvas = document.createElement('canvas');
       sliceCanvas.width = canvas.width;
-      sliceCanvas.height = sourceH;
-      sliceCanvas.getContext('2d').drawImage(canvas, 0, sourceY, canvas.width, sourceH, 0, 0, canvas.width, sourceH);
-      pdf.addImage(sliceCanvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pageW, (sourceH * pageW) / canvas.width);
-      yPos += pageH;
+      sliceCanvas.height = sliceH;
+      sliceCanvas.getContext('2d').drawImage(canvas, 0, yPx, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+      const sliceImgH = (sliceH * pageW) / canvas.width;
+      pdf.addImage(sliceCanvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pageW, sliceImgH);
+      yPx += sliceH;
       pageCount++;
     }
 
