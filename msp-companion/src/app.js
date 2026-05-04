@@ -5326,7 +5326,7 @@ function buildReportHTML(clients, devices, mode) {
 </head>
 <body>
   <!-- Header -->
-  <div style="background:#1e2a3a;padding:16px 28px;display:flex;justify-content:space-between;align-items:center">
+  <div style="background:#050a0f;padding:16px 28px;display:flex;justify-content:space-between;align-items:center">
     <img src="${SYNOBIS_LOGO_B64}" style="height:44px" />
     <div style="text-align:right;color:#a0b4c8;font-size:12px;line-height:1.6">
       <div>${reportTitle} | ${monthYear}</div>
