@@ -5363,11 +5363,7 @@ function buildReportHTML(clients, devices, mode) {
     ${clientSections}
   </div>
 
-  <!-- Footer -->
-  <div style="background:#1e2a3a;color:#a0b4c8;padding:14px 28px;font-size:11px;display:flex;justify-content:space-between;margin-top:20px">
-    <div>Synobis Network Solutions &nbsp;·&nbsp; Manage · Analyze · Protect</div>
-    <div>Confidential — prepared for authorized recipients only</div>
-  </div>
+
 </body></html>`;
 }
 
@@ -5452,6 +5448,20 @@ async function generateCompliancePDF(selectedClients, mode) {
       pdf.addImage(sliceCanvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pageW, sliceImgH);
       yPx += sliceH;
       pageCount++;
+    }
+
+    // Add footer to every page
+    const totalPages = pdf.internal.getNumberOfPages();
+    for (let p = 1; p <= totalPages; p++) {
+      pdf.setPage(p);
+      pdf.setFontSize(8);
+      pdf.setTextColor(160, 180, 200);
+      pdf.text('Synobis Network Solutions  ·  Manage · Analyze · Protect', 10, pageH - 6);
+      pdf.text('Confidential — prepared for authorized recipients only', pageW - 10, pageH - 6, { align: 'right' });
+      // Footer rule line
+      pdf.setDrawColor(60, 80, 110);
+      pdf.setLineWidth(0.3);
+      pdf.line(10, pageH - 10, pageW - 10, pageH - 10);
     }
 
     const filename = mode === 'internal'
