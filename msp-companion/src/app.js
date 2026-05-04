@@ -741,6 +741,7 @@ async function ensureMyResource() {
 // ─── COMPLIANCE — DEVICE FETCH ─────────────────────────────────────
 const COMPLIANCE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 state.complianceCache = null;
+state.complianceShowWarranty = false;
 
 async function fetchAllDevices(forceRefresh = false) {
   if (!forceRefresh && state.complianceCache &&
@@ -760,7 +761,7 @@ async function fetchAllDevices(forceRefresh = false) {
   return allDevices;
 }
 
-function getDeviceComplianceStatus(d) {
+function getDeviceComplianceStatus(d, warrantyOn = false) {
   const issues = [];
   // Software compliance
   const sw = (d.softwareStatus || '').toLowerCase();
@@ -783,8 +784,8 @@ function getDeviceComplianceStatus(d) {
   }
   // Reboot required
   if (d.rebootRequired) issues.push({ type: 'reboot', label: 'Reboot Required', color: '#e07b00' });
-  // Warranty
-  if (d.warrantyDate) {
+  // Warranty (only shown when warrantyOn toggle is active)
+  if (warrantyOn && d.warrantyDate) {
     const exp = new Date(d.warrantyDate);
     const daysLeft = Math.floor((exp - Date.now()) / 86400000);
     if (daysLeft < 0)   issues.push({ type: 'warranty', label: 'Warranty Expired', color: '#c8102e' });
@@ -5102,6 +5103,7 @@ async function renderComplianceView(forceRefresh = false) {
       <div class="clients-header">
         <div class="clients-title">🛡 Compliance</div>
         <input id="complianceSearch" type="text" placeholder="Filter clients..." class="clients-search" />
+        <button id="complianceWarrantyBtn" class="reports-range-btn" data-action="compliance-warranty-toggle" title="Toggle warranty issue visibility">🔖 Warranty OFF</button>
         <button class="reports-range-btn" data-action="compliance-refresh" title="Refresh compliance data">↺</button>
       </div>
       <div id="complianceBody"><div class="loading-state">Loading device compliance data...</div></div>
@@ -5109,11 +5111,11 @@ async function renderComplianceView(forceRefresh = false) {
 
   try {
     const devices = await fetchAllDevices(forceRefresh);
-    renderComplianceBody(devices, '');
+    renderComplianceBody(devices, '', state.complianceShowWarranty);
 
     // Wire search
     document.getElementById('complianceSearch')?.addEventListener('input', e => {
-      renderComplianceBody(devices, e.target.value.toLowerCase().trim());
+      renderComplianceBody(devices, e.target.value.toLowerCase().trim(), state.complianceShowWarranty);
     });
   } catch(e) {
     document.getElementById('complianceBody').innerHTML =
@@ -5121,7 +5123,7 @@ async function renderComplianceView(forceRefresh = false) {
   }
 }
 
-function renderComplianceBody(devices, filter) {
+function renderComplianceBody(devices, filter, warrantyOn = false) {
   const body = document.getElementById('complianceBody');
   if (!body) return;
 
@@ -5137,7 +5139,7 @@ function renderComplianceBody(devices, filter) {
   const siteEntries = Object.entries(bySite)
     .filter(([name]) => !filter || name.toLowerCase().includes(filter))
     .map(([name, devs]) => {
-      const withIssues = devs.filter(d => getDeviceComplianceStatus(d).length > 0);
+      const withIssues = devs.filter(d => getDeviceComplianceStatus(d, warrantyOn).length > 0);
       const offline    = devs.filter(d => !d.online);
       return { name, devs, withIssues, offline };
     })
@@ -5149,7 +5151,7 @@ function renderComplianceBody(devices, filter) {
   }
 
   const totalDevices  = devices.length;
-  const totalIssues   = devices.filter(d => getDeviceComplianceStatus(d).length > 0).length;
+  const totalIssues   = devices.filter(d => getDeviceComplianceStatus(d, warrantyOn).length > 0).length;
   const totalClean    = totalDevices - totalIssues;
 
   body.innerHTML = `
@@ -5195,14 +5197,14 @@ function renderComplianceDrill(siteName, devices) {
 
   // Sort: issues first, then alpha
   siteDevs.sort((a, b) => {
-    const ai = getDeviceComplianceStatus(a).length;
-    const bi = getDeviceComplianceStatus(b).length;
+    const ai = getDeviceComplianceStatus(a, state.complianceShowWarranty).length;
+    const bi = getDeviceComplianceStatus(b, state.complianceShowWarranty).length;
     if (bi !== ai) return bi - ai;
     return a.hostname.localeCompare(b.hostname);
   });
 
   return siteDevs.map(d => {
-    const issues = getDeviceComplianceStatus(d);
+    const issues = getDeviceComplianceStatus(d, state.complianceShowWarranty);
     const online = d.online;
     const onlineColor = online ? '#2a9d5c' : '#c8102e';
     const chips = issues.map(i =>
@@ -5239,26 +5241,14 @@ function injectComplianceViewAndNav() {
     if (sibling?.parentNode) sibling.parentNode.appendChild(div);
     else (document.querySelector('main') || document.body).appendChild(div);
   }
-  // Nav button — insert after Clients
+  // Nav button — insert after Clients (built from scratch to avoid clone text bleed)
   const clients = document.querySelector('.nav-item[data-view="clients"]');
   if (!clients || document.querySelector('.nav-item[data-view="compliance"]')) return;
-  const navItem = clients.cloneNode(true);
+  const navItem = document.createElement('button');
+  navItem.className = 'nav-item';
   navItem.dataset.view = 'compliance';
-  navItem.classList.remove('active');
-  navItem.querySelectorAll('.nav-badge,[class*="badge"],[class*="count"]').forEach(el => el.remove());
-  // Set icon + label
-  const icon = navItem.querySelector('.nav-icon, svg, img');
-  if (icon) icon.remove();
-  navItem.innerHTML = `<span class="nav-icon">🛡</span><span class="nav-label">Compliance</span>` + navItem.innerHTML;
-  // Replace text nodes
-  const walker = document.createTreeWalker(navItem, NodeFilter.SHOW_TEXT, null);
-  let node;
-  while ((node = walker.nextNode())) {
-    if (node.nodeValue.trim() && !['🛡','Compliance'].includes(node.nodeValue.trim())) {
-      node.nodeValue = 'Compliance';
-      break;
-    }
-  }
+  navItem.title = 'Compliance';
+  navItem.innerHTML = `<span class="nav-icon">🛡</span><span class="nav-label">Compliance</span>`;
   clients.parentNode.insertBefore(navItem, clients.nextSibling);
   navItem.addEventListener('click', () => setView('compliance'));
 }
@@ -6200,6 +6190,15 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='compliance-warranty-toggle') {
+      state.complianceShowWarranty = !state.complianceShowWarranty;
+      const btn = document.getElementById('complianceWarrantyBtn');
+      if (btn) btn.textContent = `🔖 Warranty ${state.complianceShowWarranty ? 'ON' : 'OFF'}`;
+      if (state.complianceCache) {
+        const search = document.getElementById('complianceSearch');
+        renderComplianceBody(state.complianceCache.devices, search?.value.toLowerCase().trim() || '', state.complianceShowWarranty);
+      }
     }
     if (action==='compliance-refresh') {
       renderComplianceView(true);
