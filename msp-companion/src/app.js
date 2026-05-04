@@ -738,6 +738,61 @@ async function ensureMyResource() {
 // buildIncidentClusterPrompt, renderAIResult
 
 
+// ─── COMPLIANCE — DEVICE FETCH ─────────────────────────────────────
+const COMPLIANCE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+state.complianceCache = null;
+
+async function fetchAllDevices(forceRefresh = false) {
+  if (!forceRefresh && state.complianceCache &&
+      (Date.now() - state.complianceCache.fetchedAt) < COMPLIANCE_CACHE_TTL) {
+    return state.complianceCache.devices;
+  }
+  const allDevices = [];
+  let page = 0;
+  while (true) {
+    const data = await dattoFetch(`/account/devices?max=250&page=${page}`);
+    const items = data.devices || data.items || [];
+    allDevices.push(...items);
+    if (!data.pageDetails?.nextPage) break;
+    if (++page > 40) break;
+  }
+  state.complianceCache = { devices: allDevices, fetchedAt: Date.now() };
+  return allDevices;
+}
+
+function getDeviceComplianceStatus(d) {
+  const issues = [];
+  // Software compliance
+  const sw = (d.softwareStatus || '').toLowerCase();
+  if (sw === 'noncompliant') issues.push({ type: 'software', label: 'Non-Compliant Software', color: '#c8102e' });
+  else if (sw === 'unmanaged')  issues.push({ type: 'software', label: 'Unmanaged', color: '#c8960c' });
+  // Patch management
+  const pm = d.patchManagement || {};
+  if (pm.patchStatus === 'PatchesApprovedAndPending')
+    issues.push({ type: 'patch', label: `${pm.patchesApprovedPending || 0} Patches Pending`, color: '#c8960c' });
+  else if (pm.patchStatus === 'NotFullyPatched' || pm.patchStatus === 'Failed')
+    issues.push({ type: 'patch', label: 'Not Fully Patched', color: '#c8102e' });
+  // Antivirus
+  const av = (d.antivirus?.antivirusStatus || '').toLowerCase();
+  if (av && av !== 'runninganduptodate') {
+    const avLabel = av === 'notrunning' ? 'AV Not Running'
+      : av === 'notinstalled' ? 'AV Not Installed'
+      : av === 'disabled' ? 'AV Disabled'
+      : 'AV Issue';
+    issues.push({ type: 'av', label: avLabel, color: '#c8102e' });
+  }
+  // Reboot required
+  if (d.rebootRequired) issues.push({ type: 'reboot', label: 'Reboot Required', color: '#e07b00' });
+  // Warranty
+  if (d.warrantyDate) {
+    const exp = new Date(d.warrantyDate);
+    const daysLeft = Math.floor((exp - Date.now()) / 86400000);
+    if (daysLeft < 0)   issues.push({ type: 'warranty', label: 'Warranty Expired', color: '#c8102e' });
+    else if (daysLeft < 90) issues.push({ type: 'warranty', label: `Warranty Exp. ${exp.toLocaleDateString()}`, color: '#c8960c' });
+  }
+  return issues;
+}
+
 async function fetchAtKbArticles(keywords) {
   if (!keywords?.length) return [];
   // Parallel query per keyword, 5 results each
@@ -5036,6 +5091,178 @@ function renderReportsBody(data) {
 }
 
 // ─── NAVIGATION ───────────────────────────────────────────────────
+
+// ─── COMPLIANCE VIEW ────────────────────────────────────────────────
+async function renderComplianceView(forceRefresh = false) {
+  const root = document.getElementById('view-compliance');
+  if (!root) return;
+
+  root.innerHTML = `
+    <div class="clients-wrap">
+      <div class="clients-header">
+        <div class="clients-title">🛡 Compliance</div>
+        <input id="complianceSearch" type="text" placeholder="Filter clients..." class="clients-search" />
+        <button class="reports-range-btn" data-action="compliance-refresh" title="Refresh compliance data">↺</button>
+      </div>
+      <div id="complianceBody"><div class="loading-state">Loading device compliance data...</div></div>
+    </div>`;
+
+  try {
+    const devices = await fetchAllDevices(forceRefresh);
+    renderComplianceBody(devices, '');
+
+    // Wire search
+    document.getElementById('complianceSearch')?.addEventListener('input', e => {
+      renderComplianceBody(devices, e.target.value.toLowerCase().trim());
+    });
+  } catch(e) {
+    document.getElementById('complianceBody').innerHTML =
+      `<div class="loading-state" style="color:#c8102e">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderComplianceBody(devices, filter) {
+  const body = document.getElementById('complianceBody');
+  if (!body) return;
+
+  // Group by site
+  const bySite = {};
+  for (const d of devices) {
+    const site = d.siteName || 'Unknown';
+    if (!bySite[site]) bySite[site] = [];
+    bySite[site].push(d);
+  }
+
+  // Sort sites: most issues first
+  const siteEntries = Object.entries(bySite)
+    .filter(([name]) => !filter || name.toLowerCase().includes(filter))
+    .map(([name, devs]) => {
+      const withIssues = devs.filter(d => getDeviceComplianceStatus(d).length > 0);
+      const offline    = devs.filter(d => !d.online);
+      return { name, devs, withIssues, offline };
+    })
+    .sort((a, b) => b.withIssues.length - a.withIssues.length);
+
+  if (!siteEntries.length) {
+    body.innerHTML = '<div class="loading-state">No clients match.</div>';
+    return;
+  }
+
+  const totalDevices  = devices.length;
+  const totalIssues   = devices.filter(d => getDeviceComplianceStatus(d).length > 0).length;
+  const totalClean    = totalDevices - totalIssues;
+
+  body.innerHTML = `
+    <div class="compliance-summary">
+      <div class="compliance-summary-stat">
+        <span class="compliance-summary-val" style="color:#2a9d5c">${totalClean}</span>
+        <span class="compliance-summary-lbl">Clean</span>
+      </div>
+      <div class="compliance-summary-stat">
+        <span class="compliance-summary-val" style="color:#c8102e">${totalIssues}</span>
+        <span class="compliance-summary-lbl">Issues</span>
+      </div>
+      <div class="compliance-summary-stat">
+        <span class="compliance-summary-val" style="color:var(--textdim)">${totalDevices}</span>
+        <span class="compliance-summary-lbl">Total Devices</span>
+      </div>
+    </div>
+    <div class="compliance-grid">
+      ${siteEntries.map(({ name, devs, withIssues, offline }) => {
+        const clean = devs.length - withIssues.length;
+        const pct   = devs.length > 0 ? Math.round((clean / devs.length) * 100) : 100;
+        const barColor = pct === 100 ? '#2a9d5c' : pct >= 75 ? '#c8960c' : '#c8102e';
+        return `
+          <div class="compliance-card" data-action="compliance-drill" data-site="${esc(name)}">
+            <div class="compliance-card-name">${esc(name)}</div>
+            <div class="compliance-card-stats">
+              <span style="color:#2a9d5c">${clean} clean</span>
+              <span style="color:#c8102e">${withIssues.length} issues</span>
+              <span style="color:var(--textdim)">${devs.length} total</span>
+            </div>
+            <div class="compliance-bar-track">
+              <div class="compliance-bar-fill" style="width:${pct}%;background:${barColor}"></div>
+            </div>
+            <div class="compliance-card-pct" style="color:${barColor}">${pct}%</div>
+          </div>`;
+      }).join('')}
+    </div>`;
+}
+
+function renderComplianceDrill(siteName, devices) {
+  const siteDevs = devices.filter(d => d.siteName === siteName);
+  if (!siteDevs.length) return '<div class="drill-empty">No devices found.</div>';
+
+  // Sort: issues first, then alpha
+  siteDevs.sort((a, b) => {
+    const ai = getDeviceComplianceStatus(a).length;
+    const bi = getDeviceComplianceStatus(b).length;
+    if (bi !== ai) return bi - ai;
+    return a.hostname.localeCompare(b.hostname);
+  });
+
+  return siteDevs.map(d => {
+    const issues = getDeviceComplianceStatus(d);
+    const online = d.online;
+    const onlineColor = online ? '#2a9d5c' : '#c8102e';
+    const chips = issues.map(i =>
+      `<span class="drill-pill" style="color:${i.color};border-color:${i.color}55">${esc(i.label)}</span>`
+    ).join('');
+    const cleanChip = issues.length === 0
+      ? `<span class="drill-pill" style="color:#2a9d5c;border-color:#2a9d5c55">✓ Clean</span>`
+      : '';
+
+    return `
+      <div class="drill-row">
+        <div class="drill-row-main">
+          <span class="drill-tn" style="color:${onlineColor}" title="${online?'Online':'Offline'}">${online?'●':'○'}</span>
+          <span class="drill-title">${esc(d.hostname)}</span>
+          <span class="drill-tech" style="color:var(--textdim)">${esc(d.operatingSystem?.replace('Microsoft ','') || '')}</span>
+        </div>
+        <div class="drill-row-meta">
+          ${chips}${cleanChip}
+          ${d.lastLoggedInUser ? `<span class="drill-age">${esc(d.lastLoggedInUser.split('\\').pop())}</span>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// ─── COMPLIANCE NAV + VIEW INJECTION ───────────────────────────────
+function injectComplianceViewAndNav() {
+  if (!document.getElementById('view-compliance')) {
+    const sibling = document.getElementById('view-clients')
+                 || document.getElementById('view-tickets')
+                 || document.getElementById('view-dashboard');
+    const div = document.createElement('div');
+    div.id = 'view-compliance';
+    div.className = 'view';
+    if (sibling?.parentNode) sibling.parentNode.appendChild(div);
+    else (document.querySelector('main') || document.body).appendChild(div);
+  }
+  // Nav button — insert after Clients
+  const clients = document.querySelector('.nav-item[data-view="clients"]');
+  if (!clients || document.querySelector('.nav-item[data-view="compliance"]')) return;
+  const navItem = clients.cloneNode(true);
+  navItem.dataset.view = 'compliance';
+  navItem.classList.remove('active');
+  navItem.querySelectorAll('.nav-badge,[class*="badge"],[class*="count"]').forEach(el => el.remove());
+  // Set icon + label
+  const icon = navItem.querySelector('.nav-icon, svg, img');
+  if (icon) icon.remove();
+  navItem.innerHTML = `<span class="nav-icon">🛡</span><span class="nav-label">Compliance</span>` + navItem.innerHTML;
+  // Replace text nodes
+  const walker = document.createTreeWalker(navItem, NodeFilter.SHOW_TEXT, null);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.nodeValue.trim() && !['🛡','Compliance'].includes(node.nodeValue.trim())) {
+      node.nodeValue = 'Compliance';
+      break;
+    }
+  }
+  clients.parentNode.insertBefore(navItem, clients.nextSibling);
+  navItem.addEventListener('click', () => setView('compliance'));
+}
+
 function setView(view) {
   // Stop timer if leaving the tickets view (we're no longer viewing that ticket)
   if (state.currentView === 'tickets' && view !== 'tickets') {
@@ -5046,6 +5273,7 @@ function setView(view) {
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
   if (view==='kb') renderKB();
   if (view==='clients') renderClientsView();
+  if (view==='compliance') renderComplianceView();
   if (view==='reports') renderReportsView();
   if (view==='settings') {
     populateKnownClients();
@@ -5972,6 +6200,17 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='compliance-refresh') {
+      renderComplianceView(true);
+    }
+    if (action==='compliance-drill') {
+      const siteName = el.dataset.site;
+      if (!siteName || !state.complianceCache) return;
+      openDrillPanel(
+        `🛡 ${siteName} — Device Compliance`,
+        renderComplianceDrill(siteName, state.complianceCache.devices)
+      );
     }
     if (action==='stat-drill') {
       const stat = el.dataset.stat;
@@ -6996,6 +7235,7 @@ async function boot() {
   injectAppStyles();
   // Init API modules with settings accessor
   initDatto(() => state.settings);
+  injectComplianceViewAndNav();
   initAt(() => state.settings);
   initAI(() => state.settings);
   registerSW();
