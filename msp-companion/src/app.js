@@ -7235,7 +7235,6 @@ async function boot() {
   injectAppStyles();
   // Init API modules with settings accessor
   initDatto(() => state.settings);
-  injectComplianceViewAndNav();
   initAt(() => state.settings);
   initAI(() => state.settings);
   registerSW();
@@ -7246,6 +7245,7 @@ async function boot() {
   injectBackupRestore();
   injectHandoffButton();
   injectClientsViewAndNav();
+  injectComplianceViewAndNav();
   injectVerifyButton();
   injectVerifyAutotaskButton();
   applyMode(LS.get('msp_lightmode', false));
