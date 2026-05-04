@@ -938,6 +938,32 @@ function findTicketById(ticketId) {
   return null;
 }
 
+// Search tickets in cache by ticket number or title (case-insensitive)
+function searchTicketsInCache(query) {
+  if (!query) return null;
+  const q = query.toLowerCase().trim();
+  return Object.values(state.tickets).filter(t =>
+    (t.ticketNumber || '').toLowerCase().includes(q) ||
+    (t.title || '').toLowerCase().includes(q) ||
+    (t.companyName || '').toLowerCase().includes(q)
+  );
+}
+
+// Fetch a single ticket from AT by ticket number (e.g. "T20260423.0194")
+async function fetchTicketFromAT(ticketNumber) {
+  const clean = ticketNumber.trim().replace(/^T/i, '');
+  // Try by ticketNumber field first
+  const data = await atFetch('/Tickets/query', 'POST', {
+    MaxRecords: 5,
+    filter: [{ op: 'contains', field: 'ticketNumber', value: clean }],
+    IncludeFields: ['id','ticketNumber','title','status','priority','assignedResourceID',
+      'assignedResourceRoleID','companyID','companyLocationID','contactID',
+      'createDate','lastActivityDate','dueDateTime','estimatedHours','contractID',
+      'issueType','subIssueType','source','queueID','workType'],
+  });
+  return (data.items || []);
+}
+
 function setInvestigation(ticketId, inv) {
   const key = String(ticketId);
   state.investigations[key] = inv;
@@ -3078,6 +3104,89 @@ function renderChatHistory(uid) {
 }
 
 // ─── TICKET LIST ──────────────────────────────────────────────────
+
+// ─── TICKET SEARCH ─────────────────────────────────────────────────
+function renderTicketSearchResults(query, tickets) {
+  const el = $('ticketList');
+  if (!el) return;
+  if (!query) { renderTicketList(); return; }
+
+  if (tickets === null) {
+    // Loading state — AT fetch in progress
+    el.innerHTML = `<div class="loading-state">Searching Autotask for "${esc(query)}"...</div>`;
+    return;
+  }
+
+  if (!tickets.length) {
+    // Check if it looks like a ticket number to offer AT fetch
+    const looksLikeTicketNum = /T?\d{8,}/i.test(query.trim());
+    el.innerHTML = `
+      <div class="ticket-search-empty">
+        <div class="loading-state">No cached tickets match "<strong>${esc(query)}</strong>"</div>
+        ${looksLikeTicketNum ? `
+          <button class="abtn abtn-ghost" id="ticketFetchAtBtn" style="margin:12px auto;display:block">
+            🔍 Search Autotask directly
+          </button>` : ''}
+      </div>`;
+
+    document.getElementById('ticketFetchAtBtn')?.addEventListener('click', async () => {
+      renderTicketSearchResults(query, null); // show loading
+      try {
+        const items = await fetchTicketFromAT(query);
+        if (!items.length) {
+          $('ticketList').innerHTML = `<div class="loading-state" style="color:var(--textdim)">No ticket found in Autotask for "${esc(query)}"</div>`;
+          return;
+        }
+        // Normalize and load into state using same shape as syncTickets
+        const pl = state.atStatusPicklist || {};
+        const companyNameMap = buildCompanyNameMap();
+        for (const raw of items) {
+          const si = pl[raw.status] || { label:`Status ${raw.status}`, color:'#8bacc8', done:false };
+          const normalized = {
+            id: raw.id, ticketNumber: raw.ticketNumber,
+            status: raw.status, statusLabel: si.label, statusColor: si.color, isDone: si.done,
+            priority: raw.priority, queueID: raw.queueID,
+            title: raw.title, companyID: raw.companyID,
+            companyName: companyNameMap[raw.companyID] || null,
+            assignedResourceID: raw.assignedResourceID, assignedResourceName: null,
+            lastActivity: raw.lastActivityDate,
+          };
+          state.tickets[normalized.ticketNumber] = normalized;
+        }
+        // Open first result
+        const first = state.tickets[items[0].ticketNumber];
+        state.currentTicket = first;
+        renderTicketList();
+        renderTicketDetail(first);
+        // Clear search
+        const inp = $('ticketSearchInput');
+        if (inp) { inp.value = ''; }
+        const clr = $('ticketSearchClear');
+        if (clr) clr.style.display = 'none';
+      } catch(e) {
+        $('ticketList').innerHTML = `<div class="loading-state" style="color:#c8102e">AT fetch failed: ${esc(e.message)}</div>`;
+      }
+    });
+    return;
+  }
+
+  // Render matching tickets in a flat list (no resource grouping when searching)
+  const rows = tickets.map(t => `
+    <div class="list-row ticket-row ${state.currentTicket?.id===t.id?'active':''}" data-ticket-id="${t.id}">
+      <div class="row-top">
+        <span class="row-device" style="font-size:13px">${esc(t.ticketNumber)}</span>
+        <span class="badge" style="color:${t.statusColor||'#8bacc8'};background:${t.statusColor||'#8bacc8'}22;border:1px solid ${t.statusColor||'#8bacc8'}44">${esc(t.statusLabel||'Unknown')}</span>
+      </div>
+      <div class="row-client purple">${esc(t.title?.substring(0,55)||'No title')}</div>
+      <div class="row-foot">
+        <span class="row-type">${esc(t.companyName||'AT Ticket')}</span>
+        <span style="font-size:11px;color:var(--textdim)">${t.lastActivity?new Date(t.lastActivity).toLocaleDateString():''}</span>
+      </div>
+    </div>`).join('');
+
+  el.innerHTML = `<div class="ticket-search-label">${tickets.length} match${tickets.length===1?'':'es'} for "${esc(query)}"</div>${rows}`;
+}
+
 function renderTicketList() {
   const el=$('ticketList'); if(!el) return;
   // All tickets, active + stale, for toolbar counts
@@ -5286,6 +5395,34 @@ function wireEvents() {
   document.getElementById('modeToggleBtn')?.addEventListener('click', () => {
     applyMode(!document.body.classList.contains('light'));
   });
+
+  // Ticket search
+  const ticketSearchInput = document.getElementById('ticketSearchInput');
+  const ticketSearchClear = document.getElementById('ticketSearchClear');
+  if (ticketSearchInput) {
+    ticketSearchInput.addEventListener('input', () => {
+      const q = ticketSearchInput.value.trim();
+      ticketSearchClear.style.display = q ? 'flex' : 'none';
+      if (!q) { renderTicketList(); return; }
+      const matches = searchTicketsInCache(q);
+      renderTicketSearchResults(q, matches);
+    });
+    ticketSearchInput.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        ticketSearchInput.value = '';
+        ticketSearchClear.style.display = 'none';
+        renderTicketList();
+      }
+    });
+  }
+  if (ticketSearchClear) {
+    ticketSearchClear.addEventListener('click', () => {
+      ticketSearchInput.value = '';
+      ticketSearchClear.style.display = 'none';
+      renderTicketList();
+      ticketSearchInput.focus();
+    });
+  }
 
   // Nav
   document.querySelectorAll('.nav-item[data-view]').forEach(btn => {
