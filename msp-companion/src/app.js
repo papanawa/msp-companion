@@ -938,32 +938,6 @@ function findTicketById(ticketId) {
   return null;
 }
 
-// Search tickets in cache by ticket number or title (case-insensitive)
-function searchTicketsInCache(query) {
-  if (!query) return null;
-  const q = query.toLowerCase().trim();
-  return Object.values(state.tickets).filter(t =>
-    (t.ticketNumber || '').toLowerCase().includes(q) ||
-    (t.title || '').toLowerCase().includes(q) ||
-    (t.companyName || '').toLowerCase().includes(q)
-  );
-}
-
-// Fetch a single ticket from AT by ticket number (e.g. "T20260423.0194")
-async function fetchTicketFromAT(ticketNumber) {
-  const clean = ticketNumber.trim().replace(/^T/i, '');
-  // Try by ticketNumber field first
-  const data = await atFetch('/Tickets/query', 'POST', {
-    MaxRecords: 5,
-    filter: [{ op: 'contains', field: 'ticketNumber', value: clean }],
-    IncludeFields: ['id','ticketNumber','title','status','priority','assignedResourceID',
-      'assignedResourceRoleID','companyID','companyLocationID','contactID',
-      'createDate','lastActivityDate','dueDateTime','estimatedHours','contractID',
-      'issueType','subIssueType','source','queueID','workType'],
-  });
-  return (data.items || []);
-}
-
 function setInvestigation(ticketId, inv) {
   const key = String(ticketId);
   state.investigations[key] = inv;
@@ -3104,89 +3078,6 @@ function renderChatHistory(uid) {
 }
 
 // ─── TICKET LIST ──────────────────────────────────────────────────
-
-// ─── TICKET SEARCH ─────────────────────────────────────────────────
-function renderTicketSearchResults(query, tickets) {
-  const el = $('ticketList');
-  if (!el) return;
-  if (!query) { renderTicketList(); return; }
-
-  if (tickets === null) {
-    // Loading state — AT fetch in progress
-    el.innerHTML = `<div class="loading-state">Searching Autotask for "${esc(query)}"...</div>`;
-    return;
-  }
-
-  if (!tickets.length) {
-    // Check if it looks like a ticket number to offer AT fetch
-    const looksLikeTicketNum = /T?\d{8,}/i.test(query.trim());
-    el.innerHTML = `
-      <div class="ticket-search-empty">
-        <div class="loading-state">No cached tickets match "<strong>${esc(query)}</strong>"</div>
-        ${looksLikeTicketNum ? `
-          <button class="abtn abtn-ghost" id="ticketFetchAtBtn" style="margin:12px auto;display:block">
-            🔍 Search Autotask directly
-          </button>` : ''}
-      </div>`;
-
-    document.getElementById('ticketFetchAtBtn')?.addEventListener('click', async () => {
-      renderTicketSearchResults(query, null); // show loading
-      try {
-        const items = await fetchTicketFromAT(query);
-        if (!items.length) {
-          $('ticketList').innerHTML = `<div class="loading-state" style="color:var(--textdim)">No ticket found in Autotask for "${esc(query)}"</div>`;
-          return;
-        }
-        // Normalize and load into state using same shape as syncTickets
-        const pl = state.atStatusPicklist || {};
-        const companyNameMap = buildCompanyNameMap();
-        for (const raw of items) {
-          const si = pl[raw.status] || { label:`Status ${raw.status}`, color:'#8bacc8', done:false };
-          const normalized = {
-            id: raw.id, ticketNumber: raw.ticketNumber,
-            status: raw.status, statusLabel: si.label, statusColor: si.color, isDone: si.done,
-            priority: raw.priority, queueID: raw.queueID,
-            title: raw.title, companyID: raw.companyID,
-            companyName: companyNameMap[raw.companyID] || null,
-            assignedResourceID: raw.assignedResourceID, assignedResourceName: null,
-            lastActivity: raw.lastActivityDate,
-          };
-          state.tickets[normalized.ticketNumber] = normalized;
-        }
-        // Open first result
-        const first = state.tickets[items[0].ticketNumber];
-        state.currentTicket = first;
-        renderTicketList();
-        renderTicketDetail(first);
-        // Clear search
-        const inp = $('ticketSearchInput');
-        if (inp) { inp.value = ''; }
-        const clr = $('ticketSearchClear');
-        if (clr) clr.style.display = 'none';
-      } catch(e) {
-        $('ticketList').innerHTML = `<div class="loading-state" style="color:#c8102e">AT fetch failed: ${esc(e.message)}</div>`;
-      }
-    });
-    return;
-  }
-
-  // Render matching tickets in a flat list (no resource grouping when searching)
-  const rows = tickets.map(t => `
-    <div class="list-row ticket-row ${state.currentTicket?.id===t.id?'active':''}" data-ticket-id="${t.id}">
-      <div class="row-top">
-        <span class="row-device" style="font-size:13px">${esc(t.ticketNumber)}</span>
-        <span class="badge" style="color:${t.statusColor||'#8bacc8'};background:${t.statusColor||'#8bacc8'}22;border:1px solid ${t.statusColor||'#8bacc8'}44">${esc(t.statusLabel||'Unknown')}</span>
-      </div>
-      <div class="row-client purple">${esc(t.title?.substring(0,55)||'No title')}</div>
-      <div class="row-foot">
-        <span class="row-type">${esc(t.companyName||'AT Ticket')}</span>
-        <span style="font-size:11px;color:var(--textdim)">${t.lastActivity?new Date(t.lastActivity).toLocaleDateString():''}</span>
-      </div>
-    </div>`).join('');
-
-  el.innerHTML = `<div class="ticket-search-label">${tickets.length} match${tickets.length===1?'':'es'} for "${esc(query)}"</div>${rows}`;
-}
-
 function renderTicketList() {
   const el=$('ticketList'); if(!el) return;
   // All tickets, active + stale, for toolbar counts
@@ -5057,6 +4948,7 @@ async function renderReportsView() {
         <div class="reports-title">📊 Reports</div>
         <div class="reports-range">
           ${REPORTS_RANGES.map(r => `<button class="reports-range-btn ${r.days===days?'active':''}" data-action="reports-range" data-days="${r.days}">${r.label}</button>`).join('')}
+          <button class="reports-range-btn" data-action="reports-generate-report" title="Generate PDF compliance report" style="background:var(--accent);color:#fff;border-color:var(--accent)">📄 Report</button>
           <button class="reports-range-btn" data-action="reports-refresh" title="Refresh data" style="margin-left:auto">↺</button>
         </div>
       </div>
@@ -5213,6 +5105,7 @@ async function renderComplianceView(forceRefresh = false) {
         <div class="clients-title">🛡 Compliance</div>
         <input id="complianceSearch" type="text" placeholder="Filter clients..." class="clients-search" />
         <button id="complianceWarrantyBtn" class="reports-range-btn" data-action="compliance-warranty-toggle" title="Toggle warranty issue visibility">🔖 Warranty OFF</button>
+        <button class="reports-range-btn" data-action="compliance-generate-report" title="Generate PDF compliance report" style="background:var(--accent);color:#fff;border-color:var(--accent)">📄 Report</button>
         <button class="reports-range-btn" data-action="compliance-refresh" title="Refresh compliance data">↺</button>
       </div>
       <div id="complianceBody"><div class="loading-state">Loading device compliance data...</div></div>
@@ -5338,6 +5231,343 @@ function renderComplianceDrill(siteName, devices) {
   }).join('');
 }
 
+// ─── PDF COMPLIANCE REPORT ─────────────────────────────────────────
+const SYNOBIS_LOGO_B64 = 'data:image/png;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BST0ZJTEUAAQEAAAHIAAAAAAQwAABtbnRyUkdCIFhZWiAH4AABAAEAAAAAAABhY3NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAA9tYAAQAAAADTLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlkZXNjAAAA8AAAACRyWFlaAAABFAAAABRnWFlaAAABKAAAABRiWFlaAAABPAAAABR3dHB0AAABUAAAABRyVFJDAAABZAAAAChnVFJDAAABZAAAAChiVFJDAAABZAAAAChjcHJ0AAABjAAAADxtbHVjAAAAAAAAAAEAAAAMZW5VUwAAAAgAAAAcAHMAUgBHAEJYWVogAAAAAAAAb6IAADj1AAADkFhZWiAAAAAAAABimQAAt4UAABjaWFlaIAAAAAAAACSgAAAPhAAAts9YWVogAAAAAAAA9tYAAQAAAADTLXBhcmEAAAAAAAQAAAACZmYAAPKnAAANWQAAE9AAAApbAAAAAAAAAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAACAAAAAcAEcAbwBvAGcAbABlACAASQBuAGMALgAgADIAMAAxADb/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCACdAdkDASIAAhEBAxEB/8QAHQABAAIDAQEBAQAAAAAAAAAAAAYHBAUIAwIBCf/EAE0QAAEDAwIDBAUGCwYEBQUAAAECAwQABREGIQcSMRNBUWEIFCJxgRUydJGhsRYjNjdCUmJyc4KyJDM0NaLBQ1OS8BhWwtHhY3WDk7P/xAAaAQEAAgMBAAAAAAAAAAAAAAAAAQUCAwQG/8QANREAAQMCAwUHBAEFAAMAAAAAAQACAwQREiExBRNBUWEUInGBkaGxMsHR8OEzQlJy8SNiY//aAAwDAQACEQMRAD8A4ypSlESlKkuhdG3TVczljDsIbZw9KWnKU+Q/WV5fXis443SuDWC5Kxe9rG4nGwUfix5EuQiPFYcfeWcIbbSVKUfICrF0xwivE5KH7zIRbWTv2QHO6R5jon6yfKrZ0jpOzaYi9lbowLxGHJDmC4v3nuHkNq3tejpdisaLzG55cFSVG1HHKLIc1DLPwy0jbkpK4Cpzg/TlOFWf5RhP2VJolptUNPLEtkKOPBphKfuFZtKuI6eKP6GgKtfNI/6nEpWJLtdsmAiXbocgHqHWEqz9YrLpWwgHIrAEjRQ68cNNIXFKiLcYbh/TirKMfy7p+yq+1NwfusQKesktu4NjfsnMNu/D9E/ZV5Urim2bTzDNtj0yXVFWzR6Ov4rkadElQZS4syO7HfbOFtuJKVD4GvCup9VaYs+pYfq90ihagMNvI2cb/dV/sdvKqD19oi56Uk87n9pt7isNSUDb91Q/RV9h7u/Hna3ZklN3hm391V1S17J+6ciopSlKrF3JSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKVl2e3yrrdI9uho535DgQge/vPkOp91SASbBQSALlb7h1o+Vqy7FvKmYDGDJfA6DuSn9o/Z18j0babdDtVvZgQGEsR2U8qEJ+8+JPjWHpKxRNOWJi1xACGxlxzGC4s9VH/vpgVtq9ls+hbSsz+o6/heZrKszvy+kaJSlKsFxpSlKIlKUoiV5yX2Y0dyRIdQ0y2kqWtZwEgdSTXpVKcddWrkzTpmC6RHYIVLKT89fUI9yevv8AdXLWVTaaIvPkt9NAZ5A0JrXi3NekORdMhMeOk49acQFOL80g7JHvBPuqGu631Q+04zLurkph1JS4y+hK0LB7iCPtG47qwdLWGfqO8NWy3oyte61nPK2nvUry/wDgVf8ApPh/p2wxkf2NqdLwOeRIQFkn9kHZI92/ma8/Aysr3F+Kw9vIK5ldTUgDcNyua6V05qjROnr9CWy9AYjv4/FyGGwlaD3Hb5w8jXOWobVKsl5lWqYnD0dfKSOih1Ch5EYPxrlrdnyUliTcHiuilrGVFwMisClKVwLrSlKUResSO/LlNRYzSnXnVhDaEjJUonAAq7tF8J7ZDjtydQj16WoZLAUQ035bbqP2eXfUS4A25mXq5+Y8Aow45U2COilEJz9Wfrq2eJFwkWrQ91mxVlDyGQlCh1SVKCcjzHNmr/ZlJFuTUSi9r+yqK6pk3ghjNv5WnuustDaSkLhx2WRIaBStq3xk5TvkpJGE5z1Ge7esJvjFpZxYQuJdUJOxUplBA9+Fk1QxJJyTkmvyuc7Znv3QAOVluGzIrd4kldF2Sbw/1nzxY0GA+82jmLTsQIcSnPUHHu6HwzVX8ZdOWrTl7iNWllbDT7BcU2XCoAhRG2d/trz4IfnEh/wnf6DW79Ir/P7Z9FP9ZrdNKKmhMrmgOBtl5LVFGYKsRtcbEKraUpVErZKUpREpSlESlKURKUpREpSlESlKURKUpREpSlESlKURKUpREpSlESlKURKUpREpSlESlKURKUpREq3/AEfNPgmVqOQjJSTHjZ7v11faB9dVBXU+ibWLLpO224J5VtMJLg/bV7Sv9RNW+xoBJPjOjflVu05sEWEcVuaUr8WpKElS1BKQMkk4Ar1i88v2laxzUWn23A05fbWhZOAlUtsH6s1mxJcSWjniymJCfFpwKH2ViHtJsCsi1w1C9qUpWSxSlKURarV13RYdNzrqvGWGiWweilnZI+JIrliS87JkOSH1qcddWVrWeqlE5JPxq4fSIu/JGt1jbVu4oyXR5DKUfbzfVUA4X2gXnW9ujOJ5mW19u6CNuVHtYPkSAPjXl9qyGoqWwt4ZeZV9s9ghgMruPwFdXCfTCNOaZbW81i4TAHZJI3T+qj4A/WTUwpSvSQxNiYGN0CpJJDI4udqUqqPSCsAdgRtRMIHaMEMSCB1QT7JPuO38wq161+pLai8WCdbF4xJYU2Ce5RGx+Bwa1VkAnhcz9utlNKYpQ5cn0r6WhSFqQtJSpJwQe41+cqikq5TyggE42B/7Brwq9YvylKURWLwBuTUTV70N5QT67HKGyT1WkhQH1c1Xbf7YxebNLtckkNSWi2VDqnPQj3HB+Fcoxn3o0huRHcU080oLQtJwUkbgir74d8SbffGWoF3dbh3MDlyo8rb/AJg9Ar9n6vAeh2TVx7s08nl1vwVNtGmfj3zFTWrdNXTTNyVDuLJ5SSWnkj2HR4g/7dRWlrre52+Fc4a4dwisymF9W3UhQ9/kfOqv1VwdYdK5GnJnYHr6tIJUn+VfUfHPvrTV7GkYS6HMcuP8rZT7TY4WkyPsqmsd2uFkuKLhbJHq8lAISvkSrAIwdlAjpXvqPUN41DIakXiX6y40jkQrs0IwM5x7IFfGoLFdrDL9WusJ2Ms/NJGUrHilQ2PwrW1UudIwGMkgcv4VkAxxDxY9VLdG6Vs18tbku4augWZ1DxbDD4RzKSEpPNutO2SR07qmLPBdt5lDzOqkONuJCkLRCylQO4IIc3FVDV0cBtV9vHVpia5+MaBXDJO6k9VI+HUeWfCrDZ/ZZXiKVmfO519VxVm/jaZI3eVgoTrHR9nsVsXJiavgXSSh0NqitJQFjrk7OKO2PCobVn8dtLeo3NOoobeI0xXLIAGyHf1v5h9oPjVYVy10QimLA21vH1zW+kk3kQcTdWdbuGFluLqWIWvbfJfUnm7JlpC1Y79g7mvG88N7Ja0SUSNeW5MphsqMZbaELJ5chOC7kE7d3fW40HHj6G0BK1bcGx6/NRyxW1bEpPzE/EjmPkBVSzpT82Y9MlOKdfeWVuLPUqJyTXXP2eKNt4+8c7XOQ4cVzxb6R7rP7o6DM+in9j4eWO6RoZb13bky5LaFeqpQhTiVKAJRjtckjp07qytScIZlss0ifBu3yg6ynnLAi8hUkdcHmOSBvjG9RPhl+X1m+kj7jV82/UCRrq5ablOAOcjciHn9JJQOdPvBBV7ifCuijgpaiK7mWN7anW3itNTLUQyd11xa+g5rmOlWPxp0abPcVXy3t/2CWv8AGpSNmXD/AOk9R55HhVcVT1EDoJDG7grKGVszA9qtCBwvsk+QI8HX9ulPEEhtlpC1EDqcB3NYl84eWO1xphc13blS4za1eqqQhLilJBIRjtcgnp076xeBX5wGfo7v3Vp+Jv5fXn6SfuFd7uz9mEojzJtqeXiuRu+3+7x5WvoFHK9YkaRLktxorLj77iuVDbaSpSj4ACvNCVLWEISVKUcAAZJNdD6D0xb9EaZdudwSj14MF6W8RktpAyUJ8h9p+GOaio3VLyL2A1K3VVSIG8ydAq6tfCa+vRfWrrMhWlrbIdXzLSNtzj2R18ayGuGthkKLUTiFan3iDyNpSgkn4Ok/ZUU1tqq5aoua5Et1aYyVH1eMFew0nu271eJ/22qP1m6WlYbMjuOZJ+yhsdQ4Xc+x5ABTrUXC3U9qaU+w21cmUjJ9WJKwP3CMn4ZqDKBSopUCCDgg91WLwl13LtVzj2a5yFPW19QbbLismOo7DB/V7iOg6+OZTxp0VHlW97UltZDctgc8pCBs6jvVj9Ydc94z4VudRxzwman4ag/Zam1L4pRFNx0KqLTNui3a+R7fNuTNsYd5ueU9jkbwkkZyQNyAOvfViW7hLbrkha7draJMSg4WpiMlwJPgcOnFVTV1+jn/AJPdvpCP6aw2ayGaQRSMve+dzyWVc+SNhkY61uFgtJP4XWW3yPV5+vrfEewFdm+yhCsHocF3NI/CmFcEH5G1pbrgtJ9pLbYIA790rV4ju761PHP84Mj+A1/TUKhyZEOU3KivOMPtK5kOIVhST4g1Mz6aKZzDFkDbUqImTyRh4kzI5BSLV2htQaZR286Oh6JnHrLCuZAPnsCn4ioxXUWlZadTaIhyLi0h0TY3LIQR7KzulW3mQa5kuLCY1wkRkq5ktOqQD4gEio2hRsgwvjPdcpo6l0uJjxmFL9K6Msl4szE2XrW3W2Q6VAxXQgrThRA6uA74z076k0ng0xFjrkSdWNsMtjmW45DCUpHiSXMCqqgf46P/ABU/fXTHEr8gr19FVXTQQ088T3OZm0cznr1WirkmikaGvyceQyVC6205a7CiIbbqaHei+VhYjhP4rGMZ5Vq65Ph0rRW6DLuMxuHBjuSJDhwhttOSax6u70erVHbsk28qQkyXnywlXelCQk4+JP2CuKngFXUYGjCP3muuaU08OJxuVGovCaczETLv98t9oaPXmPPy7dCSUpz16E0Tw2sTwUiFxBtEh4DIQAjf34cJH1Vp+MVxmzddz2JTi+yiqDTDZPsoTyg5A8+ufOodWc0lNE8sEd7ZXJN1hGyd7A4vtfoFMtY8Ob7pqA5cX3IsmG2QFONLIKcnAylQHeR0z1qG1c11cW56OzCnFlRDbSQSe4PgAfAACqZrXXQxxPbu8gQD6rOklfI12PUEhKUpXEupbPSkQT9T2uGoZS9LaQr90qGfszXVtcx8MQDr+zZGf7SPuNdOV6bYTRunHqqLax77R0WFfbnGs9olXSYohiM2Vqx1PgB5k4A99UJfHdd66eMoW64OQVHLLLaFJYSM7YJwFHz610DOhxZzSWZjCH20rC+RYykkHIJHQ4O+9e9WFXSOqThLrN5DiuOnqRBmG3K5jkaE1ewCV2CYcfqJC/6Sa1EiJdLU+FSI0yA6DsXG1NqB+OK6zr5dbbdbU26hK0KGClQyD8Kr37CZ/Y8j98l2N2s/+5oXN9i4jastJSlNyVMaH/DljtAf5vnD66sHT/GO1yOVq9QHoSzsXWvxjfvI+cPhmpPe+HukrqFKctTcZ0/8SKeyI88D2T8RUCv3BmU3zOWO6tvJ7mpSeVX/AFDYn4CsBBtGl+h2Ievz9lnvaKo+oYT+/uatezXu03lntbXcY8tOMkNrBUn3p6j4ithXLd307qXTb4dmQJcMoPsvo3SD5LTt9tbuwcUNVWsJbelIuLI25ZSeZX/WMKz7ya2R7ZDThnYWn94LW/ZhIxROuFgcU7obrrq5Pb9my56u2D+qj2ftIJ+NTb0dLbl26XhafmhMZs48faV9yK9kcQND6lbDOqbGI7hGO1U32oT7lpAWPgKnOg0aWiWxUTTE2O9HW6XShD/OoEgdQfaGwHWtVJTsfVb4SBwzPI+i2VMzm0+6LCNB09VI6UpXoVTJSlCQBknAFEXLnECIIOtrxGSnlSJa1JHgFHmH2Gvu0wFyNC36dnCIkqGTt1Ku2SN/r2/9q9+KkqHM1/dJMB9t+OpaAHEKylRDaQrB7/aBqaX+ynSno7wky08lw1Bc25KkKG6WUoUUD6uU/wA9eCqABM8DS5+V66EkxtJ5BVJSlK0ralKlfDnR34YSpjHyj6l6shK89h2nNkkY+cMdK12tbF+DepJNn9a9a7EIPa9nyc3MkK6ZPj41uNPIIhKR3TktQmYZDGDmFs9LcQ9S2AIZbl+uRE7dhJysAeR6j68eVW3o/ibYb6tEaSo2yarADbyhyKPglfT4HBrneldVNtKeDK9xyK0T0MU2drHoutrtbYN1grhXGK1Jjr6oWMj3jwPmN6584n6Jd0pOQ9HUp62SFEMuK+chXXkV5+B7wD4Gp1wH1TNuLciw3B5T6ozQdjuLOVBsEJKT4gEpx7/dUp4tQ25nD66JcAy02HkHwKVA/dkfGrupZFX0u+aMwPjgqqB0lJUbsnI/t1zTWRbpki3zmJsR0tPsLC21juIrHpXlQSDcL0BF8iumrRMtuvdEEvISW5TZakNjq04OuPccEfCqe0poSZJ4guWK4Nq9Xgr7SSvGAtsfNx+9t8CfCvXghfpNt1a3axlcW4nkWjPzVAEpUPPu9x8hVocXLs5YdIypkJtKJcxSYnbJGFJBCjnPkObHgTXo7xVkDaiTVmvX/v5VJaSmlMLNHadFVXGHUyb5qD1CEofJ1uy00E/NWvopXu2wPIedQalKoJpnTSF7tSriKMRMDG8FI+GX5fWb6SPuNb/jNLkQeJnrkR1TL7LTK21pO6SBWg4Zfl9ZvpI+41uOOv5wHvo7X3V2MJFCSP8AIfC5nC9UP9fura0peLbr3Ry0S2kKLiOxmx/1FeI8AeoPd7xVD6405J0xf3rc/wAy2vnx3SMBxs9D7+4+Yr70DqaRpbUDU9vmXHV7EloH+8Qf9x1H/wAmrz1rYbfrrSbbsNxtbpR28F8eJHzT5HoR3fCu422lT/8A0b7/AL8rkzoZv/R3sqn4FfnAZ+ju/dWn4m/l9efpJ+4VveCsd+JxKEWS0pp9lp5DiFDBSoDBBrRcTfy+vP0k/cK4Xi1CP9j8LrbnVn/X7rI4S29Fx1/bGnU8zbSy+ofuJKh/qAq3eOMtUXh/IbQrlMl5tnbwzzEf6arDga4hHEKKlRwXGXUp8zyk/cDVi8fm1L0K2pI2RNbUr3cqx/uK76Lu7PkI1z+AuSqzrGA9PlUDSlK8+rhK6p0tKTeNI26TISHPWoaO1B3BJThQ+vNcrV09w0bU1oKypWMExUq+B3H2Gr3YRO8eOFlU7WAwNPVc2XmGbfeJsAnJjSHGSf3VEf7VcHo5/wCT3b6Qj+mqs1q6h/WN5ebIKFTnikjvHOd6tP0c/wDJ7t9IR/TWjZgArbDqttcSaW56KHcc/wA4Mj+A1/TWg0vpe9ajmIYt0Nwtk+2+pJDSB4lXTuO3U4q0eJHEa96b1S7aoMW3OMobQsKebWVZIyeiwPsrT2zjRdEOp+UrRDeb5va9XUpsgfzFW/8A3tWU8VKalxkedcxb7/woikqBA3Awac/spfqTUlo0DpNqzQpKJFxZYDTDQIKgrH94sDoM5OO/oPEc+rUpaytRKlKOST3mr7GlNEa7sIudoipgOOZAdjoDam1jqlaB7J7vf3HfNUnqK0y7HeZNqmpAeYXykjoodQoeRGDTarZThcbYOFk2eYxiaL4uN1jQP8dH/ip++umOJX5BXr6KquZ4H+Oj/wAVP310xxK/IK9fRVVt2T/Qm8PsVr2j/Vi8fwuYKtrgHqeLE7fTk11LSn3e2iqUcBSiAFIz47DHjv5VUtfoJByDgiqqlqHU8okarCeETMLCuieIvD6Fqk+ux3RDuaUhPakZQ6B0Ch/uPtqkdS6Tv+nln5Tt7iGgcB9HtNH+YbD3HBqTaQ4q3u0Jbi3NIukROwK1YeSPJff/ADZPmKtrS+sNO6qZLER9JeUk88SQkBeO/booe7NXTo6PaBxMOF5/fPyVWH1NGLOGJq5wVdroq3C2quUwwR0jF9XZDfPzc4671hVcPFXhvFZgv33T7QZ7FJckRE/N5R1Ujwx1I6Y6Y76eqnq6eWnfgk8vBWdPMyZuJiUpSuVb1tNNzFWXU9vmvoWj1WS2txJBB5QRn7M11WhSVpC0KCkqGQQcgiuctWWoTdEWHWENGUKR8mXAJGzb7Iw2T+81yfFJ8asXgprBm5WprT850JnxEcrHMf75odMeaRtjwAPji92LUhjzE7jp4qp2pAXNEg4aqyaUpXplRJSlKIlKUoi/FAKSUqAIIwQe+qF46Cxx7+xb7Vb40eS2jtJbjKeXJV81JA2zjcnHeKtvXmp4mlrG5NeKVyFgpjM53cX/AOw6k/8AuK5mny5E+a9NluqdffWVuLPUknJqh21UtDBCMyfZW+y4HF28Onyvq1QJV0ucW2wWi7KlPJZZRnHMpRwBnu3NbzUGiNY6acLl0sNwipb37dCOdsf/AJEZT9tTX0W9Om7cQFXd1sqjWhku57u1XlKB9XOf5a6urzYV2uGbXrjVltwI18llI6JeUHRjwwvNSKHxg1SyAl5i2yfErZUD/pUB9ldSXvROkb0VKuenLZIcV1cLCUuH+cYV9tRG4cCuHkpRLMCZCz/yJazj/r5v+zXSyrqI/pefVaXU8L/qaFSTnGbUBQQi2WxKu4lKyPq5qjOo9d6nvzKo8y4FuMrZTLCezSR4HG5HkSa6IR6P2gkrCiu7rA/RMpOD9SalWmOGuiNNupkW2wxhIRuH3yXlpPiCsnlPuxUyVtRILOebKGU0LDdrQqR4G8H5l2nMah1TCVHtTRC2YjySFyj3EpPRHfv873HNaj0lNXtak1sm2QXUuW+0JUyhSTst047RQ8hgJ/lJ76n3HLjJHiRn9N6QlpelrBblT2jlLI6FLZ71ftDYd2/Tm2uVb0pSlQpVr+jl/mt3/gN/1Go9xuacb4iTVrQpKXG2lIJGyh2aRkfEEfCvnhPq2FpS6yXLgw84xKbSgrawS2Qc5weo38frq3JM/QGsoyES5dtmcu6Uuudk6nxxnCgPdV7AxlVRCEPAcDfPz/KqJXOgqjKWkghc30q+nOEGk3yHWZdzQ2oApDb6CkjxBKD99e8TQGgbA4l2eppxaBzA3CUnGM9SnZJHvGK0DY1RfvEAeK3HacPAElaD0fLDKZXM1BIaLbLrXq8fmGCscwKiPL2QM+/wqScb7uzbtEvQ+cesT1BptPfyggqPuwMfEV8aj4oaZtEcs21fyk+kcqG44w2nHTKumP3c1SWqtQXLUl1XcLk6FLPsttp2Q2n9VI8K7J6mGkpuzxOxE/fVc0UElRPvpBYLU0pSvOq6Un4V/nBs/wDH/wDSatT0gvyIY+nt/wBC6jOhtMabtdytd+d13aS42EvKjKU2kglO6Se02Iz4d1THiCvTGrLG3bPwxs8PkfS92nrDbmcBQxjnH63j3V6GlhcyjkjNrnTMdOqpqiVrqljxew6Fc80rc6vtEKy3YQ4F5j3dktBfrDGOXJJ9nZShkY8e+tNVA9hY4tOoVu1wcLhSPhl+X1m+kj7jW446/nAe+jtfdW30NpfTlvnWm/va7tQcbCH1xVqbSpJKclBJc2Izjp3dK2mu9O6Y1RqBd2/D6zxOZtKOz52145R1z2g+6rZlLJ2QsyuTfUaW8VXunZ2kPzta2h5+CpmrN4J6y+TJydPXFzEKSv8As61H+6cPd+6r7D7zVZUqup6h1PIJGrtmhbMwscumJumwjiDb9TQ0AFbbjEwAdfYPIv7Ak/y1RXE38vrz9JP3Cre4O6y+X7X8l3B0G5xEDcnd5sbBXvHQ/A99VDxN/L68/ST9wq42k6N9M2SPRxv52VZQteycsfqBb3Wt0zdF2W/wbq2CTGeSspH6Sf0h8RkfGujtWQWNWaHksQnEOplxw7GWDsVDCke7cAVzBU84acQpOmMW+c2uVa1KyEpPtsk9SnPUeXx8c8uzatkWKKX6XLoraZ0lpI/qCgzzbjLq2nUKQ4hRSpKhggjqDXxV16isOiteLNzs19iwrkse2CQO0P7bZwc9BzD7ajyuDl/Q4pTt0tKI6ckuFa8hI7yOXH21qk2bMD/4+8OYWxldER3+6eRUCsdtk3i7xbZESVPSHAhO3TxJ8gMk+6uldS3OJpLRzkgEBMVgMxkH9JYGEJ+z6gahNiGhuHEdyQ9dm7ndlJ5SWMLWB+qlIJCB5qO/j3VXOvtYT9WXAOPDsIbRPYRgrIT5k96j412QyN2fC65vI7gOHiuaRjqyQWFmD3UaWpS1laiVKUcknvNXV6Of+T3b6Qj+mqm0zbot2vke3zbkzbGHebnlPY5G8JJGckDcgDr31dnDlnTGj4cuP+Glnm+sOJXzdu23y4GMfPOa07JjImEp0F+I5LZtF43RjGuSrvjn+cGR/Aa/pqC1c+u9O6V1PfVXVOvLTDWtCUKQXWnBsMDB7QVp4ujNAW5xL131xGnNA57OMpIzjuPKpZ+rFRVUUkk7nC1idbj8qYKpjImtN7gcipD6OzEhFguT7iSGHZKQ1nvIT7RH1j6qhPHKQw/r99LKkkssNtuEfrYz9xFSnUHFK02u1JtWjYezaeRt5bfK22PFKTuo9++Ou+aqCQ87IkOSH3FOuuKK1rUclSickk1nW1EbadtMw4rangsaWF7pnTvFr6BfcD/HR/4qfvrpjiV+QV6+iqqmNIaRsVxtcW6Tda222vlZKor3JzJ5VEDOXAdwM9O+rf1Ld9MXmwzbV+FVnY9aaLfaettq5c9+OYZ+uunZkZjhkxWGIZZjkVornh8rMPA55HouaKsjSmmbHO4UXa+SoPaXCP23ZPdqscvKkEeyDg7nvFRzW2nLXYURDbdTQ70XysLEcJ/FYxjPKtXXJ8OlTbhNfNMnRkzTN7uDcVUlxzmDquzSpCkgbLOwO3ea4KOFrZzHLbQ62tfguyplLog+O+vXRVJXpGeejPtyI7q2nW1BSFoVhSSOhBqy5fB+e8suWW+W2ZGKiAp0qSR5eyFAn6q9bdwtgWt5MjV2ooDDKAFqZac5ecZ/WVggHpsM74FYDZ1Tf6bdbi3qsjWwW1v0VpadnquOi4VxuSQC/CS4/tgHKfaOPA9fjXLNW3xK4jwHbS5p7TPtMLb7F2QElKQ3jHIgd+RtnpjpnOaqSt+1ahkpYxpvhGZWnZ8Low5zha/BKUpVSrFWnwCnW64yLroC+qHydf2cMk9W5KN0lPcCR9qUioVq2w3fROq3rXMK2JcVwLZfbJSFpz7LiD4H7DkdQa00V96LKalRnVNPsrDja0nBSoHII8wa6ZTGs/HXhu0+pTMTU1vTyKc/5buO8Dfsl4z5HOM4OZCgqCaH4ttlDcLVCClQ2E1tOQf30j7x9VWrb50O4RUyoMpmSwv5q2lhQP1VyzqWx3TTl4ftN4iLiy2TgpUNlDuUk96T3EV4Wu53G1v9vbp0iI53qZcKc+/HWrml2zJGMMoxD3VZPsxjzdhsfZda0rnm3cVtXxEhLsmLMA/57A+9PLWarjJqgpIEK0JJ7wy5t/rqzG2qYjO/ouE7LnB4K+aiuttd2XTDK23HRKn49iK0rKs/tH9Ee/fwBqk71xC1bdUKaeuzjDR2KIyQ19o9o/XUWUSpRUokknJJ765KjblxaEeZ/C6IdlZ3lPkFtdU6guWpLqu4XJ3mWdm0J2Q2n9VI8PvrUjc4FKuv0b+Gzl4ubOrrywU22I5zQ21p/wAQ6OivNCT9ZGO4159znPcXONyVcNaGiw0Vw8CtIK0foKNHlN8lxmH1qYD1SpQHKj+VOB78+NTylKIlKUoiVXHpFalTp/hrMYbcCZd0/sbIB35VD8YfdyZHvUKsc7DJrjzj/rUaw1qtEN0LtVtyxFIOzhz7bn8xG3klNQpVdUpSoUpSlKIlKUoiUpSiJSlTLhfof8Nn7q18qeofJ8Myc+r9r2mD835yce/eiKG0pSiJSlKIlKUoiUpUr4Tvga8s8B2LAlRp05hiQ3KhNPhSCsAgdok8uQeqcGiKKUqbcdIUK3cVb3Ct8SPDitra7NlhsNoRllBOEjYbkn41CaIlKUoiUpSiJSvaFJchy25LSWVLbVzJDzKHUE+aFgpUPIg1avHWBbo+ieHtxiWu3Q5Vwtqn5a4kRtjtlluOrKghIHVSsDoMnFEVSUpSiJSpfwm0T+HupnbL8p/J3ZxVSO17Dtc8qkp5ccyf1uue6ok6jkdWjOeVRGaIvmlTq86k0ZJ4XW+wwdMer6gZWkv3Ds0e3jPMecHmVnPzSMDu6VBaIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlSDQGrbpozUbN5ta8lPsvsqOEPtnqhX+x7jg1H6URdhdjobjTpFD6kczjY5eYEJlQnCNxnw+tJ+G1F6+4K6t0264/bo6r3bhuHYqMupH7TfX/pyPdUH0rqK8aXu7d0sk1yLIRscbpWnvSpPRQ8jXTPDLjdYdRhm333ks91VhIKj/Z3lfsqPzSfBXuBNSoXKTiFtuKbcQpC0nCkqGCD4EV813jftL6cv295sdvnLxjneYSpY9ysZH11F3eDPDV1wrVplAJ/VmPpH1BeKWS642rNs9pud5mJh2m3yp0hXRthorPvOOg867Et/Cbh1AWFsaWiLIOfx63Hh9S1EVLrdb4FtjiNboUaGyOjbDSW0j4AAUsl1QXC/gG6H2rnrdSAhJCk21pfMVH/6ixtj9lJOfHuroOOyzGjtx47TbLLaQhtttISlCRsAANgB4V90oiUpSpUJSlU5xq4yRNPNv2LTLzcq8EFDshOFNxPHyUvy6Dv8KhSsX0kOJSLTAe0hZX83GSjlmupP+HaUPmD9pQPwHmRjmSvSS+9JkOSJDq3nnVFbji1FSlqJySSepNedQpSlKURKUpRFkW2dNts1ubbpkiHKbzyPR3S2tOQQcKSQRkEj3Grt9J28zbXrG0Ltr7kSYq1NlUtpRS6B2i8BKhunfOSCM99UlbYb1wmtxGFx0OOZwqRIbYQMAndbhCR07yMnbqatj0mpEG7362XW03W0z4jNvbjOGNcGXVpc51nHIlRVjBG+Mb9aIvW/KOq/R1a1JeD6zebXcPVxNWMvOtkgcqldVbLT139keefbhppxy38GbrrG0Whdz1JJe9XgckUvrjpC0pUtCcHCvnnmxtgeefi1Nxv/AA6zdOG8WJN2kz0yWoyrxFSot5bOTlzAOAfZJB26VqdA6kslz4Y3Th1qC4ItanXfWbdNdBLSVghXIsgHlGU9cdFHvAzKhS7hZZtUantuoLDxGtl4eiKiF6HLu0dztI7o2/FuODI7jgHHs+BOdf6MV1uivwhgKuUxUSLaluR2C+otsqKiSpCc4ScknI8arN7Shh9u5c79YmGG0KKFx7g1LU8oD2UpQypShk43UEgAk92Klno7X+0WbUN1h3iczAbuVvVHakPHDaV5GAo9AMZ3O21Qii9r17q6LeoVxf1LepPqryV8js9xQUkKBUggq3B5QCOh76sv0hLPcL/xS07EjTJD8K8steqJU4pTbSlKCVlKTskcoQo4699VJerGm0xSX7vbX5fbciY8OQmQCjGe07RBKAM4AGc9cgYq5oOrLErhJYb+/dYA1Dp6DJiRYqpA9Y7RY7FtQRnJATyq6d3lmilYnpBtW2+6HsmprK0ExrbMftCgnf2EKKWznww3kfxBWr4jSL3eNR6S4ev3qe6TEhtT+1kKXzyXlBSlLyfaKQpOM7jFevBG5WG56HvujdS3aBb465ceawuZIS2lRC0lYBURvhtO37RqB3zVT0jifI1hHHMtN09cYSrb2ULyhJ/lAFSoUy4zXmXo3VY0jo996xW+3MNBRhLLTshxSAorccThSzhQGCcbVm3yHG1vwHc1pLjMI1BaZRZky2mwhUtPMkErxso4cSc9cpPia1/Fhuz6+vLerdM3m2IdksNpmwJ81uI8y4kcuxdKUqGAB7JPTzr4vmo7Vpvg6NAW24MXK5T5JkXJ6KrmYZAUkhCV9Fn2EDKduu/TJSphpfUTsf0bnrzeGTfnIlxSGWZzqloJStAbCsnJQk78vQ4x0qEwNcXbXXF/SFwu0aCw7HnR2EJioUlJT2wO/MpW+9b+3txj6OsnTPyzYE3d+cl9uMq8xUko50KySXMA4B2JB8qr3hUyE8QrPKelQI0eDOZfkOyZjTKUoS4MkFagFe5OTRFcOrrbN09xF1dxK53n2beWW2YkKXhTi1NN4MjkVzJaBAJSd1bbcu5ojU2or1qW4qn3u4yJrxJKe0WSlsE55UJ6JT5DAq377rJnTXGy53n1y3XTTF95I8tEaYzIDjQaQkqKEKJSUnPzgOYcwHWq64o6atdhv7y7BebZdLO+vmjKjTmnXGwd+RaUqKhjpzEYO2+ciihaTSZtY1Razexm2ettetjf+65hzdN8Yz03roHXNu1bZ9YwdT2Z+XctBp7Ja7baVgtIYCRzp7AEIWk+0c79dyMCqA0cLOrVVsTqDHySZKBMyVD8Xn2vm+108N6tLhzcp2itaOus6tsrWji8ta2xdG3wpkklPIwFF0Obj9EHI3OKhStLwY01a9c8Vpapccm1M9rOLCgE86e0AQggd2VjIHcCK1Fy4kapTqN6Vbri5CgIdUlm2MjlhpayQGyyPYUMbHIya3uj+ItpsXGu56nZhrZstxcdaWhCAFIbUpJDnKO/mSFEDxOM1o79o2G7qB56y6n067ZX3VONSXbk02tlskkBbSiHeYDbCUnPd1oikHpCadtMNGntV2aE1BYvsTtXo7SeVCHOVCsgd2QvoP1c99ZfHv8ANvwu/wDs5/8A4xq1PGPVVv1XPsWmtOOpctlnYEViTIWlhDyyEpKiVkBKcISMqI762/G1USfw90MxAu9mlvWa29jPaYukdxbay2wnASlZK90K+aD0z0ooXtrWfPn+i/p2bc5kqbJkXhXM9IeU4tQBkAZUok7BOK/fR5nTXtH65gOzJDkSPaVKZYU6S22VJd5ilOcAnvx1rWW+5W3VHAaPo9N1t8G8WeeZTTM2QmOmQ2S4fZWshOfxqtiR82s/grIs1iterrRPvNrauU62rbSpc9pLIUEqSltLhIQtRKySUqKQAN+uJRffonXO5K1xItSrhLNvTb3XUxS8rsQvtG/aCM4zud8Z3qr77qXUd0UY9zv91nMtPdo23ImOOJQsZAUAokAgE7+ZqacALzbtIcT3Pl6ZGjsuRXIpfS8lxlKypKgedBKSn2cZBxv1qJah0+3bVylO3u0yHvWeSO1ElIfDyCTlznQSlA6bKIO/TaoUqzuIk2bcfRi0pNuEuRMlOXU9o8+4XFrx6yBlR3OwA+Fa+zW9jRvApGtosdld9u0v1eNJdbCzEbCljLYIISo9mr2uvtDwrM1emK76PFg06zebE7dbdNVIkxm7xFUpLY9YORhzCj7adk5Jz0rV6b1DZdS8HlcPrtcmLVcYUj1i2SJRKWHcqUeVSwPZ+esZO248DRQsngjf5ertUHR+snXL/b7gw72fr6y84w4lPNzIcVlSdknoeuDWXwJZn6e45TtLIuEkwmHJTbjQdIbeLYIStSRsTjfptWn4VItmgdROaq1JdrYsxGHUw4kCa1LdkOKHL/wlKShOCd1EVk8ELu3J4uStYXq4Wy3x3lyFvLkzmWcLcBICUrUFKG+MgYFEUaums7/YtbXFywz37awzcHCGGVlKHcOHd0DZwnfPNnrgYGAN96Sdmtdr13BmQIqIse4wW5LzLSQkBXMoEgDYZAHxzUL1RbH3tbTYzUm2uGXJddZdRcWCyUqUogl0L5E7dyiD08RViekS/bLteLDcYN2tM+FGhNx5Pq1xZcWlXOSRyJWVkY7wMedFKluvrJqN232W+8Kp7x0yzHRz2+1PFtSiDlSygY7UkcoIVlWQcjc1RvEW5Qrvra63K3Q3YUV5/LbDrQbW3gAEFKSQDkHarBtrjumeIa7loTVNkhaWeeQ4UO3ZHIGsDmS4w4rtSrY9Ek7jBqJ8a9QWfU3EOddbE3iGtKEB3k5C+pIwXMHcZ6b74AzRQoVSlKKUpSlESlKURKUpREpSlEVpcMuNGodKIat9yCrxakeylt1eHWR+wvwH6pyPDFdD6K4kaQ1a2hNsurTcpXWJJIbeB8Akn2v5SRXE1BsciiWX9CKVxJp3iVrmwoS3btRzQ0no0+Q8gDwAWDge7FTW3+kPrRhARKgWaXj9IsrQo/UvH2VN1Fl1NSua/wDxIXv/AMt2/wD/AHLrX3D0iNYvJKYlts0UHPtdk4tQ+tePspdLLqSotrLiDpLSSFi8XdkSUjaKye0eJ8OUdPerA865Q1DxO13fULbnajmJZUMFqOQwkjwIQBke/NRAkkkkkk9SaXSytniZxvv2pUO26xpXZrYv2VFK/wC0Op8FKHzQfBP1mqlpSoUpSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiJSlKIlKUoiUpSiL7YbU88hlBQFLUEgrWEJyfFRIAHmTitvfNLX2yQWZ1yhJaivqCWnUPtuJUSOYboUeo3rWQIy5k6PDb+e+6ltO2d1EAffVtzXm9TWnWmn2QVrtzyX4Q8mkhsgfBv/XXZTU7ZWuvrw9CfsuaeZ0bhbTj6gKprbBl3KezBgsqfkvK5W0J7z8dh7z0rKv1iuVjf7C5tsMvZwWkymnFp2B9pKFEp2I64qfcPbam0aitllKQbxMUH5yu+Iwkc6WtuilEJ5vIgd5rTm3sao1hqO93B9xq0wXHH31o3WpAJDaE+ZAxnyrLsg3Y/yJt0GVzfw4rHtPfP+IH8KDUqcWiNYbnpjUV2XYI8NFvYQmMUSXlKLjhKQVErwoggHYAb9K+Y9vsTPC9N6uFrQZrk71eO4084FOJAySoFRSOihkJ6Y7961ilJF8QtYnjoDbktnaBpY624flQmlTDU1pt40bp26RLemHcLit1KmWnFqS4lKsJUAtSiD06HG9et2tNp0/dIenV29u63ZwtiW4864ltpS8YQ2EKTkjI9ok9elQaVwOZFsvfMIJ2nQc/bVQqlWLO0tYV66vkdlpxm02SGZDrTbpLjxSgEpClZxkk5Pl3Vh6cTYLjZL/cJOmoDIt7CXI6vWJOCtSiAlf43cnyxWXY3B2EkcefDXgo7S0i4B4e+ig1KnUXSi2dOxb4qxqnyLk4pTEUKcTGjNdynFhQO+QEgrG3Uk7Vp9fxbFEvbbNhcbU16ugyEtOlxpD2/MlCySVJ6d5796wfTPYzE7p7rJk7XuwhR2lSrh3oyRrCZJbbmIhsRkpLrhRznKs8oCcjPQ99Y+vdKydJXhMB6QiS242HGnUp5eYZI3GTg5Hiag08oi3tu7zU76Pebu+ajtbLT1iu2oJiolohqlPIRzqAUlICemSVEDvrXAEnAGSatXR7iNKX/AE/p9OPlCY8l+5nvRzIUGmT7ubmPmRWVLC2V4xmzcvdYzymNvd1/Cqt1C2nFNrTyrQSlQ8CK+akt9gdhxJl24RmpAVclNoacKglQWv2QeUg946EVI7latMN8UmtOQLIl6Mp9tl5Lkh3CcjKynCs5GepONsYHUy2lc4nMCxt5oagC2XC6relTKFpe3zNW3xr1h1ix2hTrj7owpfIlRASnxJxgHyrIsUfT92s2orgrT7EZm2xOaORJeUsuLyEc5K8HcZ2AFQ2leTa4GvtqhqGjhy99FoLVpyRctP3C8sToaWrekKfaX2gWM7Jx7HKScbe178VpKnTObZwXeWc893uYQPNtsZ/qSaw9W2y2nSWn77a4DcRU3tm5LbTjik9olWBgLUojoe+spKcYAW6gAnzP/FiybvEHQmw8h/1RGlT7U0fSlmkPwkWdh25MRIyDHW6+pCpCvadOUqB2HKMZG56bGsPUsCAwzAsbFkhM6hkuILwjvPER+bHI0QtxQKzkE+GcedQ+lLb94ZePppqsm1AdbI5/t/BQ2lWanSVqs1+Ztl1taHbe0gGfdJj62ElRTn8QApIIBIHRRJ8KrmeIyZ0hMNS1xg6oMqWMKKM+yT54xWE1O6Ed5THM2T6V4UqxNHcLZeoNPN3dd1ahh8KLDfYlfMASMqORy7jz/wBqgdyiPW+4yYEgAPRnVNOYORzJJBx9VJKaWJjXvFgdFLJ43uLWnMLIsdmuF7l+qW1tp18/NQt9tsq8k86hk7dBWxRozULj70diLGkSGM9qwxOYddTg4IKErKtj5VvOBcPt9beuFClJgxnHtk53I5QPf7R+qvXRlsukPWadUahads0Nl12Q85Ly0pZIPspSr2lElQGw+3auiGla9jHOBzJHQDLPRaJZ3Ne4AjIe/LVV+4hbbim3EqQtJIUlQwQR3GvmrKH4OXq0an1XdrSey9eCYq2XFpdUVq3B9rkzgg/N2yTv0rTQrZZru3c9RptrlrsttZRzRUSS4t51WyUhahkAnGTjYdPLW6kIIwuBvnx0zz06LY2oBvcEW+csvdQ6lTNi2Wq9aDu15j21q2zLY83/AHLrikOoUQMELUrBHXIxW1nz4tm4WWtv5Et5XeJC3nWFLf5VIb2CjhzmyTynrjfpRtKbElwta/Hnb5Q1GdgM72+/wq3pU3tWk3EaXYv7tocuT01xQjRgVJYabHVbqwQRk7Acw95rJkaWsd21dFt1ofbjx2oIkXZTDpeaYUke2G1EnPcOp6/CoFHIQDztl4p2llz0+yr+lSNdx0utucynT5aT2REJ3tnFO9pkYLh5wjGM7BHh76kutZ8S1aK0/ZxY4A9bZVPdZK3+VpS9kKT+M5s4J+cSNqhtOC1zsQsPHnbkpdMQQMJz8FW9KUrmW9KUpREpSlESlKURKUpREpSlESlKURKUpREpSlESlKURKUpRFIdAqtcbUUS5XW5RorMR4O9m426tThAJTjkQobKAzkj4182XUVw03qOTc7dJjSn3ErQp0oWW3Ao5JAPKeuDuB06VoKVubM5oAblY3utZiDiSc75KecNrtbLbdJ9/vF9YRPfjuoaStp5aw6og86ilBGNu4nr0rG01c7UxpTUWm5dyajuTFtqYmdm4ppzkVnBwnnAONsp7+gqGUrY2rc0AWGV+ed9eKwNO0km+tvbRTUTrEzw2mWWHdUCc9NDzoeacBdQhOwTypIGVYwFEeJxnAxdV3e3v6P03ZbdI7Uw2nHJX4tSeV1ZBxuBnG+4yKilKxdUuLcNhpbyvdSIGg3vxv7WU71RfLSLhpZ+3zmZsO0NMIWwhtxKypCgpZ9tITvgDY1ku3HSrnE5Oo37wHobklMhKUx3AWiBn28p7iBgJznvIxVd0rM1jibkDUHjw81j2ZoFrnQj1VhwH0wdR3HV0m5Otw5rrzUWZGZK2y45knmbcKFLSkd3KRnHhWLfbdOuel37ja7/EuNrgrBfjMwxDLZOwUWkpCSdzvk+Wd8aC26jlxbOqzyI0S4W8udqliUhRDa+8pUlSVJ+B+81+TdQy3rUq0xY8W3QFrDjjEVKsOKHQqUoqUrHgTithnjLCDxvz1Ptb3WsQvDrj7afN1vb9cbLqPTtiSu7It0y2RhFeZfYcUlxKQMKQUJIzt0OOvXbeIThFEpYhKeVHGAhToAUrbckDYZOTjfHieteFK5ZZjKbkZrojjDMgclstP3272CUqVaJrkV1aeVWAFBQ80kEH4ivO93e5XueqddJa5UhQCedWBgDuAGwHXYeNYNKx3j8OC+XLgssDcWK2ak+gxZIlwTdrtdIba44UuPFdaeVzOgewVlLagEZ32JO3SvayaqvqtRMvztWymo7b4dcLsh8tOAKBKQlAJwRnblAx4VEqVsbUOYAG5W8c/HNa3QtcSTndWRcbrph3i5G1Gm8tLtqnEvOEMO8zakNgDKSjfKgMYz35xWu0dfra1xHmaiukpDCCZDzKltrUC4vISMJBIGFHu7qhFK2GsfjxWGuLz9Vj2ZuHDc6W8lNNMXa2R7NqeyT7k027ckoLU4NuKbWpKicEBPOAc/q+O1fcSdYY/Di52aNdm0z5MlC3O1ZcAdQgBQCOVJA9rYcxHeTy5xUIpWIqnAWsNCOOh8+qk07Sb3OoPopre7nYp2ibDb0z1trt7L3bRUMq51PLIKVZI5eXOSd84PTfbbaHnWt3h858pqCvkG4icGik/jAUENoz09pzu8AarSt3etRyrnbY9uTCt8CK0QpSITHZh5YGAte55lAZ38zWyOqs4vcM7Wtz5fAWD6e7Q0c7raaWn20zbhqG63SIi8lwriNyWnVNhxRyXVciFdM+yPEd2BX5b5lnsjse7ruDF5uybm0+VNB4crQyV5LiEgqUojx6VEaVqFS4AZDL55+K2GAEnPX9spbq46dn6hm3pm9qfjylqe9WQwtMgLO/KSpPIBn9LmO3caiVKVrkk3jsVrLNjMAtdb6yaw1LZbeq32y6usRlZPJyJVy568pUCU/DFaN1a3XFOurUtayVKUo5KiepJ8a+aVDpHuABNwFIY1pJA1U80RNslp0tfGX79DauN0jBhpJZfIZSQoKCiGzvv3Z6VBVgJWpIUFgHAUM4PnvvXzSspJi9rW2tZYsjDXF19VK593t7fDK3WKHJ55bk1cqa2EKHLgFKRkjB2wds9K+tMXe3K0Zd9MXCV6iZTqJDElTalo5049lYSCoA8o3APWolSsxUuxB3S3layx3DbW6381KbjeINv0f+DNoe9aMl4Pz5YQpKVkY5UICgDyjAOSASe6s/WVx07d4VmUxc1IYgWxMf1RLK+2Do8yAjl6ZPMTsdjUHpU9pcQWkCxsPRNw24N8/yppd7jZ9Q6UskZ26N22bamlMLbfZcUh1O2FJKEq326HHWvPRF7s1kvdwjvLkm2ToSoi3ygdokqAyvlHdnO25wR1qH0p2p2MPsLj7CyjcNwlt8itrOh2eIysN3YXF5Sx2ZjNLQhKM7lXaJB5sdAAR591SPiRcNPXq7KuUS6KdZTDQzFjNsLSttSR0WVAJCQSfmlWfLrUHpWIns0tAFj48L9eqyMV3BxJuEpSlaFtX/2Q==';
+
+function buildReportHTML(clients, devices, mode) {
+  // mode: 'client' | 'internal'
+  const now = new Date();
+  const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const generated = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+
+  const clientSections = clients.map(clientName => {
+    const clientDevices = devices.filter(d => d.siteName === clientName);
+    if (!clientDevices.length) return '';
+
+    const withIssues = clientDevices.filter(d => getDeviceComplianceStatus(d, false).length > 0);
+    const clean = clientDevices.length - withIssues.length;
+    const pct = clientDevices.length > 0 ? Math.round((clean / clientDevices.length) * 100) : 100;
+    const barColor = pct === 100 ? '#2a9d5c' : pct >= 75 ? '#c8960c' : '#c8102e';
+
+    const deviceRows = clientDevices.map(d => {
+      const issues = getDeviceComplianceStatus(d, false);
+      const pm = d.patchManagement || {};
+      const av = d.antivirus || {};
+      const statusColor = issues.length === 0 ? '#2a9d5c' : '#c8102e';
+      const statusLabel = issues.length === 0 ? '✓ Clean' : issues.map(i => i.label).join(', ');
+      return `
+        <tr>
+          <td style="padding:7px 10px;border-bottom:1px solid #e8edf2;font-size:12px;font-weight:600">${esc(d.hostname)}</td>
+          <td style="padding:7px 10px;border-bottom:1px solid #e8edf2;font-size:11px;color:#555">${esc((d.operatingSystem||'').replace('Microsoft ','').substring(0,30))}</td>
+          <td style="padding:7px 10px;border-bottom:1px solid #e8edf2;font-size:11px;text-align:center">
+            <span style="color:${pm.patchStatus==='FullyPatched'?'#2a9d5c':'#c8102e'};font-weight:700">
+              ${pm.patchStatus==='FullyPatched'?'✓':pm.patchesApprovedPending>0?pm.patchesApprovedPending+' pending':'✗'}
+            </span>
+          </td>
+          <td style="padding:7px 10px;border-bottom:1px solid #e8edf2;font-size:11px;text-align:center">
+            <span style="color:${(av.antivirusStatus||'').toLowerCase()==='runninganduptodate'?'#2a9d5c':'#c8102e'};font-weight:700">
+              ${(av.antivirusStatus||'').toLowerCase()==='runninganduptodate'?'✓ Active':av.antivirusProduct||'✗'}
+            </span>
+          </td>
+          <td style="padding:7px 10px;border-bottom:1px solid #e8edf2;font-size:11px;text-align:center">
+            <span style="color:${d.rebootRequired?'#e07b00':'#2a9d5c'};font-weight:700">${d.rebootRequired?'Required':'—'}</span>
+          </td>
+          <td style="padding:7px 10px;border-bottom:1px solid #e8edf2;font-size:11px;color:${statusColor};font-weight:600">${statusLabel}</td>
+        </tr>`;
+    }).join('');
+
+    return `
+      <div style="margin-bottom:36px;page-break-inside:avoid">
+        <div style="background:#1e2a3a;color:#fff;padding:12px 18px;border-radius:6px 6px 0 0;display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:15px;font-weight:700;letter-spacing:0.03em">${esc(clientName)}</div>
+          <div style="font-size:13px;color:#a0b4c8">${clientDevices.length} devices · ${pct}% compliant</div>
+        </div>
+        <div style="background:#f0f4f8;padding:12px 18px;display:flex;gap:24px;border-left:1px solid #dde3ea;border-right:1px solid #dde3ea">
+          <div><span style="font-size:22px;font-weight:700;color:#2a9d5c">${clean}</span> <span style="font-size:12px;color:#666">Clean</span></div>
+          <div><span style="font-size:22px;font-weight:700;color:#c8102e">${withIssues.length}</span> <span style="font-size:12px;color:#666">Issues</span></div>
+          <div style="flex:1;display:flex;align-items:center;padding-left:12px">
+            <div style="flex:1;height:8px;background:#dde3ea;border-radius:4px;overflow:hidden">
+              <div style="width:${pct}%;height:100%;background:${barColor};border-radius:4px"></div>
+            </div>
+          </div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;border:1px solid #dde3ea;border-top:none">
+          <thead>
+            <tr style="background:#f8fafc">
+              <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;letter-spacing:0.08em;color:#666;text-transform:uppercase;border-bottom:2px solid #dde3ea">Device</th>
+              <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;letter-spacing:0.08em;color:#666;text-transform:uppercase;border-bottom:2px solid #dde3ea">OS</th>
+              <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.08em;color:#666;text-transform:uppercase;border-bottom:2px solid #dde3ea">Patches</th>
+              <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.08em;color:#666;text-transform:uppercase;border-bottom:2px solid #dde3ea">Antivirus</th>
+              <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.08em;color:#666;text-transform:uppercase;border-bottom:2px solid #dde3ea">Reboot</th>
+              <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;letter-spacing:0.08em;color:#666;text-transform:uppercase;border-bottom:2px solid #dde3ea">Status</th>
+            </tr>
+          </thead>
+          <tbody>${deviceRows}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  const totalDevices = devices.filter(d => clients.includes(d.siteName));
+  const allIssues = devices.filter(d => clients.includes(d.siteName) && getDeviceComplianceStatus(d, false).length > 0);
+  const overallPct = totalDevices.length > 0 ? Math.round(((totalDevices.length - allIssues.length) / totalDevices.length) * 100) : 100;
+
+  const reportTitle = mode === 'internal'
+    ? 'Fleet Compliance Report'
+    : clients.length === 1 ? `Compliance Report — ${clients[0]}` : 'Compliance Report';
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; color: #1a2332; background: #fff; }
+  @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+</style>
+</head>
+<body>
+  <!-- Header -->
+  <div style="background:#1e2a3a;padding:16px 28px;display:flex;justify-content:space-between;align-items:center">
+    <img src="${SYNOBIS_LOGO_B64}" style="height:44px" />
+    <div style="text-align:right;color:#a0b4c8;font-size:12px;line-height:1.6">
+      <div>${reportTitle} | ${monthYear}</div>
+      <div>Synobis Network Solutions</div>
+    </div>
+  </div>
+
+  <!-- Title block -->
+  <div style="background:#253447;color:#fff;padding:28px 28px 24px">
+    <div style="font-size:24px;font-weight:700;margin-bottom:6px">${reportTitle}</div>
+    <div style="font-size:13px;color:#a0b4c8">${monthYear} &nbsp;|&nbsp; Prepared by Synobis Network Solutions &nbsp;|&nbsp; Generated ${generated}</div>
+  </div>
+
+  <!-- Fleet summary (internal only or multi-client) -->
+  ${clients.length > 1 ? `
+  <div style="background:#f0f4f8;padding:20px 28px;border-bottom:2px solid #dde3ea;display:flex;gap:32px;align-items:center">
+    <div><div style="font-size:28px;font-weight:700;color:#1e2a3a">${totalDevices.length}</div><div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.08em">Total Devices</div></div>
+    <div><div style="font-size:28px;font-weight:700;color:#2a9d5c">${totalDevices.length - allIssues.length}</div><div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.08em">Clean</div></div>
+    <div><div style="font-size:28px;font-weight:700;color:#c8102e">${allIssues.length}</div><div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.08em">Issues</div></div>
+    <div><div style="font-size:28px;font-weight:700;color:#4a90c8">${clients.length}</div><div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.08em">Organizations</div></div>
+    <div style="flex:1;padding-left:16px">
+      <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+        <span style="font-size:12px;color:#666">Overall Compliance</span>
+        <span style="font-size:12px;font-weight:700;color:${overallPct>=90?'#2a9d5c':overallPct>=70?'#c8960c':'#c8102e'}">${overallPct}%</span>
+      </div>
+      <div style="height:10px;background:#dde3ea;border-radius:5px;overflow:hidden">
+        <div style="width:${overallPct}%;height:100%;background:${overallPct>=90?'#2a9d5c':overallPct>=70?'#c8960c':'#c8102e'};border-radius:5px"></div>
+      </div>
+    </div>
+  </div>` : ''}
+
+  <!-- Client sections -->
+  <div style="padding:24px 28px">
+    ${clientSections}
+  </div>
+
+  <!-- Footer -->
+  <div style="background:#1e2a3a;color:#a0b4c8;padding:14px 28px;font-size:11px;display:flex;justify-content:space-between;margin-top:20px">
+    <div>Synobis Network Solutions &nbsp;·&nbsp; Manage · Analyze · Protect</div>
+    <div>Confidential — prepared for authorized recipients only</div>
+  </div>
+</body></html>`;
+}
+
+async function generateCompliancePDF(selectedClients, mode) {
+  // Ensure we have device data
+  let devices;
+  try {
+    devices = await fetchAllDevices();
+  } catch(e) {
+    alert('Failed to load device data: ' + e.message);
+    return;
+  }
+
+  // Load jsPDF + html2canvas dynamically
+  const loadScript = src => new Promise((res, rej) => {
+    if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = res;
+    s.onerror = rej;
+    document.head.appendChild(s);
+  });
+
+  try {
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+  } catch(e) {
+    alert('Failed to load PDF libraries. Check your internet connection.');
+    return;
+  }
+
+  // Generate one PDF per client (or combined for internal)
+  const clientsToProcess = mode === 'internal' ? [selectedClients] : selectedClients.map(c => [c]);
+
+  for (const clientGroup of clientsToProcess) {
+    const html = buildReportHTML(clientGroup, devices, mode);
+
+    // Render to hidden iframe
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:fixed;left:-9999px;top:0;width:1100px;height:1px;border:none';
+    document.body.appendChild(iframe);
+    iframe.contentDocument.open();
+    iframe.contentDocument.write(html);
+    iframe.contentDocument.close();
+
+    // Wait for images to load
+    await new Promise(r => setTimeout(r, 800));
+    iframe.style.height = iframe.contentDocument.body.scrollHeight + 'px';
+    await new Promise(r => setTimeout(r, 200));
+
+    const canvas = await html2canvas(iframe.contentDocument.body, {
+      scale: 1.5,
+      useCORS: true,
+      allowTaint: true,
+      backgroundColor: '#ffffff',
+      width: 1100,
+      windowWidth: 1100,
+    });
+    document.body.removeChild(iframe);
+
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const imgW = pageW;
+    const imgH = (canvas.height * imgW) / canvas.width;
+    let yPos = 0;
+    let pageCount = 0;
+
+    while (yPos < imgH) {
+      if (pageCount > 0) pdf.addPage();
+      const sourceY = (yPos / imgH) * canvas.height;
+      const sourceH = Math.min((pageH / imgH) * canvas.height, canvas.height - sourceY);
+      const sliceCanvas = document.createElement('canvas');
+      sliceCanvas.width = canvas.width;
+      sliceCanvas.height = sourceH;
+      sliceCanvas.getContext('2d').drawImage(canvas, 0, sourceY, canvas.width, sourceH, 0, 0, canvas.width, sourceH);
+      pdf.addImage(sliceCanvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pageW, (sourceH * pageW) / canvas.width);
+      yPos += pageH;
+      pageCount++;
+    }
+
+    const filename = mode === 'internal'
+      ? `Synobis_Fleet_Compliance_${new Date().toISOString().slice(0,7)}.pdf`
+      : `Synobis_Compliance_${clientGroup[0].replace(/[^a-z0-9]/gi,'_')}_${new Date().toISOString().slice(0,7)}.pdf`;
+    pdf.save(filename);
+
+    // Small delay between multiple PDFs
+    if (clientsToProcess.length > 1) await new Promise(r => setTimeout(r, 300));
+  }
+}
+
+function openReportModal() {
+  // Remove existing modal if present
+  document.getElementById('reportModal')?.remove();
+
+  const devices = state.complianceCache?.devices || [];
+  const siteNames = [...new Set(devices.map(d => d.siteName).filter(Boolean))].sort();
+
+  if (!devices.length) {
+    alert('No compliance data loaded. Please visit the Compliance view first to load device data.');
+    return;
+  }
+
+  const modal = document.createElement('div');
+  modal.id = 'reportModal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;width:520px;max-height:80vh;display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:18px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.05em">📄 GENERATE COMPLIANCE REPORT</div>
+        <button id="reportModalClose" style="background:none;border:none;color:var(--textdim);font-size:18px;cursor:pointer">✕</button>
+      </div>
+      <div style="padding:18px 20px;border-bottom:1px solid var(--border)">
+        <div style="font-family:var(--cond);font-size:11px;letter-spacing:0.08em;color:var(--textdim);margin-bottom:8px">REPORT TYPE</div>
+        <div style="display:flex;gap:10px">
+          <button class="report-type-btn active" data-type="client" style="flex:1;padding:10px;border-radius:5px;border:2px solid var(--accent);background:rgba(0,180,216,0.08);color:var(--accent);font-family:var(--cond);font-weight:700;font-size:13px;cursor:pointer">
+            👤 Client-Facing<br><span style="font-size:10px;font-weight:400;opacity:0.8">One PDF per selected org</span>
+          </button>
+          <button class="report-type-btn" data-type="internal" style="flex:1;padding:10px;border-radius:5px;border:2px solid var(--border);background:none;color:var(--text);font-family:var(--cond);font-weight:700;font-size:13px;cursor:pointer">
+            🏢 Internal<br><span style="font-size:10px;font-weight:400;opacity:0.8">All selected orgs in one PDF</span>
+          </button>
+        </div>
+      </div>
+      <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div style="font-family:var(--cond);font-size:11px;letter-spacing:0.08em;color:var(--textdim)">SELECT ORGANIZATIONS</div>
+        <div style="display:flex;gap:8px">
+          <button id="reportSelectAll" style="background:none;border:none;color:var(--accent);font-size:12px;cursor:pointer;font-family:var(--cond)">SELECT ALL</button>
+          <button id="reportSelectNone" style="background:none;border:none;color:var(--textdim);font-size:12px;cursor:pointer;font-family:var(--cond)">NONE</button>
+        </div>
+      </div>
+      <div id="reportClientList" style="flex:1;overflow-y:auto;padding:10px 20px">
+        ${siteNames.map(name => {
+          const siteDevices = devices.filter(d => d.siteName === name);
+          const issues = siteDevices.filter(d => getDeviceComplianceStatus(d, false).length > 0).length;
+          const pct = siteDevices.length > 0 ? Math.round(((siteDevices.length - issues) / siteDevices.length) * 100) : 100;
+          const color = pct === 100 ? '#2a9d5c' : pct >= 75 ? '#c8960c' : '#c8102e';
+          return `<label style="display:flex;align-items:center;gap:10px;padding:8px 4px;cursor:pointer;border-bottom:1px solid var(--border)">
+            <input type="checkbox" class="report-client-cb" value="${esc(name)}" checked style="width:15px;height:15px;accent-color:var(--accent)" />
+            <span style="flex:1;font-size:13px">${esc(name)}</span>
+            <span style="font-size:11px;color:${color};font-family:var(--cond);font-weight:700">${pct}%</span>
+            <span style="font-size:11px;color:var(--textdim)">${siteDevices.length} devices</span>
+          </label>`;
+        }).join('')}
+      </div>
+      <div style="padding:16px 20px;display:flex;gap:10px;justify-content:flex-end">
+        <button id="reportModalCancel" style="padding:9px 18px;background:none;border:1px solid var(--border);border-radius:5px;color:var(--text);cursor:pointer;font-family:var(--cond)">CANCEL</button>
+        <button id="reportGenerateBtn" style="padding:9px 20px;background:var(--accent);border:none;border-radius:5px;color:#fff;font-family:var(--cond);font-weight:700;font-size:13px;cursor:pointer;letter-spacing:0.05em">⬇ GENERATE PDF</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(modal);
+
+  let reportMode = 'client';
+
+  // Type toggle
+  modal.querySelectorAll('.report-type-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      reportMode = btn.dataset.type;
+      modal.querySelectorAll('.report-type-btn').forEach(b => {
+        const active = b.dataset.type === reportMode;
+        b.style.border = active ? '2px solid var(--accent)' : '2px solid var(--border)';
+        b.style.background = active ? 'rgba(0,180,216,0.08)' : 'none';
+        b.style.color = active ? 'var(--accent)' : 'var(--text)';
+      });
+    });
+  });
+
+  // Select all / none
+  document.getElementById('reportSelectAll').addEventListener('click', () => {
+    modal.querySelectorAll('.report-client-cb').forEach(cb => cb.checked = true);
+  });
+  document.getElementById('reportSelectNone').addEventListener('click', () => {
+    modal.querySelectorAll('.report-client-cb').forEach(cb => cb.checked = false);
+  });
+
+  // Close
+  const closeModal = () => modal.remove();
+  document.getElementById('reportModalClose').addEventListener('click', closeModal);
+  document.getElementById('reportModalCancel').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+  // Generate
+  document.getElementById('reportGenerateBtn').addEventListener('click', async () => {
+    const selected = [...modal.querySelectorAll('.report-client-cb:checked')].map(cb => cb.value);
+    if (!selected.length) { alert('Please select at least one organization.'); return; }
+    const btn = document.getElementById('reportGenerateBtn');
+    btn.textContent = '⏳ Generating...';
+    btn.disabled = true;
+    try {
+      await generateCompliancePDF(selected, reportMode);
+      closeModal();
+    } catch(e) {
+      alert('PDF generation failed: ' + e.message);
+      btn.textContent = '⬇ GENERATE PDF';
+      btn.disabled = false;
+    }
+  });
+}
+
 // ─── COMPLIANCE NAV + VIEW INJECTION ───────────────────────────────
 function injectComplianceViewAndNav() {
   if (!document.getElementById('view-compliance')) {
@@ -5395,34 +5625,6 @@ function wireEvents() {
   document.getElementById('modeToggleBtn')?.addEventListener('click', () => {
     applyMode(!document.body.classList.contains('light'));
   });
-
-  // Ticket search
-  const ticketSearchInput = document.getElementById('ticketSearchInput');
-  const ticketSearchClear = document.getElementById('ticketSearchClear');
-  if (ticketSearchInput) {
-    ticketSearchInput.addEventListener('input', () => {
-      const q = ticketSearchInput.value.trim();
-      ticketSearchClear.style.display = q ? 'flex' : 'none';
-      if (!q) { renderTicketList(); return; }
-      const matches = searchTicketsInCache(q);
-      renderTicketSearchResults(q, matches);
-    });
-    ticketSearchInput.addEventListener('keydown', e => {
-      if (e.key === 'Escape') {
-        ticketSearchInput.value = '';
-        ticketSearchClear.style.display = 'none';
-        renderTicketList();
-      }
-    });
-  }
-  if (ticketSearchClear) {
-    ticketSearchClear.addEventListener('click', () => {
-      ticketSearchInput.value = '';
-      ticketSearchClear.style.display = 'none';
-      renderTicketList();
-      ticketSearchInput.focus();
-    });
-  }
 
   // Nav
   document.querySelectorAll('.nav-item[data-view]').forEach(btn => {
@@ -6279,6 +6481,9 @@ ${alertsBlob}`;
       renderReportsView();
     }
 
+    if (action==='reports-generate-report') {
+      openReportModal();
+    }
     if (action==='reports-refresh') {
       // Bust caches and re-render
       state.reportsResolvedTickets = null;
@@ -6327,6 +6532,9 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='compliance-generate-report') {
+      openReportModal();
     }
     if (action==='compliance-warranty-toggle') {
       state.complianceShowWarranty = !state.complianceShowWarranty;
