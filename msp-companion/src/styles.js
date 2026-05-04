@@ -1790,6 +1790,130 @@ export function injectAppStyles() {
       color: var(--textdim);
       font-size: 13px;
     }
+
+    /* ─── COMPLIANCE VIEW ─────────────────────────────────────────── */
+    .compliance-summary {
+      display: flex;
+      gap: 24px;
+      padding: 16px 0 20px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px;
+    }
+    .compliance-summary-stat {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+    }
+    .compliance-summary-val {
+      font-family: var(--cond);
+      font-size: 32px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .compliance-summary-lbl {
+      font-family: var(--cond);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      color: var(--textdim);
+    }
+    .compliance-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 10px;
+    }
+    .compliance-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px 16px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .compliance-card:hover {
+      border-color: var(--accent);
+      background: rgba(0,180,216,0.05);
+    }
+    .compliance-card-name {
+      font-family: var(--cond);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      margin-bottom: 8px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .compliance-card-stats {
+      display: flex;
+      gap: 10px;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .compliance-bar-track {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-bottom: 4px;
+    }
+    .compliance-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.3s;
+    }
+    .compliance-card-pct {
+      font-family: var(--cond);
+      font-size: 11px;
+      text-align: right;
+      letter-spacing: 0.05em;
+    }
+    /* ─── TICKET SEARCH ───────────────────────────────────────────── */
+    .ticket-search-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px 4px;
+      border-bottom: 1px solid var(--border);
+    }
+    .ticket-search-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 13px;
+      padding: 5px 9px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .ticket-search-input:focus { border-color: var(--accent); }
+    .ticket-search-input::placeholder { color: var(--textdim); }
+    .ticket-search-clear {
+      background: none;
+      border: none;
+      color: var(--textdim);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 2px 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 3px;
+    }
+    .ticket-search-clear:hover { color: var(--text); background: var(--surface); }
+    .ticket-search-label {
+      font-size: 11px;
+      color: var(--textdim);
+      font-family: var(--cond);
+      letter-spacing: 0.05em;
+      padding: 8px 10px 4px;
+    }
+    .ticket-search-empty { padding: 12px 10px; text-align: center; }
+    @media (max-width: 640px) {
+      .compliance-grid { grid-template-columns: 1fr; }
+      .compliance-summary { gap: 16px; }
+    }
   `;
   document.head.appendChild(style);
 }
