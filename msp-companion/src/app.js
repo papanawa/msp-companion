@@ -3800,13 +3800,6 @@ function renderTemplateManager() {
 }
 
 function renderKB(filter='') {
-  // Ensure tab switcher exists
-  const tabBar = document.getElementById('kbTabBar');
-  if (tabBar) {
-    tabBar.querySelectorAll('.kb-tab-btn').forEach(b => {
-      b.classList.toggle('active', b.dataset.tab === 'kb');
-    });
-  }
   const kb=LS.get('msp_kb',[]); const el=$('kbList'); if(!el) return;
   const filtered = filter ? kb.filter(e=>[e.title,e.symptoms,e.resolution,...(e.tags||[])].join(' ').toLowerCase().includes(filter.toLowerCase())) : kb;
   if (!filtered.length) { el.innerHTML='<div class="loading-state">No KB entries yet. Resolve an alert and save it to KB to begin.</div>'; return; }
@@ -5737,7 +5730,7 @@ function setView(view) {
   state.currentView = view;
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
-  if (view==='kb') { injectKBTabBar(); renderKB(); }
+  if (view==='kb') renderKB();
   if (view==='templates') renderTemplateManagerView();
   if (view==='clients') renderClientsView();
   if (view==='compliance') renderComplianceView();
