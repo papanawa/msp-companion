@@ -1791,129 +1791,131 @@ export function injectAppStyles() {
       font-size: 13px;
     }
 
-    /* ─── COMPLIANCE VIEW ─────────────────────────────────────────── */
-    .compliance-summary {
+    /* ─── KB TAB BAR ──────────────────────────────────────────────── */
+    .kb-tab-bar {
       display: flex;
-      gap: 24px;
-      padding: 16px 0 20px;
+      gap: 4px;
+      padding: 10px 12px 0;
       border-bottom: 1px solid var(--border);
-      margin-bottom: 16px;
+      background: var(--bg);
     }
-    .compliance-summary-stat {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 3px;
-    }
-    .compliance-summary-val {
+    .kb-tab-btn {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--textdim);
+      cursor: pointer;
       font-family: var(--cond);
-      font-size: 32px;
+      font-size: 12px;
       font-weight: 700;
-      line-height: 1;
+      letter-spacing: 0.07em;
+      padding: 6px 14px 8px;
+      margin-bottom: -1px;
+      transition: color 0.15s, border-color 0.15s;
     }
-    .compliance-summary-lbl {
+    .kb-tab-btn:hover { color: var(--text); }
+    .kb-tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    /* ─── TEMPLATE MANAGER ─────────────────────────────────────────── */
+    .tpl-mgr-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 4px 10px;
+    }
+    .tpl-mgr-count {
       font-family: var(--cond);
       font-size: 11px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.07em;
       color: var(--textdim);
     }
-    .compliance-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-      gap: 10px;
-    }
-    .compliance-card {
+    .tpl-mgr-list { display: flex; flex-direction: column; gap: 8px; }
+    .tpl-mgr-card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 14px 16px;
-      cursor: pointer;
-      transition: border-color 0.15s, background 0.15s;
+      padding: 12px 14px;
+      transition: border-color 0.15s;
     }
-    .compliance-card:hover {
-      border-color: var(--accent);
-      background: rgba(0,180,216,0.05);
+    .tpl-mgr-card:hover { border-color: var(--accent); }
+    .tpl-mgr-card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 4px;
     }
-    .compliance-card-name {
+    .tpl-mgr-name {
+      font-family: var(--cond);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tpl-mgr-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .tpl-mgr-btn { font-size: 11px !important; padding: 3px 8px !important; }
+    .tpl-mgr-desc {
+      font-size: 12px;
+      color: var(--textmid);
+      margin-bottom: 6px;
+    }
+    .tpl-mgr-meta {
+      display: flex;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--textdim);
+      font-family: var(--cond);
+      margin-bottom: 4px;
+    }
+    .tpl-mgr-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+    /* ─── TEMPLATE STEP EDITOR ──────────────────────────────────────── */
+    .tpl-step-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 8px 10px;
+    }
+    .tpl-step-num {
       font-family: var(--cond);
       font-size: 13px;
       font-weight: 700;
-      letter-spacing: 0.04em;
-      margin-bottom: 8px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      color: var(--accent);
+      min-width: 18px;
+      padding-top: 6px;
     }
-    .compliance-card-stats {
-      display: flex;
-      gap: 10px;
-      font-size: 12px;
-      margin-bottom: 8px;
-    }
-    .compliance-bar-track {
-      height: 4px;
-      background: var(--border);
-      border-radius: 2px;
-      overflow: hidden;
-      margin-bottom: 4px;
-    }
-    .compliance-bar-fill {
-      height: 100%;
-      border-radius: 2px;
-      transition: width 0.3s;
-    }
-    .compliance-card-pct {
-      font-family: var(--cond);
-      font-size: 11px;
-      text-align: right;
-      letter-spacing: 0.05em;
-    }
-    /* ─── TICKET SEARCH ───────────────────────────────────────────── */
-    .ticket-search-bar {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 6px 10px 4px;
-      border-bottom: 1px solid var(--border);
-    }
-    .ticket-search-input {
-      flex: 1;
-      background: var(--bg);
+    .tpl-step-fields { flex: 1; display: flex; flex-direction: column; gap: 5px; }
+    .tpl-step-fields input {
+      background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 4px;
       color: var(--text);
       font-size: 13px;
-      padding: 5px 9px;
+      padding: 5px 8px;
+      width: 100%;
       outline: none;
-      transition: border-color 0.15s;
     }
-    .ticket-search-input:focus { border-color: var(--accent); }
-    .ticket-search-input::placeholder { color: var(--textdim); }
-    .ticket-search-clear {
+    .tpl-step-fields input:focus { border-color: var(--accent); }
+    .tpl-step-remove {
       background: none;
       border: none;
       color: var(--textdim);
       cursor: pointer;
-      font-size: 14px;
-      padding: 2px 4px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      font-size: 13px;
+      padding: 4px;
+      margin-top: 2px;
       border-radius: 3px;
     }
-    .ticket-search-clear:hover { color: var(--text); background: var(--surface); }
-    .ticket-search-label {
-      font-size: 11px;
-      color: var(--textdim);
-      font-family: var(--cond);
-      letter-spacing: 0.05em;
-      padding: 8px 10px 4px;
-    }
-    .ticket-search-empty { padding: 12px 10px; text-align: center; }
-    @media (max-width: 640px) {
-      .compliance-grid { grid-template-columns: 1fr; }
-      .compliance-summary { gap: 16px; }
-    }
+    .tpl-step-remove:hover { color: #c8102e; background: rgba(200,16,46,0.08); }
   `;
   document.head.appendChild(style);
 }

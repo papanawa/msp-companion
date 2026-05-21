@@ -3683,7 +3683,73 @@ function renderTicketDetail(ticket) {
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
+// ─── KB TAB BAR INJECTION ───────────────────────────────────────────
+function injectKBTabBar() {
+  if (document.getElementById('kbTabBar')) return;
+  const kbView = document.getElementById('view-kb');
+  if (!kbView) return;
+  const bar = document.createElement('div');
+  bar.id = 'kbTabBar';
+  bar.className = 'kb-tab-bar';
+  bar.innerHTML = `
+    <button class="kb-tab-btn active" data-tab="kb" data-action="kb-switch-tab">📚 Knowledge Base</button>
+    <button class="kb-tab-btn" data-tab="templates" data-action="kb-switch-tab">🗂 Templates</button>`;
+  kbView.prepend(bar);
+}
+
+// ─── TEMPLATE MANAGER ───────────────────────────────────────────────
+function renderTemplateManager() {
+  // Switch tab active state
+  document.querySelectorAll('.kb-tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === 'templates');
+  });
+
+  const el = $('kbList');
+  if (!el) return;
+
+  const templates = Object.values(state.templates || {})
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  el.innerHTML = `
+    <div class="tpl-mgr-header">
+      <div class="tpl-mgr-count">${templates.length} template${templates.length !== 1 ? 's' : ''}</div>
+      <button class="abtn abtn-ai" data-action="tpl-mgr-new" style="font-size:12px;padding:6px 14px">+ New Template</button>
+    </div>
+    ${!templates.length ? '<div class="loading-state">No templates yet. Create one below or save from a ticket investigation.</div>' : ''}
+    <div class="tpl-mgr-list">
+      ${templates.map(t => `
+        <div class="tpl-mgr-card" data-tpl-id="${esc(t.id)}">
+          <div class="tpl-mgr-card-top">
+            <div class="tpl-mgr-name">${esc(t.name)}</div>
+            <div class="tpl-mgr-actions">
+              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-edit" data-tpl-id="${esc(t.id)}" title="Edit template">✏ Edit</button>
+              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-rename" data-tpl-id="${esc(t.id)}" title="Rename">✎ Rename</button>
+              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-toggle-privacy" data-tpl-id="${esc(t.id)}" title="Toggle public/private">
+                ${t.isPublic !== false ? '🌐 Public' : '🔒 Private'}
+              </button>
+              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-delete" data-tpl-id="${esc(t.id)}" title="Delete template" style="color:#c8102e">✕</button>
+            </div>
+          </div>
+          ${t.description ? `<div class="tpl-mgr-desc">${esc(t.description)}</div>` : ''}
+          <div class="tpl-mgr-meta">
+            <span>${t.steps?.length || 0} steps</span>
+            ${t.usageCount ? `<span>Used ${t.usageCount}×</span>` : ''}
+            ${t.createdBy ? `<span>by ${esc(t.createdBy)}</span>` : ''}
+            ${t.updatedAt ? `<span>Updated ${new Date(t.updatedAt).toLocaleDateString()}</span>` : ''}
+          </div>
+          ${t.tags?.length ? `<div class="tpl-mgr-tags">${t.tags.map(tag => `<span class="kb-tag">${esc(tag)}</span>`).join('')}</div>` : ''}
+        </div>`).join('')}
+    </div>`;
+}
+
 function renderKB(filter='') {
+  // Ensure tab switcher exists
+  const tabBar = document.getElementById('kbTabBar');
+  if (tabBar) {
+    tabBar.querySelectorAll('.kb-tab-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === 'kb');
+    });
+  }
   const kb=LS.get('msp_kb',[]); const el=$('kbList'); if(!el) return;
   const filtered = filter ? kb.filter(e=>[e.title,e.symptoms,e.resolution,...(e.tags||[])].join(' ').toLowerCase().includes(filter.toLowerCase())) : kb;
   if (!filtered.length) { el.innerHTML='<div class="loading-state">No KB entries yet. Resolve an alert and save it to KB to begin.</div>'; return; }
@@ -5614,7 +5680,7 @@ function setView(view) {
   state.currentView = view;
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
-  if (view==='kb') renderKB();
+  if (view==='kb') { injectKBTabBar(); renderKB(); }
   if (view==='clients') renderClientsView();
   if (view==='compliance') renderComplianceView();
   if (view==='reports') renderReportsView();
@@ -6546,6 +6612,45 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='kb-switch-tab') {
+      const tab = el.dataset.tab;
+      if (tab === 'templates') renderTemplateManager();
+      else renderKB();
+    }
+    if (action==='tpl-mgr-new') {
+      showTemplateEditorModal(null, null);
+    }
+    if (action==='tpl-mgr-edit') {
+      const tpl = state.templates[el.dataset.tplId];
+      if (tpl) showTemplateEditorModal(tpl, null);
+    }
+    if (action==='tpl-mgr-rename') {
+      const tplId = el.dataset.tplId;
+      const t = state.templates[tplId];
+      if (!t) return;
+      const newName = prompt('Rename template:', t.name);
+      if (newName?.trim()) {
+        updateTemplate(tplId, { name: newName.trim() });
+        renderTemplateManager();
+        showToast('✓ Template renamed', 'ok');
+      }
+    }
+    if (action==='tpl-mgr-toggle-privacy') {
+      const tplId = el.dataset.tplId;
+      const t = state.templates[tplId];
+      if (!t) return;
+      updateTemplate(tplId, { isPublic: !t.isPublic });
+      renderTemplateManager();
+    }
+    if (action==='tpl-mgr-delete') {
+      const tplId = el.dataset.tplId;
+      const t = state.templates[tplId];
+      if (!t) return;
+      if (!confirm(`Delete template "${t.name}"? This cannot be undone.`)) return;
+      deleteTemplate(tplId);
+      renderTemplateManager();
+      showToast('Template deleted', 'ok');
     }
     if (action==='compliance-generate-report') {
       openReportModal();
