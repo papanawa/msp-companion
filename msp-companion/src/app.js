@@ -3684,6 +3684,63 @@ function renderTicketDetail(ticket) {
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
 // ─── KB TAB BAR INJECTION ───────────────────────────────────────────
+function renderTemplateManagerView() {
+  let vt = document.getElementById('view-templates');
+  if (!vt) {
+    vt = document.createElement('div');
+    vt.id = 'view-templates';
+    vt.className = 'view';
+    const kbView = document.getElementById('view-kb');
+    if (kbView?.parentNode) kbView.parentNode.insertBefore(vt, kbView.nextSibling);
+    else (document.querySelector('main') || document.body).appendChild(vt);
+  }
+  vt.innerHTML = `
+    <div class="kb-wrap">
+      <div class="tpl-mgr-header" style="padding:14px 12px 10px">
+        <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.05em">🗂 Templates</div>
+        <button class="abtn abtn-ai" data-action="tpl-mgr-new" style="font-size:12px;padding:6px 14px">+ New Template</button>
+      </div>
+      <div id="tplMgrList" class="kb-list"></div>
+    </div>`;
+  renderTemplateList(document.getElementById('tplMgrList'));
+}
+
+function renderTemplateList(el) {
+  if (!el) return;
+  const templates = Object.values(state.templates || {})
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  if (!templates.length) {
+    el.innerHTML = '<div class="loading-state">No templates yet. Create one or save from a ticket investigation.</div>';
+    return;
+  }
+
+  el.innerHTML = `<div class="tpl-mgr-list">
+    ${templates.map(t => `
+      <div class="tpl-mgr-card" data-tpl-id="${esc(t.id)}">
+        <div class="tpl-mgr-card-top">
+          <div class="tpl-mgr-name">${esc(t.name)}</div>
+          <div class="tpl-mgr-actions">
+            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-edit" data-tpl-id="${esc(t.id)}">✏ Edit</button>
+            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-rename" data-tpl-id="${esc(t.id)}">✎ Rename</button>
+            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-toggle-privacy" data-tpl-id="${esc(t.id)}">
+              ${t.isPublic !== false ? '🌐 Public' : '🔒 Private'}
+            </button>
+            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-delete" data-tpl-id="${esc(t.id)}" style="color:#c8102e">✕</button>
+          </div>
+        </div>
+        ${t.description ? `<div class="tpl-mgr-desc">${esc(t.description)}</div>` : ''}
+        <div class="tpl-mgr-meta">
+          <span>${t.steps?.length || 0} steps</span>
+          ${t.usageCount ? `<span>Used ${t.usageCount}×</span>` : ''}
+          ${t.createdBy ? `<span>by ${esc(t.createdBy)}</span>` : ''}
+          ${t.updatedAt ? `<span>Updated ${new Date(t.updatedAt).toLocaleDateString()}</span>` : ''}
+        </div>
+        ${t.tags?.length ? `<div class="tpl-mgr-tags">${t.tags.map(tag => `<span class="kb-tag">${esc(tag)}</span>`).join('')}</div>` : ''}
+      </div>`).join('')}
+  </div>`;
+}
+
 function injectKBTabBar() {
   if (document.getElementById('kbTabBar')) return;
   const kbView = document.getElementById('view-kb');
@@ -5681,6 +5738,7 @@ function setView(view) {
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
   if (view==='kb') { injectKBTabBar(); renderKB(); }
+  if (view==='templates') renderTemplateManagerView();
   if (view==='clients') renderClientsView();
   if (view==='compliance') renderComplianceView();
   if (view==='reports') renderReportsView();
@@ -6641,7 +6699,8 @@ ${alertsBlob}`;
       const t = state.templates[tplId];
       if (!t) return;
       updateTemplate(tplId, { isPublic: !t.isPublic });
-      renderTemplateManager();
+      if (document.getElementById('tplMgrList')) renderTemplateList(document.getElementById('tplMgrList'));
+      else renderTemplateManager();
     }
     if (action==='tpl-mgr-delete') {
       const tplId = el.dataset.tplId;
@@ -6649,7 +6708,8 @@ ${alertsBlob}`;
       if (!t) return;
       if (!confirm(`Delete template "${t.name}"? This cannot be undone.`)) return;
       deleteTemplate(tplId);
-      renderTemplateManager();
+      if (document.getElementById('tplMgrList')) renderTemplateList(document.getElementById('tplMgrList'));
+      else renderTemplateManager();
       showToast('Template deleted', 'ok');
     }
     if (action==='compliance-generate-report') {
