@@ -3225,9 +3225,15 @@ function hydrateDevicePanel(deviceData) {
   // Populate the "Open in Datto" link in the header — opens device summary, where Web Remote / Agent Browser / Open in PSA all live
   if (openSlot) {
     const dattoUrl = buildDattoDeviceUrl(d);
-    if (dattoUrl) {
-      openSlot.innerHTML = `<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="inv-step-btn datto-open-btn" title="Open device in Datto RMM (Web Remote, Agent Browser, etc.)" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">📟 OPEN IN DATTO</a>`;
+    const agentUrl = d.webRemoteUrl || null;
+    const btns = [];
+    if (agentUrl) {
+      btns.push(`<a href="${esc(agentUrl)}" target="_blank" rel="noopener" class="inv-step-btn" title="Open Agent Browser for this device" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px;background:rgba(42,157,92,0.15);border-color:#2a9d5c;color:#2a9d5c">🖥 AGENT BROWSER</a>`);
     }
+    if (dattoUrl) {
+      btns.push(`<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="inv-step-btn datto-open-btn" title="Open device in Datto RMM" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">📟 OPEN IN DATTO</a>`);
+    }
+    if (btns.length) openSlot.innerHTML = btns.join('');
   }
   const openAlerts = deviceData.openAlertCount || 0;
   const online = d.online === true || d.online === 'true';
@@ -3683,122 +3689,6 @@ function renderTicketDetail(ticket) {
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
-// ─── KB TAB BAR INJECTION ───────────────────────────────────────────
-function renderTemplateManagerView() {
-  let vt = document.getElementById('view-templates');
-  if (!vt) {
-    vt = document.createElement('div');
-    vt.id = 'view-templates';
-    vt.className = 'view';
-    const kbView = document.getElementById('view-kb');
-    if (kbView?.parentNode) kbView.parentNode.insertBefore(vt, kbView.nextSibling);
-    else (document.querySelector('main') || document.body).appendChild(vt);
-  }
-  vt.innerHTML = `
-    <div class="kb-wrap">
-      <div class="tpl-mgr-header" style="padding:14px 12px 10px">
-        <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.05em">🗂 Templates</div>
-        <button class="abtn abtn-ai" data-action="tpl-mgr-new" style="font-size:12px;padding:6px 14px">+ New Template</button>
-      </div>
-      <div id="tplMgrList" class="kb-list"></div>
-    </div>`;
-  renderTemplateList(document.getElementById('tplMgrList'));
-}
-
-function renderTemplateList(el) {
-  if (!el) return;
-  const templates = Object.values(state.templates || {})
-    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-
-  if (!templates.length) {
-    el.innerHTML = '<div class="loading-state">No templates yet. Create one or save from a ticket investigation.</div>';
-    return;
-  }
-
-  el.innerHTML = `<div class="tpl-mgr-list">
-    ${templates.map(t => `
-      <div class="tpl-mgr-card" data-tpl-id="${esc(t.id)}">
-        <div class="tpl-mgr-card-top">
-          <div class="tpl-mgr-name">${esc(t.name)}</div>
-          <div class="tpl-mgr-actions">
-            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-edit" data-tpl-id="${esc(t.id)}">✏ Edit</button>
-            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-rename" data-tpl-id="${esc(t.id)}">✎ Rename</button>
-            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-toggle-privacy" data-tpl-id="${esc(t.id)}">
-              ${t.isPublic !== false ? '🌐 Public' : '🔒 Private'}
-            </button>
-            <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-delete" data-tpl-id="${esc(t.id)}" style="color:#c8102e">✕</button>
-          </div>
-        </div>
-        ${t.description ? `<div class="tpl-mgr-desc">${esc(t.description)}</div>` : ''}
-        <div class="tpl-mgr-meta">
-          <span>${t.steps?.length || 0} steps</span>
-          ${t.usageCount ? `<span>Used ${t.usageCount}×</span>` : ''}
-          ${t.createdBy ? `<span>by ${esc(t.createdBy)}</span>` : ''}
-          ${t.updatedAt ? `<span>Updated ${new Date(t.updatedAt).toLocaleDateString()}</span>` : ''}
-        </div>
-        ${t.tags?.length ? `<div class="tpl-mgr-tags">${t.tags.map(tag => `<span class="kb-tag">${esc(tag)}</span>`).join('')}</div>` : ''}
-      </div>`).join('')}
-  </div>`;
-}
-
-function injectKBTabBar() {
-  if (document.getElementById('kbTabBar')) return;
-  const kbView = document.getElementById('view-kb');
-  if (!kbView) return;
-  const bar = document.createElement('div');
-  bar.id = 'kbTabBar';
-  bar.className = 'kb-tab-bar';
-  bar.innerHTML = `
-    <button class="kb-tab-btn active" data-tab="kb" data-action="kb-switch-tab">📚 Knowledge Base</button>
-    <button class="kb-tab-btn" data-tab="templates" data-action="kb-switch-tab">🗂 Templates</button>`;
-  kbView.prepend(bar);
-}
-
-// ─── TEMPLATE MANAGER ───────────────────────────────────────────────
-function renderTemplateManager() {
-  // Switch tab active state
-  document.querySelectorAll('.kb-tab-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.tab === 'templates');
-  });
-
-  const el = $('kbList');
-  if (!el) return;
-
-  const templates = Object.values(state.templates || {})
-    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-
-  el.innerHTML = `
-    <div class="tpl-mgr-header">
-      <div class="tpl-mgr-count">${templates.length} template${templates.length !== 1 ? 's' : ''}</div>
-      <button class="abtn abtn-ai" data-action="tpl-mgr-new" style="font-size:12px;padding:6px 14px">+ New Template</button>
-    </div>
-    ${!templates.length ? '<div class="loading-state">No templates yet. Create one below or save from a ticket investigation.</div>' : ''}
-    <div class="tpl-mgr-list">
-      ${templates.map(t => `
-        <div class="tpl-mgr-card" data-tpl-id="${esc(t.id)}">
-          <div class="tpl-mgr-card-top">
-            <div class="tpl-mgr-name">${esc(t.name)}</div>
-            <div class="tpl-mgr-actions">
-              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-edit" data-tpl-id="${esc(t.id)}" title="Edit template">✏ Edit</button>
-              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-rename" data-tpl-id="${esc(t.id)}" title="Rename">✎ Rename</button>
-              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-toggle-privacy" data-tpl-id="${esc(t.id)}" title="Toggle public/private">
-                ${t.isPublic !== false ? '🌐 Public' : '🔒 Private'}
-              </button>
-              <button class="abtn abtn-ghost tpl-mgr-btn" data-action="tpl-mgr-delete" data-tpl-id="${esc(t.id)}" title="Delete template" style="color:#c8102e">✕</button>
-            </div>
-          </div>
-          ${t.description ? `<div class="tpl-mgr-desc">${esc(t.description)}</div>` : ''}
-          <div class="tpl-mgr-meta">
-            <span>${t.steps?.length || 0} steps</span>
-            ${t.usageCount ? `<span>Used ${t.usageCount}×</span>` : ''}
-            ${t.createdBy ? `<span>by ${esc(t.createdBy)}</span>` : ''}
-            ${t.updatedAt ? `<span>Updated ${new Date(t.updatedAt).toLocaleDateString()}</span>` : ''}
-          </div>
-          ${t.tags?.length ? `<div class="tpl-mgr-tags">${t.tags.map(tag => `<span class="kb-tag">${esc(tag)}</span>`).join('')}</div>` : ''}
-        </div>`).join('')}
-    </div>`;
-}
-
 function renderKB(filter='') {
   const kb=LS.get('msp_kb',[]); const el=$('kbList'); if(!el) return;
   const filtered = filter ? kb.filter(e=>[e.title,e.symptoms,e.resolution,...(e.tags||[])].join(' ').toLowerCase().includes(filter.toLowerCase())) : kb;
@@ -5731,7 +5621,6 @@ function setView(view) {
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view));
   if (view==='kb') renderKB();
-  if (view==='templates') renderTemplateManagerView();
   if (view==='clients') renderClientsView();
   if (view==='compliance') renderComplianceView();
   if (view==='reports') renderReportsView();
@@ -6663,47 +6552,6 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
-    }
-    if (action==='kb-switch-tab') {
-      const tab = el.dataset.tab;
-      if (tab === 'templates') renderTemplateManager();
-      else renderKB();
-    }
-    if (action==='tpl-mgr-new') {
-      showTemplateEditorModal(null, null);
-    }
-    if (action==='tpl-mgr-edit') {
-      const tpl = state.templates[el.dataset.tplId];
-      if (tpl) showTemplateEditorModal(tpl, null);
-    }
-    if (action==='tpl-mgr-rename') {
-      const tplId = el.dataset.tplId;
-      const t = state.templates[tplId];
-      if (!t) return;
-      const newName = prompt('Rename template:', t.name);
-      if (newName?.trim()) {
-        updateTemplate(tplId, { name: newName.trim() });
-        renderTemplateManager();
-        showToast('✓ Template renamed', 'ok');
-      }
-    }
-    if (action==='tpl-mgr-toggle-privacy') {
-      const tplId = el.dataset.tplId;
-      const t = state.templates[tplId];
-      if (!t) return;
-      updateTemplate(tplId, { isPublic: !t.isPublic });
-      if (document.getElementById('tplMgrList')) renderTemplateList(document.getElementById('tplMgrList'));
-      else renderTemplateManager();
-    }
-    if (action==='tpl-mgr-delete') {
-      const tplId = el.dataset.tplId;
-      const t = state.templates[tplId];
-      if (!t) return;
-      if (!confirm(`Delete template "${t.name}"? This cannot be undone.`)) return;
-      deleteTemplate(tplId);
-      if (document.getElementById('tplMgrList')) renderTemplateList(document.getElementById('tplMgrList'));
-      else renderTemplateManager();
-      showToast('Template deleted', 'ok');
     }
     if (action==='compliance-generate-report') {
       openReportModal();
