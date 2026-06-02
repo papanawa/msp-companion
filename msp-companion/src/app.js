@@ -3564,6 +3564,7 @@ function renderTicketDetail(ticket) {
         ${!isMine && !isComplete ? `<button class="abtn abtn-accept" data-action="ticket-accept" data-ticket-id="${ticket.id}">✋ Accept</button>` : ''}
         ${!isComplete ? `<button class="abtn abtn-complete" data-action="ticket-complete" data-ticket-id="${ticket.id}">✓ Complete</button>` : ''}
         <button class="abtn abtn-time" data-action="log-time-ticket" data-ticket-id="${ticket.id}">⏱ Log Time</button>
+        ${!isComplete ? `<button class="abtn abtn-ghost" data-action="ticket-merge" data-ticket-id="${ticket.id}" title="Merge this ticket into another" style="font-size:11px">🔀 Merge</button>` : ''}
       </div>
     </div>
 
@@ -5803,6 +5804,158 @@ function setView(view) {
   setTimeout(updateNewItemBadges, 300);
 }
 
+// ─── TICKET MERGE ──────────────────────────────────────────────────
+function showTicketMergeModal(sourceTicket) {
+  document.getElementById('ticketMergeModal')?.remove();
+
+  const candidates = Object.values(state.tickets)
+    .filter(t => !t.isDone && t.id !== sourceTicket.id)
+    .sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0));
+
+  const modal = document.createElement('div');
+  modal.id = 'ticketMergeModal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  modal.innerHTML = `
+    <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:100%;max-width:560px;display:flex;flex-direction:column;max-height:80vh;overflow:hidden">
+      <div style="padding:18px 20px;border-bottom:1px solid var(--border)">
+        <div style="font-family:var(--cond);font-size:15px;font-weight:700;letter-spacing:0.06em;margin-bottom:4px">🔀 MERGE TICKET</div>
+        <div style="font-size:12px;color:var(--textdim)">
+          <strong style="color:var(--text)">${esc(sourceTicket.ticketNumber)}</strong>
+          — ${esc(sourceTicket.title?.substring(0,60) || 'No title')}
+          will be absorbed into the ticket you select below.
+        </div>
+      </div>
+      <div style="padding:10px 20px;border-bottom:1px solid var(--border)">
+        <input type="text" id="mergeSearch" placeholder="Search tickets..." autocomplete="off"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;padding:6px 10px;outline:none" />
+      </div>
+      <div id="mergeCandidateList" style="flex:1;overflow-y:auto;padding:8px 12px">
+        ${candidates.length ? candidates.map(t => `
+          <div class="merge-candidate-row" data-ticket-id="${t.id}" data-ticket-num="${esc(t.ticketNumber)}">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+              <span style="font-family:var(--cond);font-size:12px;font-weight:700;color:var(--accent)">${esc(t.ticketNumber)}</span>
+              <span style="font-size:11px;color:${t.statusColor||'#8bacc8'};border:1px solid ${t.statusColor||'#8bacc8'}44;border-radius:3px;padding:1px 6px;font-family:var(--cond);font-weight:700">${esc(t.statusLabel||'')}</span>
+            </div>
+            <div style="font-size:13px;margin:3px 0">${esc(t.title?.substring(0,70)||'No title')}</div>
+            <div style="font-size:11px;color:var(--textdim)">${esc(t.companyName||'')}${t.assignedResourceName?' · '+esc(t.assignedResourceName):''}</div>
+          </div>`).join('') : '<div class="loading-state">No other open tickets to merge into.</div>'}
+      </div>
+      <div id="mergePreview" style="display:none;padding:12px 20px;background:rgba(224,123,0,0.08);border-top:1px solid rgba(224,123,0,0.25)">
+        <div style="font-family:var(--cond);font-size:11px;color:#e07b00;font-weight:700;letter-spacing:0.07em;margin-bottom:6px">MERGE PREVIEW</div>
+        <div id="mergePreviewText" style="font-size:12px;color:var(--text)"></div>
+        <div style="font-size:11px;color:var(--textdim);margin-top:4px">
+          • A note will be posted to the survivor ticket<br>
+          • Linked alerts will be re-pointed to the survivor<br>
+          • The source ticket will be completed in Autotask
+        </div>
+      </div>
+      <div style="padding:14px 20px;display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--border)">
+        <button id="mergeCancelBtn" class="abtn abtn-ghost">Cancel</button>
+        <button id="mergeConfirmBtn" class="abtn abtn-ai" disabled style="opacity:0.4">🔀 Confirm Merge</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(modal);
+
+  let selectedSurvivor = null;
+
+  // Search filter
+  document.getElementById('mergeSearch').addEventListener('input', e => {
+    const q = e.target.value.toLowerCase();
+    document.querySelectorAll('.merge-candidate-row').forEach(row => {
+      const text = row.textContent.toLowerCase();
+      row.style.display = !q || text.includes(q) ? '' : 'none';
+    });
+  });
+
+  // Row selection
+  modal.querySelectorAll('.merge-candidate-row').forEach(row => {
+    row.addEventListener('click', () => {
+      modal.querySelectorAll('.merge-candidate-row').forEach(r => r.classList.remove('merge-selected'));
+      row.classList.add('merge-selected');
+      selectedSurvivor = state.tickets[row.dataset.ticketId] ||
+        Object.values(state.tickets).find(t => t.id === parseInt(row.dataset.ticketId));
+      if (selectedSurvivor) {
+        const preview = document.getElementById('mergePreview');
+        const previewText = document.getElementById('mergePreviewText');
+        preview.style.display = 'block';
+        previewText.innerHTML = `<strong>${esc(sourceTicket.ticketNumber)}</strong> (${esc(sourceTicket.title?.substring(0,40)||'')}) → merged into <strong>${esc(selectedSurvivor.ticketNumber)}</strong> (${esc(selectedSurvivor.title?.substring(0,40)||'')})`;
+        const btn = document.getElementById('mergeConfirmBtn');
+        btn.disabled = false;
+        btn.style.opacity = '1';
+      }
+    });
+  });
+
+  // Cancel
+  const closeModal = () => modal.remove();
+  document.getElementById('mergeCancelBtn').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+  // Confirm
+  document.getElementById('mergeConfirmBtn').addEventListener('click', async () => {
+    if (!selectedSurvivor) return;
+    const btn = document.getElementById('mergeConfirmBtn');
+    btn.textContent = '⏳ Merging...';
+    btn.disabled = true;
+    try {
+      await mergeTickets(sourceTicket, selectedSurvivor);
+      closeModal();
+    } catch(e) {
+      showToast(`Merge failed: ${e.message}`, 'warn');
+      btn.textContent = '🔀 Confirm Merge';
+      btn.disabled = false;
+    }
+  });
+}
+
+async function mergeTickets(source, survivor) {
+  // 1. Post merge note to survivor
+  const noteText = `Merged from ${source.ticketNumber}: ${source.title || 'No title'}\n\nOriginal ticket: ${source.companyName || ''} | ${source.statusLabel || ''} | Assigned: ${source.assignedResourceName || 'Unassigned'}\n\nMerged via MSP Companion on ${new Date().toLocaleString()}`;
+  await atFetch(`/Tickets/${survivor.id}/Notes`, 'POST', {
+    ticketID: parseInt(survivor.id),
+    title: `Merged from ${source.ticketNumber}`,
+    description: noteText,
+    noteType: 1,
+    publish: 1,
+  });
+
+  // 2. Complete the source ticket in AT
+  const doneStatusId = Object.entries(state.atStatusPicklist || {}).find(([id, s]) => s.done)?.[0];
+  if (doneStatusId) {
+    await atFetch('/Tickets', 'PATCH', { id: parseInt(source.id), status: parseInt(doneStatusId) });
+  }
+
+  // 3. Re-link alerts from source → survivor
+  let alertsRelinked = 0;
+  state.alerts.forEach(a => {
+    if (a.ticketNumber === source.ticketNumber) {
+      a.ticketNumber = survivor.ticketNumber;
+      alertsRelinked++;
+    }
+  });
+  if (alertsRelinked) LS.set('msp_alerts', state.alerts);
+
+  // 4. Move investigation if source has one
+  const srcInv = state.investigations?.[source.id];
+  if (srcInv && !state.investigations[survivor.id]) {
+    state.investigations[survivor.id] = { ...srcInv, ticketId: survivor.id };
+    delete state.investigations[source.id];
+    if (typeof saveInvestigations === 'function') saveInvestigations();
+  }
+
+  // 5. Remove source from local state
+  delete state.tickets[source.ticketNumber];
+
+  // 6. Open survivor
+  state.currentTicket = survivor;
+  renderTicketList();
+  renderTicketDetail(survivor);
+
+  showToast(`✓ ${source.ticketNumber} merged into ${survivor.ticketNumber}${alertsRelinked ? ` · ${alertsRelinked} alert${alertsRelinked>1?'s':''} re-linked` : ''}`, 'ok');
+}
+
 // ─── EVENT WIRING ─────────────────────────────────────────────────
 function wireEvents() {
 
@@ -6073,6 +6226,10 @@ function wireEvents() {
       showTimeEntryModal(ticket.id, ticket.ticketNumber);
     }
 
+    if (action==='ticket-merge') {
+      const ticket = state.currentTicket || findTicketById(el.dataset.ticketId);
+      if (ticket) showTicketMergeModal(ticket);
+    }
     if (action==='log-time-ticket') {
       const ticketId=el.dataset.ticketId;
       const ticket=Object.values(state.tickets).find(t=>String(t.id)===ticketId); if(!ticket) return;
