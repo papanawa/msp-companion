@@ -1808,6 +1808,13 @@ export function injectAppStyles() {
       border-color: #e07b00;
       background: rgba(224,123,0,0.08);
     }
+    .merge-candidate-row.merge-cross-company {
+      border-color: rgba(200,150,12,0.3);
+    }
+    .merge-candidate-row.merge-cross-company:hover {
+      border-color: #c8960c;
+      background: rgba(200,150,12,0.06);
+    }
   `;
   document.head.appendChild(style);
 }

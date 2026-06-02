@@ -5808,9 +5808,15 @@ function setView(view) {
 function showTicketMergeModal(sourceTicket) {
   document.getElementById('ticketMergeModal')?.remove();
 
-  const candidates = Object.values(state.tickets)
+  const allCandidates = Object.values(state.tickets)
     .filter(t => !t.isDone && t.id !== sourceTicket.id)
     .sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0));
+
+  const sameCompany = allCandidates.filter(t =>
+    t.companyID && sourceTicket.companyID && t.companyID === sourceTicket.companyID
+  );
+  let candidates = sameCompany;
+  let showingAll = false;
 
   const modal = document.createElement('div');
   modal.id = 'ticketMergeModal';
@@ -5820,10 +5826,14 @@ function showTicketMergeModal(sourceTicket) {
     <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:100%;max-width:560px;display:flex;flex-direction:column;max-height:80vh;overflow:hidden">
       <div style="padding:18px 20px;border-bottom:1px solid var(--border)">
         <div style="font-family:var(--cond);font-size:15px;font-weight:700;letter-spacing:0.06em;margin-bottom:4px">🔀 MERGE TICKET</div>
-        <div style="font-size:12px;color:var(--textdim)">
+        <div style="font-size:12px;color:var(--textdim);margin-bottom:6px">
           <strong style="color:var(--text)">${esc(sourceTicket.ticketNumber)}</strong>
           — ${esc(sourceTicket.title?.substring(0,60) || 'No title')}
           will be absorbed into the ticket you select below.
+        </div>
+        <div style="font-size:11px;color:var(--accent)">
+          Showing tickets for <strong>${esc(sourceTicket.companyName || 'same company')}</strong> only.
+          <button id="mergeShowAllBtn" style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:11px;text-decoration:underline;padding:0 4px">Show all companies</button>
         </div>
       </div>
       <div style="padding:10px 20px;border-bottom:1px solid var(--border)">
@@ -5831,15 +5841,6 @@ function showTicketMergeModal(sourceTicket) {
           style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;padding:6px 10px;outline:none" />
       </div>
       <div id="mergeCandidateList" style="flex:1;overflow-y:auto;padding:8px 12px">
-        ${candidates.length ? candidates.map(t => `
-          <div class="merge-candidate-row" data-ticket-id="${t.id}" data-ticket-num="${esc(t.ticketNumber)}">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-              <span style="font-family:var(--cond);font-size:12px;font-weight:700;color:var(--accent)">${esc(t.ticketNumber)}</span>
-              <span style="font-size:11px;color:${t.statusColor||'#8bacc8'};border:1px solid ${t.statusColor||'#8bacc8'}44;border-radius:3px;padding:1px 6px;font-family:var(--cond);font-weight:700">${esc(t.statusLabel||'')}</span>
-            </div>
-            <div style="font-size:13px;margin:3px 0">${esc(t.title?.substring(0,70)||'No title')}</div>
-            <div style="font-size:11px;color:var(--textdim)">${esc(t.companyName||'')}${t.assignedResourceName?' · '+esc(t.assignedResourceName):''}</div>
-          </div>`).join('') : '<div class="loading-state">No other open tickets to merge into.</div>'}
       </div>
       <div id="mergePreview" style="display:none;padding:12px 20px;background:rgba(224,123,0,0.08);border-top:1px solid rgba(224,123,0,0.25)">
         <div style="font-family:var(--cond);font-size:11px;color:#e07b00;font-weight:700;letter-spacing:0.07em;margin-bottom:6px">MERGE PREVIEW</div>
@@ -5860,32 +5861,70 @@ function showTicketMergeModal(sourceTicket) {
 
   let selectedSurvivor = null;
 
+  function renderCandidateRows(list) {
+    const container = document.getElementById('mergeCandidateList');
+    if (!container) return;
+    if (!list.length) {
+      container.innerHTML = '<div class="loading-state">No matching tickets to merge into.</div>';
+      return;
+    }
+    container.innerHTML = list.map(t => {
+      const crossCompany = t.companyID !== sourceTicket.companyID;
+      return `<div class="merge-candidate-row${crossCompany ? ' merge-cross-company' : ''}" data-ticket-id="${t.id}">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span style="font-family:var(--cond);font-size:12px;font-weight:700;color:var(--accent)">${esc(t.ticketNumber)}</span>
+          <span style="font-size:11px;color:${t.statusColor||'#8bacc8'};border:1px solid ${t.statusColor||'#8bacc8'}44;border-radius:3px;padding:1px 6px;font-family:var(--cond);font-weight:700">${esc(t.statusLabel||'')}</span>
+        </div>
+        <div style="font-size:13px;margin:3px 0">${esc(t.title?.substring(0,70)||'No title')}</div>
+        <div style="font-size:11px;color:var(--textdim)">
+          ${esc(t.companyName||'')}${t.assignedResourceName?' · '+esc(t.assignedResourceName):''}
+          ${crossCompany ? '<span style="color:#c8960c;margin-left:6px">⚠ Different company</span>' : ''}
+        </div>
+      </div>`;
+    }).join('');
+
+    // Bind row clicks
+    container.querySelectorAll('.merge-candidate-row').forEach(row => {
+      row.addEventListener('click', () => {
+        container.querySelectorAll('.merge-candidate-row').forEach(r => r.classList.remove('merge-selected'));
+        row.classList.add('merge-selected');
+        selectedSurvivor = Object.values(state.tickets).find(t => String(t.id) === String(row.dataset.ticketId));
+        if (selectedSurvivor) {
+          const crossCo = selectedSurvivor.companyID !== sourceTicket.companyID;
+          const preview = document.getElementById('mergePreview');
+          const previewText = document.getElementById('mergePreviewText');
+          preview.style.display = 'block';
+          previewText.innerHTML = `<strong>${esc(sourceTicket.ticketNumber)}</strong> (${esc(sourceTicket.title?.substring(0,40)||'')}) → merged into <strong>${esc(selectedSurvivor.ticketNumber)}</strong> (${esc(selectedSurvivor.title?.substring(0,40)||'')})${crossCo ? '<br><span style="color:#c8960c">⚠ Warning: merging across different companies</span>' : ''}`;
+          const btn = document.getElementById('mergeConfirmBtn');
+          btn.disabled = false;
+          btn.style.opacity = '1';
+        }
+      });
+    });
+  }
+
+  // Initial render
+  renderCandidateRows(candidates);
+
+  // Show all toggle
+  document.getElementById('mergeShowAllBtn')?.addEventListener('click', () => {
+    showingAll = !showingAll;
+    candidates = showingAll ? allCandidates : sameCompany;
+    const btn = document.getElementById('mergeShowAllBtn');
+    if (btn) btn.textContent = showingAll ? 'Show same company only' : 'Show all companies';
+    const label = btn?.previousSibling;
+    selectedSurvivor = null;
+    document.getElementById('mergePreview').style.display = 'none';
+    document.getElementById('mergeConfirmBtn').disabled = true;
+    document.getElementById('mergeConfirmBtn').style.opacity = '0.4';
+    const q = document.getElementById('mergeSearch')?.value.toLowerCase() || '';
+    renderCandidateRows(q ? candidates.filter(t => (t.ticketNumber+t.title+t.companyName).toLowerCase().includes(q)) : candidates);
+  });
+
   // Search filter
   document.getElementById('mergeSearch').addEventListener('input', e => {
     const q = e.target.value.toLowerCase();
-    document.querySelectorAll('.merge-candidate-row').forEach(row => {
-      const text = row.textContent.toLowerCase();
-      row.style.display = !q || text.includes(q) ? '' : 'none';
-    });
-  });
-
-  // Row selection
-  modal.querySelectorAll('.merge-candidate-row').forEach(row => {
-    row.addEventListener('click', () => {
-      modal.querySelectorAll('.merge-candidate-row').forEach(r => r.classList.remove('merge-selected'));
-      row.classList.add('merge-selected');
-      selectedSurvivor = state.tickets[row.dataset.ticketId] ||
-        Object.values(state.tickets).find(t => t.id === parseInt(row.dataset.ticketId));
-      if (selectedSurvivor) {
-        const preview = document.getElementById('mergePreview');
-        const previewText = document.getElementById('mergePreviewText');
-        preview.style.display = 'block';
-        previewText.innerHTML = `<strong>${esc(sourceTicket.ticketNumber)}</strong> (${esc(sourceTicket.title?.substring(0,40)||'')}) → merged into <strong>${esc(selectedSurvivor.ticketNumber)}</strong> (${esc(selectedSurvivor.title?.substring(0,40)||'')})`;
-        const btn = document.getElementById('mergeConfirmBtn');
-        btn.disabled = false;
-        btn.style.opacity = '1';
-      }
-    });
+    renderCandidateRows(q ? candidates.filter(t => (t.ticketNumber+' '+t.title+' '+t.companyName).toLowerCase().includes(q)) : candidates);
   });
 
   // Cancel
