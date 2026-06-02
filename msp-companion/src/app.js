@@ -12,7 +12,8 @@ import { KB_TTL_MS, HISTORY_TTL_MS, CONTEXT_CACHE_MAX, AI_STOP_WORDS, extractAle
 const state = {
   alerts: [], sites: [], tickets: {},
   atStatusPicklist: null, atPriorityPicklist: null, atResources: [], atBillingCodes: [], atRoles: [],
-  resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(), psaExcludedClients: new Set(), atQueues: [],
+  resolvedIds: new Set(), snoozedIds: new Set(), excludedClients: new Set(),
+  lastViewedAt: LS.get('msp_last_viewed', {}), psaExcludedClients: new Set(), atQueues: [],
   notesDrafts: {}, aiResults: {}, chatHistories: {},
   ticketChatHistories: {},
   kbContextCache: {}, historyContextCache: {},
@@ -2767,6 +2768,9 @@ function showAiClusterReviewModal(proposals, totalCandidates) {
 
 // ─── ALERT LIST ───────────────────────────────────────────────────
 function renderAlertList() {
+  // Inject new-since banner if applicable
+  const bannerSlot = document.getElementById('alertNewSinceSlot');
+  if (bannerSlot) bannerSlot.innerHTML = renderNewSincePill('alerts');
   const filtered = getFilteredAlerts();
   const el = $('alertList'); if(!el) return;
   const cntEl = $('alertListCount'); if(cntEl) cntEl.textContent = `${filtered.length} alert${filtered.length!==1?'s':''}`;
@@ -3079,6 +3083,9 @@ function renderChatHistory(uid) {
 
 // ─── TICKET LIST ──────────────────────────────────────────────────
 function renderTicketList() {
+  // Inject new-since banner if applicable
+  const bannerSlot = document.getElementById('ticketNewSinceSlot');
+  if (bannerSlot) bannerSlot.innerHTML = renderNewSincePill('tickets');
   const el=$('ticketList'); if(!el) return;
   // All tickets, active + stale, for toolbar counts
   const allOpen = getOpenTickets({ includeStale: true });
@@ -3225,15 +3232,9 @@ function hydrateDevicePanel(deviceData) {
   // Populate the "Open in Datto" link in the header — opens device summary, where Web Remote / Agent Browser / Open in PSA all live
   if (openSlot) {
     const dattoUrl = buildDattoDeviceUrl(d);
-    const agentUrl = d.webRemoteUrl || null;
-    const btns = [];
-    if (agentUrl) {
-      btns.push(`<a href="${esc(agentUrl)}" target="_blank" rel="noopener" class="inv-step-btn" title="Open Agent Browser for this device" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px;background:rgba(42,157,92,0.15);border-color:#2a9d5c;color:#2a9d5c">🖥 WEB REMOTE</a>`);
-    }
     if (dattoUrl) {
-      btns.push(`<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="inv-step-btn datto-open-btn" title="Open device in Datto RMM" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">📟 OPEN IN DATTO</a>`);
+      openSlot.innerHTML = `<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="inv-step-btn datto-open-btn" title="Open device in Datto RMM (Web Remote, Agent Browser, etc.)" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">📟 OPEN IN DATTO</a>`;
     }
-    if (btns.length) openSlot.innerHTML = btns.join('');
   }
   const openAlerts = deviceData.openAlertCount || 0;
   const online = d.online === true || d.online === 'true';
@@ -5612,6 +5613,62 @@ function injectComplianceViewAndNav() {
   navItem.addEventListener('click', () => setView('compliance'));
 }
 
+
+// ─── "WHAT'S NEW" TRACKING ─────────────────────────────────────────
+function recordViewedAt(view) {
+  state.lastViewedAt[view] = Date.now();
+  LS.set('msp_last_viewed', state.lastViewedAt);
+}
+
+function getNewAlertsSince(ts) {
+  if (!ts) return [];
+  return getVisibleAlerts().filter(a => (a.timestampMs || 0) > ts);
+}
+
+function getNewTicketsSince(ts) {
+  if (!ts) return [];
+  return Object.values(state.tickets).filter(t =>
+    !t.isDone && (new Date(t.lastActivity || 0).getTime()) > ts
+  );
+}
+
+function updateNewItemBadges() {
+  const alertTs  = state.lastViewedAt['alerts']  || 0;
+  const ticketTs = state.lastViewedAt['tickets'] || 0;
+  const newAlerts  = alertTs  ? getNewAlertsSince(alertTs).length  : 0;
+  const newTickets = ticketTs ? getNewTicketsSince(ticketTs).length : 0;
+
+  // Update nav badges
+  ['alerts', 'tickets'].forEach(view => {
+    const navBtn = document.querySelector(`.nav-item[data-view="${view}"]`);
+    if (!navBtn) return;
+    let pill = navBtn.querySelector('.new-since-pill');
+    const count = view === 'alerts' ? newAlerts : newTickets;
+    if (count > 0) {
+      if (!pill) {
+        pill = document.createElement('span');
+        pill.className = 'new-since-pill';
+        navBtn.appendChild(pill);
+      }
+      pill.textContent = `+${count}`;
+    } else {
+      pill?.remove();
+    }
+  });
+}
+
+function renderNewSincePill(view) {
+  const ts = state.lastViewedAt[view];
+  if (!ts) return '';
+  const items = view === 'alerts' ? getNewAlertsSince(ts) : getNewTicketsSince(ts);
+  if (!items.length) return '';
+  const timeStr = new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return `<div class="new-since-banner" id="newSinceBanner">
+    <span>⚡ ${items.length} new since ${timeStr}</span>
+    <button class="new-since-dismiss" data-action="dismiss-new-since" data-view="${view}">✕</button>
+  </div>`;
+}
+
 function setView(view) {
   // Stop timer if leaving the tickets view (we're no longer viewing that ticket)
   if (state.currentView === 'tickets' && view !== 'tickets') {
@@ -5635,7 +5692,13 @@ function setView(view) {
         state.atQueues.map(q => `<option value="${q.id}" ${String(q.id)===String(current)?'selected':''}>${q.name}</option>`).join('');
     }).catch(() => {});
   }
+  // Record when we LEFT the previous view, then update badges
+  if (state.currentView && state.currentView !== view) {
+    recordViewedAt(state.currentView);
+  }
   LS.set('msp_view', view);
+  // Update +N badges after a short delay so renders complete first
+  setTimeout(updateNewItemBadges, 300);
 }
 
 // ─── EVENT WIRING ─────────────────────────────────────────────────
@@ -6552,6 +6615,12 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='dismiss-new-since') {
+      const view = el.dataset.view;
+      recordViewedAt(view);
+      document.getElementById('newSinceBanner')?.remove();
+      updateNewItemBadges();
     }
     if (action==='compliance-generate-report') {
       openReportModal();
