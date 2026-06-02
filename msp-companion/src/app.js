@@ -3228,7 +3228,7 @@ function hydrateDevicePanel(deviceData) {
     const agentUrl = d.webRemoteUrl || null;
     const btns = [];
     if (agentUrl) {
-      btns.push(`<a href="${esc(agentUrl)}" target="_blank" rel="noopener" class="inv-step-btn" title="Open Agent Browser for this device" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px;background:rgba(42,157,92,0.15);border-color:#2a9d5c;color:#2a9d5c">🖥 AGENT BROWSER</a>`);
+      btns.push(`<a href="${esc(agentUrl)}" target="_blank" rel="noopener" class="inv-step-btn" title="Open Agent Browser for this device" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px;background:rgba(42,157,92,0.15);border-color:#2a9d5c;color:#2a9d5c">🖥 WEB REMOTE</a>`);
     }
     if (dattoUrl) {
       btns.push(`<a href="${esc(dattoUrl)}" target="_blank" rel="noopener" class="inv-step-btn datto-open-btn" title="Open device in Datto RMM" style="width:auto;padding:0 10px;height:22px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">📟 OPEN IN DATTO</a>`);
