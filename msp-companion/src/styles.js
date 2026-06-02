@@ -1791,46 +1791,58 @@ export function injectAppStyles() {
       font-size: 13px;
     }
 
-    /* ─── NEW SINCE TRACKING ──────────────────────────────────────── */
-    .new-since-pill {
-      background: #e07b00;
-      color: #fff;
+    /* ─── KB UPGRADES ──────────────────────────────────────────────── */
+    .kb-tag-cloud {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      padding: 8px 0 12px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 10px;
+    }
+    .kb-tag {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--textdim);
+      cursor: pointer;
       font-family: var(--cond);
       font-size: 10px;
       font-weight: 700;
-      border-radius: 10px;
-      padding: 1px 6px;
-      margin-left: 4px;
-      letter-spacing: 0.04em;
-      animation: pulse-badge 2s ease-in-out infinite;
+      letter-spacing: 0.06em;
+      padding: 2px 7px;
+      transition: border-color 0.12s, color 0.12s, background 0.12s;
     }
-    @keyframes pulse-badge {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.6; }
+    .kb-tag:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: rgba(0,180,216,0.06);
     }
-    .new-since-banner {
+    .kb-tag-active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: rgba(0,180,216,0.1);
+    }
+    .kb-card-header {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
-      background: rgba(224,123,0,0.12);
-      border-bottom: 1px solid rgba(224,123,0,0.3);
-      color: #e07b00;
-      font-size: 12px;
+      gap: 10px;
+      margin-bottom: 4px;
+    }
+    .kb-card-actions { flex-shrink: 0; }
+    .kb-push-btn { font-size: 11px !important; padding: 3px 8px !important; }
+    .kb-at-badge {
       font-family: var(--cond);
+      font-size: 10px;
       font-weight: 700;
-      letter-spacing: 0.05em;
-      padding: 6px 12px;
+      letter-spacing: 0.06em;
+      color: #2a9d5c;
+      border: 1px solid #2a9d5c55;
+      border-radius: 3px;
+      padding: 2px 7px;
+      white-space: nowrap;
     }
-    .new-since-dismiss {
-      background: none;
-      border: none;
-      color: #e07b00;
-      cursor: pointer;
-      font-size: 13px;
-      opacity: 0.7;
-      padding: 0 2px;
-    }
-    .new-since-dismiss:hover { opacity: 1; }
   `;
   document.head.appendChild(style);
 }

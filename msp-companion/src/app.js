@@ -3690,17 +3690,81 @@ function renderTicketDetail(ticket) {
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────
-function renderKB(filter='') {
-  const kb=LS.get('msp_kb',[]); const el=$('kbList'); if(!el) return;
-  const filtered = filter ? kb.filter(e=>[e.title,e.symptoms,e.resolution,...(e.tags||[])].join(' ').toLowerCase().includes(filter.toLowerCase())) : kb;
-  if (!filtered.length) { el.innerHTML='<div class="loading-state">No KB entries yet. Resolve an alert and save it to KB to begin.</div>'; return; }
-  el.innerHTML=filtered.map(e=>`
+
+// ─── PUSH KB ENTRY TO AUTOTASK KB ──────────────────────────────────
+async function pushKBToAT(kbId) {
+  const kb = LS.get('msp_kb', []);
+  const entry = kb.find(e => e.id === kbId);
+  if (!entry) return;
+
+  // Build AT KB article payload
+  const body = {
+    title: entry.title,
+    description: entry.symptoms || '',
+    solution: entry.resolution || '',
+    isPublished: true,
+    isApproved: true,
+  };
+
+  const data = await atFetch('/KnowledgeBaseArticles', 'POST', body);
+  const atId = data?.item?.id || data?.id || data?.itemId || null;
+
+  if (!atId) throw new Error(data?.errors?.[0] || 'No article ID returned from AT');
+
+  // Update entry with AT reference
+  const updated = kb.map(e => e.id === kbId
+    ? { ...e, atKbId: atId, atKbPushedAt: Date.now() }
+    : e
+  );
+  LS.set('msp_kb', updated);
+  return atId;
+}
+
+function getAllKBTags() {
+  const kb = LS.get('msp_kb', []);
+  const counts = {};
+  kb.forEach(e => (e.tags || []).forEach(t => { counts[t] = (counts[t] || 0) + 1; }));
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([t]) => t);
+}
+
+function renderKB(filter='', tagFilter='') {
+  // Inject new-since banner if applicable
+  const bannerSlot = document.getElementById('alertNewSinceSlot');
+  if (bannerSlot) bannerSlot.innerHTML = renderNewSincePill('alerts');
+
+  const kb = LS.get('msp_kb', []); const el = $('kbList'); if (!el) return;
+  let filtered = kb;
+  if (tagFilter) filtered = filtered.filter(e => (e.tags || []).includes(tagFilter));
+  if (filter) filtered = filtered.filter(e => [e.title, e.symptoms, e.resolution, ...(e.tags||[])].join(' ').toLowerCase().includes(filter.toLowerCase()));
+
+  // Tag cloud
+  const allTags = getAllKBTags();
+  const tagCloud = allTags.length ? `
+    <div class="kb-tag-cloud">
+      ${tagFilter ? `<button class="kb-tag kb-tag-active" data-action="kb-tag-filter" data-tag="">✕ ${esc(tagFilter)}</button>` : ''}
+      ${allTags.filter(t => t !== tagFilter).map(t => `<button class="kb-tag" data-action="kb-tag-filter" data-tag="${esc(t)}">${esc(t)}</button>`).join('')}
+    </div>` : '';
+
+  if (!filtered.length) {
+    el.innerHTML = tagCloud + '<div class="loading-state">No KB entries match.</div>';
+    return;
+  }
+
+  el.innerHTML = tagCloud + filtered.map(e => `
     <div class="kb-card">
-      <div class="kb-card-title">${esc(e.title)}</div>
-      <div class="kb-card-meta">Saved ${new Date(e.savedAt).toLocaleDateString()}${e.client?` · ${esc(e.client)}`:''}</div>
-      ${e.symptoms?`<div class="kb-card-preview">${esc(e.symptoms.substring(0,120))}...</div>`:''}
-      ${e.resolution?`<div class="kb-card-preview" style="margin-top:4px;color:var(--green)">✓ ${esc(e.resolution.substring(0,100))}...</div>`:''}
-      <div class="kb-card-tags">${(e.tags||[]).map(t=>`<span class="kb-tag">${esc(t)}</span>`).join('')}</div>
+      <div class="kb-card-header">
+        <div class="kb-card-title">${esc(e.title)}</div>
+        <div class="kb-card-actions">
+          ${e.atKbId
+            ? `<span class="kb-at-badge" title="Pushed to Autotask KB (ID: ${esc(String(e.atKbId))})">✓ In AT KB</span>`
+            : `<button class="abtn abtn-ghost kb-push-btn" data-action="kb-push-to-at" data-kb-id="${esc(e.id)}" title="Push this entry to Autotask Knowledge Base">📤 Push to AT</button>`
+          }
+        </div>
+      </div>
+      <div class="kb-card-meta">Saved ${new Date(e.savedAt).toLocaleDateString()}${e.client ? ` · ${esc(e.client)}` : ''}${e.atKbPushedAt ? ` · Pushed ${new Date(e.atKbPushedAt).toLocaleDateString()}` : ''}</div>
+      ${e.symptoms ? `<div class="kb-card-preview">${esc(e.symptoms.substring(0, 120))}...</div>` : ''}
+      ${e.resolution ? `<div class="kb-card-preview" style="margin-top:4px;color:var(--green)">✓ ${esc(e.resolution.substring(0, 100))}...</div>` : ''}
+      <div class="kb-card-tags">${(e.tags || []).map(t => `<button class="kb-tag" data-action="kb-tag-filter" data-tag="${esc(t)}">${esc(t)}</button>`).join('')}</div>
     </div>`).join('');
 }
 
@@ -3720,7 +3784,10 @@ function showKBModal(prefill={}) {
     <div class="field-group"><label>TITLE</label><input type="text" id="kbTitle" value="${esc(prefill.title||'')}" placeholder="Issue title..." /></div>
     <div class="field-group"><label>SYMPTOMS</label><textarea id="kbSymptoms" rows="3" placeholder="What was the problem?">${esc(prefill.symptoms||'')}</textarea></div>
     <div class="field-group"><label>RESOLUTION</label><textarea id="kbResolution" rows="4" placeholder="How was it resolved?">${esc(prefill.resolution||'')}</textarea></div>
-    <div class="field-group"><label>TAGS (comma-separated)</label><input type="text" id="kbTags" value="${esc(prefill.tags||'')}" placeholder="client, monitor type..." /></div>
+    <div class="field-group"><label>TAGS (comma-separated)</label>
+      <input type="text" id="kbTags" value="${esc(prefill.tags||'')}" placeholder="client, monitor type..." list="kbTagSuggestions" autocomplete="off" />
+      <datalist id="kbTagSuggestions">${getAllKBTags().map(t=>`<option value="${esc(t)}">`).join('')}</datalist>
+    </div>
     <div id="kbModalResult" style="font-family:var(--cond);font-size:11px;min-height:14px;margin-bottom:8px"></div>
     <div style="display:flex;gap:8px">
       <button id="kbSaveBtn" style="flex:2;cursor:pointer;background:var(--accent);border:none;color:#fff;padding:10px;border-radius:4px;font-family:var(--cond);font-size:13px;font-weight:700;letter-spacing:0.07em">✓ SAVE TO KB</button>
@@ -6615,6 +6682,25 @@ ${alertsBlob}`;
       state.clientResolvedCache = null;
       if (client.siteUid) delete state.clientDevicesCache[client.siteUid];
       renderClientDetail(client);
+    }
+    if (action==='kb-tag-filter') {
+      const tag = el.dataset.tag || '';
+      const search = document.getElementById('kbSearch');
+      renderKB(search?.value || '', tag);
+    }
+    if (action==='kb-push-to-at') {
+      const kbId = el.dataset.kbId;
+      el.textContent = '⏳ Pushing...';
+      el.disabled = true;
+      try {
+        const atId = await pushKBToAT(kbId);
+        showToast(`✓ Pushed to Autotask KB (ID: ${atId})`, 'ok');
+        renderKB();
+      } catch(e) {
+        showToast(`Push failed: ${e.message}`, 'warn');
+        el.textContent = '📤 Push to AT';
+        el.disabled = false;
+      }
     }
     if (action==='dismiss-new-since') {
       const view = el.dataset.view;
