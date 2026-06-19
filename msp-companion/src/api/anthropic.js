@@ -12,7 +12,7 @@ export async function callAI(systemPrompt, messages) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type':'application/json', 'x-api-key':key, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
-    body: JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:1024, system:systemPrompt, messages }),
+    body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:1024, system:systemPrompt, messages }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(`AI API ${res.status}: ${data?.error?.message||'Unknown error'}`);
