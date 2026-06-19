@@ -3694,10 +3694,18 @@ function renderTicketDetail(ticket) {
 
 // ─── TEMPLATE MANAGER VIEW ─────────────────────────────────────────
 function renderTemplateManagerView() {
-  const vt = document.getElementById('view-templates') || document.body;
+  let vt = document.getElementById('view-templates');
+  if (!vt) {
+    vt = document.createElement('div');
+    vt.id = 'view-templates';
+    vt.className = 'view';
+    const kbView = document.getElementById('view-kb');
+    if (kbView?.parentNode) kbView.parentNode.insertBefore(vt, kbView.nextSibling);
+    else (document.querySelector('main') || document.body).appendChild(vt);
+  }
   vt.innerHTML = `
-    <div class="kb-wrap">
-      <div class="tpl-mgr-header" style="padding:14px 12px 10px">
+    <div class="kb-wrap" style="padding:16px 20px">
+      <div class="tpl-mgr-header" style="padding:0 0 10px">
         <div style="font-family:var(--cond);font-size:16px;font-weight:700;letter-spacing:0.05em">🗂 Templates</div>
         <button class="abtn abtn-ai" data-action="tpl-mgr-new" style="font-size:12px;padding:6px 14px">+ New Template</button>
       </div>
@@ -8013,21 +8021,6 @@ async function boot() {
   initDatto(() => state.settings);
   initAt(() => state.settings);
   initAI(() => state.settings);
-  // Pre-create dynamic view divs so setView can activate them
-  if (!document.getElementById('view-templates')) {
-    const vt = document.createElement('div');
-    vt.id = 'view-templates';
-    vt.className = 'view';
-    const kbView = document.getElementById('view-kb');
-    if (kbView?.parentNode) kbView.parentNode.insertBefore(vt, kbView.nextSibling);
-  }
-  if (!document.getElementById('view-compliance')) {
-    const vc = document.createElement('div');
-    vc.id = 'view-compliance';
-    vc.className = 'view';
-    const reportsView = document.getElementById('view-reports');
-    if (reportsView?.parentNode) reportsView.parentNode.insertBefore(vc, reportsView);
-  }
   registerSW();
   loadSettings();
   injectAiContextToggles();
